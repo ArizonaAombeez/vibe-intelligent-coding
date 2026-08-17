@@ -1,0 +1,24 @@
+{
+  "name": "vic-testing",
+  "version": "0.1.0",
+  "description": "Standalone Test Creation & Execution module (Areas E/F): writing generated test files to disk (reusing vic-coding's write-scope gate), the module/element-scoped test-execution gate, mechanical test running, the requirement-status pass-threshold flip, and full regression orchestration. Depends on vic-requirements-elicitation for the Project/TestCase data model, vic-coding for the shared source tree/scaffold/git helpers and the scoping gate, and vic-llm-claude-code for the agentic test-file-writing client.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "vic-requirements-elicitation": "*",
+    "vic-coding": "*",
+    "vic-llm-claude-code": "*",
+    "cross-spawn": "^7.0.6"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2",
+    "@types/node": "^24.13.3"
+  }
+}

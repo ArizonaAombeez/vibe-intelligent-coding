@@ -1,0 +1,558 @@
+.architecture-screen {
+  padding: 32px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.architecture-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.architecture-screen h1 {
+  font-size: 22px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.architecture-screen-substep {
+  color: var(--accent);
+  font-weight: 600;
+  margin: 8px 0 16px;
+}
+
+.architecture-type-selector {
+  margin: 24px 0;
+}
+
+.architecture-type-selector h2 {
+  font-size: 15px;
+  color: var(--text-h);
+  margin: 0 0 4px;
+}
+
+.architecture-type-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+.architecture-type-line {
+  color: var(--text-h);
+  font-size: 14px;
+  margin: 0 0 16px;
+}
+
+.architecture-type-line-warning {
+  color: var(--status-amber);
+}
+
+.architecture-type-change-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.architecture-type-change-link:hover {
+  text-decoration: underline;
+}
+
+.architecture-type-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.architecture-type-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-alt);
+  cursor: pointer;
+  color: var(--text);
+  transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
+}
+
+.architecture-type-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px -12px var(--accent);
+}
+
+.architecture-type-card.selected {
+  border-color: var(--accent);
+  background: linear-gradient(135deg, var(--accent-bg), transparent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+
+.architecture-type-card-label {
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.architecture-type-card-description {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.architecture-screen-note {
+  color: var(--text-muted);
+}
+
+.architecture-view-selector {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.architecture-status-filters {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.architecture-status-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 150ms ease, background 150ms ease, transform 150ms ease;
+}
+
+.architecture-status-filter:hover {
+  transform: translateY(-1px);
+}
+
+.architecture-status-filter.active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.architecture-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.architecture-action-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.architecture-action-bar button {
+  border-radius: 8px;
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: transform 150ms ease, box-shadow 150ms ease, filter 150ms ease;
+}
+
+.architecture-action-bar button:first-child {
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 70%, #4338ca));
+  color: #fff;
+  border: none;
+  box-shadow: 0 4px 14px -6px var(--accent);
+}
+
+.architecture-action-bar button:first-child:hover:not(:disabled) {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+.architecture-action-secondary {
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+
+.architecture-action-secondary:hover:not(:disabled) {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.architecture-action-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.architecture-layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.architecture-left-col {
+  flex: 0 0 auto;
+  min-width: 260px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.architecture-split-resize-handle {
+  width: 10px;
+  flex-shrink: 0;
+  cursor: ew-resize;
+  position: relative;
+}
+
+.architecture-split-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-50%);
+  background: var(--border);
+  transition: background 150ms ease;
+}
+
+.architecture-split-resize-handle:hover::after {
+  background: var(--accent);
+}
+
+.architecture-action-box {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-alt);
+}
+
+.architecture-action-box .architecture-action-bar {
+  flex-wrap: wrap;
+}
+
+.architecture-alignment-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.architecture-req-list-panel {
+  flex: 1;
+  min-height: 120px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.architecture-req-list-heading {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 10px 12px;
+  font-size: 13px;
+  color: var(--text-h);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+}
+
+.architecture-req-list-unallocated-count {
+  font-weight: 600;
+  color: var(--status-amber);
+}
+
+.architecture-req-list-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.architecture-right-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  overflow: hidden;
+  box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+  background: radial-gradient(ellipse at top left, var(--accent-bg), transparent 60%), var(--bg);
+}
+
+.architecture-left-col .analyst-chat-dock {
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.architecture-left-col .analyst-chat-panel {
+  padding: 0 14px 12px;
+}
+
+.architecture-grid-scroll {
+  flex: 1;
+  min-width: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  height: 100%;
+  padding: 12px;
+}
+
+.architecture-grid-svg {
+  display: block;
+  width: 100%;
+}
+
+.architecture-card-status-pulse {
+  animation: architecture-pulse-ring 2s ease-out infinite;
+}
+
+@keyframes architecture-pulse-ring {
+  0% {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+.architecture-card-req-badge {
+  animation: architecture-badge-pop 260ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+@keyframes architecture-badge-pop {
+  0% {
+    transform: scale(0);
+  }
+  70% {
+    transform: scale(1.15);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.architecture-card {
+  transition: filter 150ms ease;
+}
+
+.architecture-card-drop-active .architecture-card-bg {
+  animation: architecture-drop-target-breathe 900ms ease-in-out infinite;
+}
+
+@keyframes architecture-drop-target-breathe {
+  0%,
+  100% {
+    stroke-opacity: 1;
+  }
+  50% {
+    stroke-opacity: 0.55;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .architecture-card-status-pulse,
+  .architecture-card-req-badge,
+  .architecture-card-drop-active .architecture-card-bg {
+    animation: none;
+  }
+}
+
+.architecture-grid-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 24px;
+  text-align: center;
+}
+
+.architecture-detail-field-label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 10px 0 4px;
+}
+
+.architecture-detail-input {
+  width: 100%;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: inherit;
+  padding: 6px 10px;
+  font: inherit;
+}
+
+.architecture-detail-interface-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+
+.architecture-detail-interface-option {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.architecture-add-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.architecture-req-tray {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+  max-height: 160px;
+  overflow-y: auto;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-alt) 70%, transparent);
+  backdrop-filter: blur(6px);
+}
+
+.architecture-req-tray-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.architecture-allocated-req-list {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.architecture-allocated-req-row {
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  color: var(--text);
+  cursor: grab;
+  user-select: none;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.architecture-allocated-req-row:hover {
+  background: var(--bg-alt);
+  border-color: var(--border);
+}
+
+.architecture-allocated-req-row.selected {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+}
+
+.architecture-allocated-req-row:active {
+  cursor: grabbing;
+  transform: scale(0.99);
+}
+
+.architecture-allocated-req-row.dragging {
+  opacity: 0.5;
+}
+
+.architecture-req-rationale-badge {
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
+.architecture-req-tray-list-mode {
+  flex-direction: column;
+  align-items: stretch;
+  max-height: 220px;
+}
+
+.architecture-unallocate-btn {
+  color: var(--status-red);
+  border-color: var(--status-red);
+  transition: background 150ms ease, transform 150ms ease;
+}
+
+.architecture-unallocate-btn:hover {
+  background: color-mix(in srgb, var(--status-red) 12%, transparent);
+  transform: translateY(-1px);
+}
+
+.architecture-interface-list {
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.architecture-interface-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.architecture-interface-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.architecture-interface-actions .requirement-detail-edit-btn {
+  padding: 3px 8px;
+  font-size: 11px;
+}

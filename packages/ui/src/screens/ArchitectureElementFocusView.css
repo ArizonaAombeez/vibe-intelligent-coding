@@ -1,0 +1,268 @@
+.architecture-focus-view {
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 24px;
+  overflow-y: auto;
+  animation: architecture-focus-zoom-in 220ms cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+@keyframes architecture-focus-zoom-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.94);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .architecture-focus-view {
+    animation: none;
+  }
+}
+
+.architecture-focus-header {
+  flex-shrink: 0;
+  margin-bottom: 20px;
+}
+
+.architecture-focus-back-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+  margin-bottom: 14px;
+  transition: border-color 150ms ease, transform 150ms ease;
+}
+
+.architecture-focus-back-btn:hover {
+  border-color: var(--accent);
+  transform: translateX(-2px);
+}
+
+.architecture-focus-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.architecture-focus-title h2 {
+  margin: 0;
+  font-size: 20px;
+  color: var(--text-h);
+}
+
+.architecture-focus-kind {
+  font-size: 12px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+
+.architecture-focus-description {
+  margin: 10px 0 0;
+  color: var(--text);
+  max-width: 70ch;
+}
+
+.architecture-focus-stage {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(280px, 2fr) minmax(140px, 1fr);
+  gap: 20px;
+  align-items: start;
+}
+
+.architecture-focus-edge {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.architecture-focus-edge-left {
+  align-items: flex-end;
+}
+
+.architecture-focus-edge-right {
+  align-items: flex-start;
+}
+
+.architecture-focus-edge-bottom {
+  flex-direction: row;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 20px;
+}
+
+.architecture-focus-interface-chip {
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+}
+
+.architecture-focus-interface-chip:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px -10px var(--accent);
+}
+
+.architecture-focus-center-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+}
+
+.architecture-focus-element-card {
+  width: 100%;
+  max-width: 360px;
+  border-radius: 16px;
+  border: 1px solid var(--accent);
+  background: linear-gradient(135deg, var(--accent-bg), transparent);
+  box-shadow: 0 12px 30px -16px var(--accent);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: center;
+  text-align: center;
+}
+
+.architecture-focus-element-id {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.architecture-focus-element-card strong {
+  font-size: 16px;
+  color: var(--text-h);
+}
+
+.architecture-focus-requirements {
+  width: 100%;
+  max-width: 420px;
+}
+
+.architecture-focus-requirements h3 {
+  font-size: 13px;
+  color: var(--text-h);
+  margin: 0 0 8px;
+  text-align: center;
+}
+
+.architecture-focus-requirement-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.architecture-focus-requirement-chip {
+  width: 100%;
+  text-align: left;
+  background: var(--bg-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 150ms ease;
+}
+
+.architecture-focus-requirement-chip:hover {
+  border-color: var(--accent);
+}
+
+.architecture-focus-metadata {
+  flex-shrink: 0;
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  animation: architecture-focus-fade-in 260ms ease 80ms both;
+}
+
+@keyframes architecture-focus-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.architecture-focus-metadata-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.architecture-focus-metadata-header h3 {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.architecture-focus-metadata-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.architecture-focus-metadata-expand {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows 260ms cubic-bezier(0.2, 0.8, 0.3, 1), opacity 200ms ease;
+}
+
+.architecture-focus-metadata-expand.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  margin-top: 10px;
+}
+
+.architecture-focus-metadata-expand-content {
+  overflow: hidden;
+  min-height: 0;
+}
+
+.architecture-focus-metadata-section {
+  padding: 14px 0;
+  border-top: 1px solid var(--border);
+}
+
+.architecture-focus-metadata-section:first-of-type {
+  border-top: none;
+}
+
+.architecture-focus-metadata-section h3 {
+  font-size: 13px;
+  color: var(--text-h);
+  margin: 0 0 8px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .architecture-focus-metadata,
+  .architecture-focus-metadata-expand {
+    animation: none;
+    transition: none;
+  }
+}

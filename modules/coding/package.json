@@ -1,0 +1,23 @@
+{
+  "name": "vic-coding",
+  "version": "0.1.0",
+  "description": "Standalone Coding & Review-Rework module (Area D): per-architecture-element source-tree scaffolding, the write-scope isolation gate, and orchestration of a Claude Code CLI agent run for a single story. Depends on vic-requirements-elicitation for the Project/Architecture/Story data model and vic-llm-claude-code for the scoped agent client.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "vic-requirements-elicitation": "*",
+    "vic-llm-claude-code": "*",
+    "cross-spawn": "^7.0.6"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2",
+    "@types/node": "^24.13.3"
+  }
+}

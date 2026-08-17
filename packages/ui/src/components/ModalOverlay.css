@@ -1,0 +1,26 @@
+/* Generic centered-modal overlay, shared by any screen needing a dialog
+   (Requirements' Bin panel, Architecture's Add-element form). */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+
+.modal-panel {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+}
+
+.modal-panel .requirement-detail-header {
+  margin-bottom: 16px;
+}

@@ -1,0 +1,20 @@
+.phase-placeholder {
+  padding: 32px;
+  max-width: 640px;
+}
+
+.phase-placeholder h1 {
+  font-size: 22px;
+  color: var(--text-h);
+  margin: 0 0 8px;
+}
+
+.phase-placeholder-substep {
+  color: var(--accent);
+  font-weight: 600;
+  margin: 0 0 16px;
+}
+
+.phase-placeholder-note {
+  color: var(--text-muted);
+}

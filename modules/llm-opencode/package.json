@@ -1,0 +1,22 @@
+{
+  "name": "vic-llm-opencode",
+  "version": "0.1.0",
+  "description": "Standalone LLM client module that drives the open-source OpenCode CLI (npm: opencode-ai) as a subprocess, pointed at any provider it natively supports — including z.ai's GLM Coding Plan — via a per-run generated opencode.json. Gives GLM (and any future OpenCode-supported provider) a real agentic coding capability without any dependency on the Claude Code CLI or a Python toolchain. Mirrors vic-llm-claude-code's ClaudeCodeAgentClient shape so vic-coding can use either interchangeably.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "vic-llm-claude-code": "*",
+    "cross-spawn": "^7.0.6"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2"
+  }
+}

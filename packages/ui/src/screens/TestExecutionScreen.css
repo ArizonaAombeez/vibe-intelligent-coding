@@ -1,0 +1,393 @@
+.test-execution-screen {
+  padding: 32px;
+  max-width: 1200px;
+}
+
+.test-execution-screen h1 {
+  font-size: 22px;
+  color: var(--text-h);
+  margin: 0 0 16px;
+}
+
+.test-execution-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.test-execution-action-bar {
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.test-execution-status-text {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.test-execution-secondary-button {
+  background: transparent;
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.test-execution-secondary-button:hover {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.08));
+}
+
+.test-execution-action-bar button,
+.test-execution-detail-header button,
+.test-execution-command-row button,
+.test-execution-triage-panel button,
+.test-execution-group-run {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.test-execution-action-bar button:disabled,
+.test-execution-detail-header button:disabled,
+.test-execution-command-row button:disabled,
+.test-execution-triage-panel button:disabled,
+.test-execution-group-run:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.test-execution-layout {
+  display: grid;
+  grid-template-columns: 380px 1fr 300px;
+  gap: 20px;
+  align-items: start;
+}
+
+.test-execution-regression-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--tone-color);
+  background: color-mix(in srgb, var(--tone-color) 10%, transparent);
+  margin-bottom: 16px;
+}
+
+.test-execution-regression-status .test-execution-status-dot {
+  background: var(--tone-color);
+}
+
+.test-execution-regression-status-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.test-execution-regression-awaiting {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.test-execution-regression-status.tone-good {
+  --tone-color: var(--status-green);
+}
+
+.test-execution-regression-status.tone-critical {
+  --tone-color: var(--status-red);
+}
+
+.test-execution-regression-status.tone-neutral {
+  --tone-color: var(--status-grey);
+}
+
+.test-execution-history-pane {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.test-execution-history-pane h2 {
+  font-size: 14px;
+  color: var(--text-h);
+  margin: 0 0 10px;
+}
+
+.test-execution-history-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.test-execution-history-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border-left: 3px solid var(--tone-color);
+  background: var(--hover-bg, rgba(128, 128, 128, 0.06));
+}
+
+.test-execution-history-row .test-execution-status-dot {
+  background: var(--tone-color);
+}
+
+.test-execution-history-row.tone-good {
+  --tone-color: var(--status-green);
+}
+
+.test-execution-history-row.tone-critical {
+  --tone-color: var(--status-red);
+}
+
+.test-execution-history-row.tone-neutral {
+  --tone-color: var(--status-grey);
+}
+
+.test-execution-history-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-h);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.test-execution-history-count {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.test-execution-history-time {
+  font-size: 10px;
+  color: var(--text-muted);
+  width: 100%;
+}
+
+.test-execution-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.test-execution-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.test-execution-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--hover-bg, rgba(128, 128, 128, 0.06));
+  border-bottom: 1px solid var(--border);
+}
+
+.test-execution-group-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  width: 16px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.test-execution-group-title {
+  flex: 1;
+  color: var(--text-h);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.test-execution-group-summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.test-execution-group-run {
+  padding: 4px 10px !important;
+  font-size: 12px !important;
+}
+
+.test-execution-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.test-execution-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+
+.test-execution-row-body {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.test-execution-row:hover {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.08));
+}
+
+.test-execution-row-selected {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.12));
+  border: 1px solid var(--accent);
+}
+
+.test-execution-title {
+  flex: 1;
+  color: var(--text-h);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.test-execution-run-state {
+  color: var(--text-muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.test-execution-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.test-execution-triage-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--status-amber);
+}
+
+.test-execution-detail-pane {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  min-height: 200px;
+}
+
+.test-execution-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.test-execution-detail-header h2 {
+  font-size: 16px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.test-execution-command-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.test-execution-command-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.test-execution-command-row input {
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.test-execution-triage-panel {
+  border: 1px solid var(--status-amber);
+  background: color-mix(in srgb, var(--status-amber) 12%, transparent);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 10px 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.test-execution-triage-panel p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-h);
+  flex: 1;
+  min-width: 200px;
+}
+
+.test-execution-raw-log {
+  margin-top: 12px;
+}
+
+.test-execution-raw-log summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.test-execution-raw-log pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+}

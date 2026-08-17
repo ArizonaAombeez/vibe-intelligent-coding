@@ -1,0 +1,63 @@
+import type { AlignmentStatus, MigrationAction, MigrationStory, Project } from 'vic-requirements-elicitation'
+
+// Alignment status -> required migration action (Import Project, REQ-061).
+// 'relocate' is deliberately not derived here: the alignment data
+// (CodeAlignmentMapping) has no field distinguishing "needs relocating" from
+// "needs refactoring in place" — inventing a path-comparison heuristic
+// without a reliable signal for it would be guessing, not deriving. An
+// operator can still relabel a generated story's action manually in the UI.
+const ACTION_FOR_STATUS: Record<AlignmentStatus, MigrationAction> = {
+  aligned: 'reuse-as-is',
+  'partially-aligned': 'refactor-in-place',
+  'no-equivalent': 'rewrite',
+}
+
+// Pure, deterministic — no LLM call. REQ-061 asks for the plan to be
+// "driven by the alignment analysis", which is already-computed structured
+// data (project.codeAlignment.mappings against project.architecture.elements),
+// so generating one story per architecture element is a direct mapping, not
+// a fresh judgement call requiring an LLM. Non-destructive re-run: the
+// caller decides whether to overwrite an existing project.migrationPlan.
+export function generateMigrationPlan(project: Project): MigrationStory[] {
+  if (project.projectMode !== 'import') {
+    throw new Error('Migration plan generation is only valid for an "import" mode project')
+  }
+  if (!project.architecture) {
+    throw new Error('Project has no architecture — select an Architecture type first')
+  }
+  if (!project.codeAlignment) {
+    throw new Error('Project has no code alignment analysis — run Analyze Code Alignment first')
+  }
+
+  const { architecture, codeAlignment } = project
+  const createdAt = new Date().toISOString()
+
+  return architecture.elements.map((element, index) => {
+    const elementMappings = codeAlignment.mappings.filter((m) => m.architectureElementId === element.id)
+
+    let action: MigrationAction
+    let rationale: string
+    if (elementMappings.length === 0) {
+      action = 'rewrite'
+      rationale = `No existing code maps to ${element.name} — build it from scratch.`
+    } else {
+      const statuses = elementMappings.map((m) => m.status).filter((s): s is AlignmentStatus => s !== null)
+      const worstStatus: AlignmentStatus = statuses.includes('no-equivalent')
+        ? 'no-equivalent'
+        : statuses.includes('partially-aligned')
+          ? 'partially-aligned'
+          : 'aligned'
+      action = ACTION_FOR_STATUS[worstStatus]
+      const files = elementMappings.map((m) => m.filePath).join(', ')
+      rationale = `Based on alignment analysis of ${files} (${worstStatus}).`
+    }
+
+    return {
+      id: `STORY-${String(index + 1).padStart(3, '0')}`,
+      architectureElementId: element.id,
+      action,
+      rationale,
+      createdAt,
+    } satisfies MigrationStory
+  })
+}

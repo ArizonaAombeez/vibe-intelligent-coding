@@ -1,0 +1,8 @@
+node_modules/
+dist/
+
+# Local credential storage for plugin settings (API keys, etc.) — never committed.
+.vic/
+
+# Local project data created by running the server — not source.
+.vic-projects/

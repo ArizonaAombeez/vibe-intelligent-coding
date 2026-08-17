@@ -1,0 +1,130 @@
+.top-bar {
+  display: flex;
+  align-items: stretch;
+  height: 44px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-alt);
+  flex-shrink: 0;
+}
+
+.file-menu {
+  position: relative;
+  display: flex;
+}
+
+.file-menu-button {
+  background: none;
+  border: none;
+  border-right: 1px solid var(--border);
+  padding: 0 16px;
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.file-menu-button:hover {
+  background: var(--accent-bg);
+}
+
+.file-menu-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 180px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  z-index: 100;
+}
+
+.file-menu-dropdown button {
+  text-align: left;
+  background: none;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.file-menu-dropdown button:hover {
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.file-menu-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+.phase-tabs {
+  display: flex;
+  flex: 1;
+  overflow-x: auto;
+}
+
+.phase-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  border-right: 1px solid var(--border);
+  padding: 0 16px;
+  cursor: pointer;
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.phase-tab:hover:not(:disabled) {
+  background: var(--accent-bg);
+}
+
+.phase-tab.active {
+  color: var(--text-h);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
+.phase-tab:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.phase-tab-number {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.help-button {
+  width: 44px;
+  border: none;
+  border-left: 1px solid var(--border);
+  background: none;
+  cursor: pointer;
+  border-radius: 50%;
+  margin: 6px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.help-button:hover {
+  background: var(--accent-bg);
+  color: var(--text-h);
+}

@@ -1,0 +1,523 @@
+.test-creation-screen {
+  padding: 32px;
+  max-width: 1200px;
+}
+
+.test-creation-screen h1 {
+  font-size: 22px;
+  color: var(--text-h);
+  margin: 0 0 16px;
+}
+
+.test-creation-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.test-creation-settings-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 20px;
+}
+
+.test-creation-mode-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.test-creation-mode-label select {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.test-creation-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+
+.test-creation-action-bar select {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.test-creation-action-bar button,
+.test-creation-detail-header button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.test-creation-action-bar button:disabled,
+.test-creation-detail-header button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.test-creation-secondary-button {
+  background: transparent !important;
+  color: var(--text-h) !important;
+  border: 1px solid var(--border) !important;
+}
+
+.test-creation-secondary-button:hover {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.08)) !important;
+}
+
+.test-creation-rejected-banner {
+  background: color-mix(in srgb, var(--status-amber) 12%, transparent);
+  border: 1px solid var(--status-amber);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.test-creation-rejected-banner ul {
+  margin: 6px 0 0;
+  padding-left: 18px;
+}
+
+.test-creation-layout {
+  display: grid;
+  grid-template-columns: 400px 1fr;
+  gap: 20px;
+  align-items: start;
+}
+
+.test-creation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 70vh;
+  overflow-y: auto;
+}
+
+.test-creation-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.test-creation-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--hover-bg, rgba(128, 128, 128, 0.06));
+  border-bottom: 1px solid var(--border);
+}
+
+.test-creation-group-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  width: 16px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  flex-shrink: 0;
+}
+
+.test-creation-group-title {
+  flex: 1;
+  color: var(--text-h);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.test-creation-group-summary {
+  color: var(--text-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.test-creation-group-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.test-creation-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-wrap: wrap;
+}
+
+.test-creation-row:hover {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.08));
+}
+
+.test-creation-row-selected {
+  background: var(--hover-bg, rgba(128, 128, 128, 0.12));
+  border: 1px solid var(--accent);
+}
+
+.test-creation-title {
+  flex: 1;
+  color: var(--text-h);
+  font-size: 13px;
+}
+
+.test-creation-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.test-creation-type-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.test-creation-status-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: #fff;
+}
+
+/* Separate from test-creation-status-badge on purpose: generation ("has a
+   test file been written yet?") and status ("did it pass when last run?")
+   are two independent axes — a test can be generated-and-failing,
+   generated-and-not-run, or not-generated-at-all (which "Not run" alone
+   can't distinguish from a generated test that just hasn't executed yet). */
+.test-creation-generation-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: #fff;
+  background: var(--status-green);
+}
+
+.test-creation-generation-badge-pending {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.test-creation-detail-badges {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.test-creation-detail-pane {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  min-height: 200px;
+}
+
+.test-creation-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.test-creation-detail-header h2 {
+  font-size: 16px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.test-creation-title-input {
+  flex: 1;
+  font: inherit;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-h);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+  margin: -4px -6px;
+  min-width: 0;
+}
+
+.test-creation-title-input:hover,
+.test-creation-title-input:focus {
+  border-color: var(--border);
+  background: var(--bg);
+}
+
+.test-creation-title-input:disabled {
+  opacity: 0.6;
+}
+
+.test-creation-detail-header-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.test-creation-delete-button {
+  background: transparent !important;
+  color: var(--status-red) !important;
+  border: 1px solid var(--status-red) !important;
+}
+
+.test-creation-add-form {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.test-creation-add-form h2 {
+  font-size: 16px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.test-creation-add-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.test-creation-add-field input[type='text'],
+.test-creation-add-field select {
+  font: inherit;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.test-creation-add-requirement-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.test-creation-add-requirement-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--text-h);
+}
+
+.test-creation-add-requirement-row input {
+  margin-top: 3px;
+  flex-shrink: 0;
+}
+
+.test-creation-add-form-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.test-creation-add-form-actions button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.test-creation-add-form-actions button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.test-creation-add-form-actions button:last-child {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.test-creation-filepath {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: var(--text-h);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+  display: inline-block;
+}
+
+.test-creation-import-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 20px;
+}
+
+.test-creation-import-panel h2 {
+  font-size: 16px;
+  color: var(--text-h);
+  margin: 0 0 8px;
+}
+
+.test-creation-import-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.test-creation-import-bar input {
+  flex: 1;
+  font: inherit;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+}
+
+.test-creation-import-bar button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 16px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.test-creation-import-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.test-creation-import-error {
+  color: var(--status-red);
+  font-size: 13px;
+  margin: 0 0 8px;
+}
+
+.test-creation-imported-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.test-creation-imported-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.test-creation-imported-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.test-creation-imported-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.test-creation-imported-row-header .test-creation-title {
+  flex: 1;
+}
+
+.test-creation-imported-row-header button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.test-creation-run-banner {
+  background: color-mix(in srgb, var(--status-red) 12%, transparent);
+  border: 1px solid var(--status-red);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 10px 0;
+  font-size: 13px;
+  color: var(--text-h);
+}
+
+.test-creation-raw-log {
+  margin-top: 12px;
+}
+
+.test-creation-raw-log summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.test-creation-raw-log pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+}

@@ -1,0 +1,105 @@
+.login-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  width: 100%;
+}
+
+.login-content {
+  width: 360px;
+  text-align: center;
+}
+
+.login-content h1 {
+  font-size: 40px;
+  margin: 0 0 4px;
+  color: var(--text-h);
+}
+
+.login-tagline {
+  color: var(--text-muted);
+  margin-bottom: 32px;
+}
+
+.login-offline {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--status-red);
+  border-radius: 8px;
+  text-align: left;
+}
+
+.login-offline-message {
+  margin: 0;
+  color: var(--status-red);
+}
+
+.login-offline button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.login-user-list {
+  list-style: none;
+  margin: 0 0 20px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  text-align: left;
+}
+
+.login-user-button {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  cursor: pointer;
+  color: var(--text);
+}
+
+.login-user-button:hover {
+  background: var(--accent-bg);
+  color: var(--text-h);
+}
+
+.login-new-user {
+  display: flex;
+  gap: 8px;
+}
+
+.login-new-user input {
+  flex: 1;
+  min-width: 0;
+  padding: 9px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+
+.login-new-user button {
+  padding: 9px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+}
+
+.login-new-user button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

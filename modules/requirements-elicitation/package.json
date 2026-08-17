@@ -1,0 +1,17 @@
+{
+  "name": "vic-requirements-elicitation",
+  "version": "0.1.0",
+  "description": "Standalone Requirements Elicitation module (Area A): data model, JSON persistence, structured-form and Analyst-chat elicitation logic. No dependency on vic-llm-glm or any UI/server package.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2",
+    "@types/node": "^24.13.3"
+  }
+}

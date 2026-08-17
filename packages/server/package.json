@@ -1,0 +1,31 @@
+{
+  "name": "vic-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Thin HTTP integration layer. The only place vic-llm-glm and vic-requirements-elicitation are imported together and wired to the reference UI.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "jszip": "^3.10.1",
+    "vic-coding": "*",
+    "vic-llm-claude-code": "*",
+    "vic-llm-opencode": "*",
+    "vic-testing": "*",
+    "vic-llm-glm": "*",
+    "vic-planning": "*",
+    "vic-requirements-elicitation": "*"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2"
+  }
+}

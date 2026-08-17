@@ -1,0 +1,132 @@
+.status-strip {
+  border-top: 1px solid var(--border);
+  background: var(--bg-alt);
+  padding: 6px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+  font-size: 12px;
+  transition: background 300ms ease, border-color 300ms ease;
+}
+
+.status-strip-busy {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--status-amber) 18%, var(--bg-alt)),
+    color-mix(in srgb, var(--status-amber) 8%, var(--bg-alt))
+  );
+  background-size: 200% 100%;
+  border-top-color: color-mix(in srgb, var(--status-amber) 45%, var(--border));
+  animation: status-strip-sheen 2.4s ease-in-out infinite;
+}
+
+@keyframes status-strip-sheen {
+  0%, 100% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+}
+
+.status-strip-error {
+  background: color-mix(in srgb, var(--status-red) 16%, var(--bg-alt));
+  border-top-color: color-mix(in srgb, var(--status-red) 55%, var(--border));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-strip-busy {
+    animation: none;
+  }
+}
+
+.status-strip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 18px;
+}
+
+.operation-text {
+  color: var(--text-muted);
+}
+
+.operation-text-busy {
+  color: var(--text-h);
+  font-weight: 600;
+}
+
+.operation-error {
+  color: var(--status-red);
+  font-weight: 600;
+}
+
+.status-strip-dot-busy {
+  animation: status-strip-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes status-strip-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.retry-button {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 8px;
+  cursor: pointer;
+  color: var(--text-h);
+}
+
+.retry-button:hover {
+  background: var(--accent-bg);
+}
+
+.status-strip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.project {
+  color: var(--text-h);
+  font-weight: 500;
+}
+
+.status-strip-token-usage {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-strip-plugin-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-strip-plugin-usage-label {
+  color: var(--text-h);
+  font-weight: 500;
+}
+
+.status-strip-usage-window + .status-strip-usage-window::before {
+  content: '·';
+  margin: 0 4px;
+  color: var(--text-muted);
+}
+
+.status-strip-usage-reset {
+  color: var(--text-muted);
+}

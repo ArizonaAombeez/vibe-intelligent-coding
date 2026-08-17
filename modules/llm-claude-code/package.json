@@ -1,0 +1,21 @@
+{
+  "name": "vic-llm-claude-code",
+  "version": "0.1.0",
+  "description": "Standalone LLM client module that drives the locally installed Claude Code CLI as a subprocess, so calls are billed against a Claude Pro/Max subscription (OAuth session) instead of a metered API key. No dependency on any other VIC module.",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/cross-spawn": "^6.0.6",
+    "@types/node": "^24.13.3",
+    "tsx": "^4.19.2",
+    "typescript": "~5.7.2"
+  },
+  "dependencies": {
+    "cross-spawn": "^7.0.6"
+  }
+}
