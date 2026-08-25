@@ -202,7 +202,7 @@ const usersStore = new UsersStore(PROJECTS_ROOT)
 // travel through runAgentTask's options (resolved from the Dev/QA persona
 // per request, same as every chat-backed route), matching how
 // getClientForPersona is never cached either. Either can be undefined if its
-// plugin module (modules/llm/claude-code, modules/llm/opencode) isn't
+// plugin module (modules/llm/claude-code, modules/opencode) isn't
 // present — see getCodingAgentClientForPersona below, which surfaces that as
 // LlmNotConfiguredError rather than crashing.
 
