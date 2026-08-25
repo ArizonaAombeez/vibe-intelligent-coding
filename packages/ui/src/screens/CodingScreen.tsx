@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   Architecture,
   ArchitectureElement,
@@ -7,12 +7,14 @@ import type {
   ElementRequirementCoverage,
   Requirement,
   Status,
+  TestRegressionRun,
   VicCoreApi,
 } from '../api/types'
 import { toOperationError } from '../api/errorCode'
 import { REQUIREMENT_STATUS_LABEL, STATUS_COLOR, STATUS_LABEL } from '../statusColor'
 import { formatCodingLog } from './formatCodingLog'
-import { highlightRequirementIds } from './requirementIdHighlight'
+import { HighlightedCode, HighlightedLine, langForFilePath } from './highlightCode'
+import type { CodeLang } from './highlightCode'
 import './RequirementsScreen.css'
 import './CodingScreen.css'
 
@@ -27,15 +29,6 @@ interface CodingScreenProps {
   onOperationChange: (op: CurrentOperation) => void
   onOpenSettings: () => void
 }
-
-interface CodingChatEntry {
-  role: 'user' | 'dev'
-  text: string
-}
-
-const DEFAULT_CHAT_HEIGHT = 260
-const MIN_CHAT_HEIGHT = 120
-const MAX_CHAT_HEIGHT = 640
 
 function triggerBrowserDownload(blob: Blob, filename: string): void {
   const url = URL.createObjectURL(blob)
@@ -84,22 +77,95 @@ function CodeCheckPanel({ coverage }: { coverage: ElementRequirementCoverage[] }
   )
 }
 
+// Diff header lines (diff --git, index, ---/+++, @@) carry their own path,
+// so the changed file's extension picks the language used to color the code
+// *inside* +/- lines — tracked as we walk the lines top to bottom.
+// Colors formatCodingLog's summary lines by their leading marker: tool
+// calls ('• '), tool errors ('✗ '), and reasoning/thinking text ('💭 ') —
+// everything else (plain model text, raw fallback lines) is left uncolored
+// since it isn't a distinct category.
+function LogLine({ line }: { line: string }) {
+  if (line.startsWith('✗ ')) return <div className="coding-log-line coding-log-line-error">{line}</div>
+  if (line.startsWith('\u{1F4AD} ')) return <div className="coding-log-line coding-log-line-thinking">{line}</div>
+  if (line.startsWith('• ')) return <div className="coding-log-line coding-log-line-tool">{line}</div>
+  return <div className="coding-log-line">{line}</div>
+}
+
+function FormattedLog({ text }: { text: string }) {
+  const lines = formatCodingLog(text).split('\n')
+  return (
+    <>
+      {lines.map((line, i) => (
+        <LogLine key={i} line={line} />
+      ))}
+    </>
+  )
+}
+
+function formatMs(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainderSeconds = Math.round(seconds % 60)
+  return `${minutes}m ${remainderSeconds}s`
+}
+
+// Above this, msToFirstOutput is flagged as a warning rather than shown as
+// a plain stat — distinguishes "the provider took unusually long to start
+// responding at all" (worth a human's attention, since it's the exact
+// signal that diagnosed a real ~320s stall-before-first-tool-call on one
+// GLM run, with everything after that point running at completely normal
+// speed) from ordinary startup variance. Not a hard failure threshold —
+// just a visibility cue in the UI.
+const SLOW_START_WARNING_MS = 60_000
+
+// Provider-agnostic run-timing summary — works identically for any agent
+// client (ClaudeCodeAgentClient, OpenCodeAgentClient, or a future one),
+// since AgentRunTiming is derived purely from process lifecycle events
+// (spawn/first output/exit), never a provider-specific event schema. Shows
+// which provider/model actually ran (recorded on CodingRun so this can be
+// compared across runs made with different plugins later, not just
+// inferred in the moment), total CLI duration, and — the key diagnostic —
+// how long the provider took before producing anything at all.
+function RunTimingSummary({ run }: { run: CodingRun }) {
+  if (!run.timing && !run.providerId && !run.model) return null
+  const slowStart = (run.timing?.msToFirstOutput ?? 0) > SLOW_START_WARNING_MS
+  return (
+    <div className={`coding-run-timing${slowStart ? ' coding-run-timing-warning' : ''}`}>
+      {run.providerId && <span className="coding-run-timing-item">provider: {run.providerId}</span>}
+      {run.model && <span className="coding-run-timing-item">model: {run.model}</span>}
+      {run.timing?.msToFirstOutput !== undefined && (
+        <span className="coding-run-timing-item">
+          time to first response: {formatMs(run.timing.msToFirstOutput)}
+          {slowStart && ' — unusually slow to start'}
+        </span>
+      )}
+      {run.timing && <span className="coding-run-timing-item">total CLI time: {formatMs(run.timing.msTotal)}</span>}
+    </div>
+  )
+}
+
 function DiffView({ diff }: { diff: string }) {
   if (!diff.trim()) {
     return <p className="coding-hint">No diff for this run.</p>
   }
   const lines = diff.split('\n')
+  let lang: CodeLang = 'plain'
   return (
     <pre className="coding-diff">
       {lines.map((line, i) => {
-        const cls = line.startsWith('+') && !line.startsWith('+++')
-          ? 'coding-diff-add'
-          : line.startsWith('-') && !line.startsWith('---')
-            ? 'coding-diff-remove'
-            : 'coding-diff-context'
+        if (line.startsWith('diff --git')) {
+          const match = line.match(/ b\/(\S+)$/)
+          lang = match ? langForFilePath(match[1]) : 'plain'
+        }
+        const isAdd = line.startsWith('+') && !line.startsWith('+++')
+        const isRemove = line.startsWith('-') && !line.startsWith('---')
+        const cls = isAdd ? 'coding-diff-add' : isRemove ? 'coding-diff-remove' : 'coding-diff-context'
+        const isHeader = /^(diff --git|index |---|\+\+\+|@@)/.test(line)
         return (
           <div key={i} className={cls}>
-            {line}
+            {isHeader || lang === 'plain' ? line : <HighlightedLine line={line} lang={lang} />}
           </div>
         )
       })}
@@ -121,33 +187,20 @@ function deriveElementStatus(elementId: string, requirements: Requirement[]): St
   return 'in-progress'
 }
 
-export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings }: CodingScreenProps) {
+export function CodingScreen({ api, projectId, onOperationChange }: CodingScreenProps) {
   const [architecture, setArchitecture] = useState<Architecture | null>(null)
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [runs, setRuns] = useState<CodingRun[]>([])
   const [sourceRoot, setSourceRoot] = useState<string | null>(null)
   const [sourceFiles, setSourceFiles] = useState<Array<{ path: string; size: number }>>([])
   const [previewFilePath, setPreviewFilePath] = useState<string | null>(null)
+  const [previewText, setPreviewText] = useState<string | null>(null)
+  const [previewTextError, setPreviewTextError] = useState<string | null>(null)
   const [downloadBusy, setDownloadBusy] = useState(false)
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null)
   const [conventions, setConventions] = useState('')
   const [busy, setBusy] = useState(false)
   const [loadError, setLoadError] = useState<string | null>(null)
-
-  const [chatHistory, setChatHistory] = useState<CodingChatEntry[]>([])
-  const [chatInput, setChatInput] = useState('')
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
-  const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
-  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT)
-  // How much real source code Dev chat reads into context per message —
-  // 'none' (default) costs nothing extra; 'element' reads just the selected
-  // element's own folder (cheap, a handful of files); 'project' reads the
-  // whole src/ tree (most capable, most tokens) for when a bug spans more
-  // than one element. User opts up deliberately rather than this
-  // defaulting wide.
-  const [chatCodeScope, setChatCodeScope] = useState<'none' | 'element' | 'project'>('none')
-  const resizingRef = useRef(false)
 
   // Live output for whichever element is currently being coded (set by
   // handleRunCoding/handleCodeAll, cleared once that run's poll loop sees
@@ -180,10 +233,48 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
   const [analyzeBusy, setAnalyzeBusy] = useState(false)
   const [analyzeError, setAnalyzeError] = useState<string | null>(null)
 
+  // "Test Full App" — runs every element's + every connected interface
+  // pair's own test suite together (runFullRegression, already used
+  // elsewhere for the same aggregation) so there's at least one check that
+  // the whole assembled app still works, not just each element in
+  // isolation. Client-side only, same "reflects this session's latest run"
+  // convention as codeChecks above.
+  const [testFullAppBusy, setTestFullAppBusy] = useState(false)
+  const [fullAppTestResult, setFullAppTestResult] = useState<TestRegressionRun | null>(null)
+
   useEffect(() => {
     if (!liveLogRef.current) return
     liveLogRef.current.scrollTop = liveLogRef.current.scrollHeight
   }, [liveLog])
+
+  // Fetches the raw text of a selected non-HTML file for the highlighted
+  // code preview below — HTML files instead render live in the iframe, so
+  // this only runs for everything else. sourceFileUrl already serves plain
+  // file bytes, so a direct fetch is enough; no dedicated JSON endpoint.
+  useEffect(() => {
+    if (!previewFilePath || isHtmlFile(previewFilePath)) {
+      setPreviewText(null)
+      setPreviewTextError(null)
+      return
+    }
+    let cancelled = false
+    setPreviewText(null)
+    setPreviewTextError(null)
+    fetch(api.sourceFileUrl(projectId, previewFilePath))
+      .then((res) => {
+        if (!res.ok) throw new Error(`Failed to load file (${res.status})`)
+        return res.text()
+      })
+      .then((text) => {
+        if (!cancelled) setPreviewText(text)
+      })
+      .catch((err) => {
+        if (!cancelled) setPreviewTextError(err instanceof Error ? err.message : 'Failed to load file.')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, projectId, previewFilePath])
 
   // Polls this project's run-lock status regardless of whether this tab is
   // the one running Coding — so a second user opening the same project sees
@@ -257,30 +348,6 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
     }
   }
 
-  const handleResizeStart = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      resizingRef.current = true
-      const startY = e.clientY
-      const startHeight = chatHeight
-
-      function onMove(moveEvent: MouseEvent) {
-        if (!resizingRef.current) return
-        const delta = startY - moveEvent.clientY
-        const next = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, startHeight + delta))
-        setChatHeight(next)
-      }
-      function onUp() {
-        resizingRef.current = false
-        window.removeEventListener('mousemove', onMove)
-        window.removeEventListener('mouseup', onUp)
-      }
-      window.addEventListener('mousemove', onMove)
-      window.addEventListener('mouseup', onUp)
-    },
-    [chatHeight],
-  )
-
   async function reload() {
     try {
       const [a, reqs, r, c, tree] = await Promise.all([
@@ -345,20 +412,12 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
 
   async function handleRunCoding(element: ArchitectureElement, recode = false, fromScratch = false) {
     if (busy) return
-    if (fromScratch) {
-      if (
-        !window.confirm(
-          "Recode this element from scratch? This deletes everything currently in its code folder before writing fresh code — the agent won't see (or be able to keep) the existing implementation.",
-        )
-      ) {
-        return
-      }
-    } else if (recode && !window.confirm('Recode this element? This will regenerate its code and create a new commit.')) {
+    if (!fromScratch && recode && !window.confirm('Update this element\'s code? This will regenerate it and create a new commit.')) {
       return
     }
     setBusy(true)
     onOperationChange({
-      text: `${fromScratch ? 'Recoding from scratch' : recode ? 'Recoding' : 'Coding'} ${element.id}...`,
+      text: `${fromScratch ? 'Coding' : recode ? 'Updating code for' : 'Coding'} ${element.id}...`,
     })
     const runToken = crypto.randomUUID()
     const stopPolling = pollRunLog(element.id, runToken)
@@ -408,13 +467,23 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
     }
   }
 
-  // Codes every element in the list, one at a time (not in parallel — each
-  // run is a real CLI invocation against the same shared source tree, so
-  // concurrent runs would race on the same git repo/files). Stops on the
-  // first failure rather than plowing through the rest, same as how a
-  // single Code run surfaces its error via onOperationChange.
+  // Rebuilds every element in the list from scratch, one at a time (not in
+  // parallel — each run is a real CLI invocation against the same shared
+  // source tree, so concurrent runs would race on the same git repo/files).
+  // Each element's own code folder is wiped before that element's run, same
+  // as a single-element from-scratch rebuild — the agent writes fresh code
+  // instead of reviewing/keeping whatever was there. Stops on the first
+  // failure rather than plowing through the rest, same as a single Update
+  // Code run surfaces its error via onOperationChange.
   async function handleCodeAll() {
     if (busy || elements.length === 0) return
+    if (
+      !window.confirm(
+        'Code every element from scratch? This deletes everything currently in each element\'s code folder before writing fresh code — the agent won\'t see (or be able to keep) any existing implementation.',
+      )
+    ) {
+      return
+    }
     setBusy(true)
     try {
       for (const element of elements) {
@@ -422,7 +491,7 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
         const runToken = crypto.randomUUID()
         const stopPolling = pollRunLog(element.id, runToken)
         try {
-          await api.runCoding(projectId, element.id, runToken)
+          await api.runCoding(projectId, element.id, runToken, true, true)
         } finally {
           stopPolling()
         }
@@ -437,6 +506,22 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
     }
   }
 
+  async function handleTestFullApp() {
+    if (busy || testFullAppBusy) return
+    setTestFullAppBusy(true)
+    onOperationChange({ text: 'Testing full app...' })
+    try {
+      const { regressionRun } = await api.runFullRegression(projectId)
+      setFullAppTestResult(regressionRun)
+      await reload()
+      onOperationChange({ text: null })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    } finally {
+      setTestFullAppBusy(false)
+    }
+  }
+
   async function handleSaveConventions() {
     if (busy) return
     setBusy(true)
@@ -446,29 +531,6 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
       onOperationChange(toOperationError(err))
     } finally {
       setBusy(false)
-    }
-  }
-
-  async function handleChatSend() {
-    if (!chatInput.trim() || chatBusy) return
-    const message = chatInput.trim()
-    setChatHistory((prev) => [...prev, { role: 'user', text: message }])
-    setChatInput('')
-    setChatBusy(true)
-    setChatError(null)
-    setChatErrorIsLlmNotConfigured(false)
-    onOperationChange({ text: 'Dev is thinking...' })
-    try {
-      const result = await api.codingChat(projectId, selectedElementId, message, chatCodeScope)
-      setChatHistory((prev) => [...prev, { role: 'dev', text: result.reply }])
-      onOperationChange({ text: null })
-    } catch (err) {
-      const operationError = toOperationError(err)
-      setChatError(operationError.error ?? null)
-      setChatErrorIsLlmNotConfigured(operationError.errorCode === 'llm-not-configured')
-      onOperationChange(operationError)
-    } finally {
-      setChatBusy(false)
     }
   }
 
@@ -510,6 +572,24 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
           <button type="button" onClick={handleCodeAll} disabled={busy || elements.length === 0 || !!projectLock}>
             Code All
           </button>
+          <button
+            type="button"
+            onClick={handleTestFullApp}
+            disabled={busy || testFullAppBusy || elements.length === 0 || !!projectLock}
+            title="Runs every element's and every connected interface pair's own test suite together, so you can see whether the assembled app still works as a whole — not just each element on its own."
+          >
+            {testFullAppBusy ? 'Testing full app...' : 'Test Full App'}
+          </button>
+          {fullAppTestResult && (
+            <span
+              className="coding-full-app-result"
+              style={{ color: fullAppTestResult.allPassed ? 'var(--status-passing, green)' : 'var(--status-failing, crimson)' }}
+            >
+              {fullAppTestResult.allPassed
+                ? `All ${fullAppTestResult.runIds.length} test run(s) passed`
+                : `Failures found across ${fullAppTestResult.runIds.length} test run(s)`}
+            </span>
+          )}
         </div>
         <label className="coding-conventions-label">
           Coding conventions
@@ -589,10 +669,14 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
                     title={previewFilePath}
                     sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
                   />
+                ) : previewTextError ? (
+                  <p className="coding-hint">{previewTextError}</p>
+                ) : previewText === null ? (
+                  <p className="coding-hint">Loading…</p>
                 ) : (
-                  <p className="coding-hint">
-                    Not an HTML file — use "Open in new tab" to view or download it directly.
-                  </p>
+                  <pre className="coding-code-preview">
+                    <HighlightedCode code={previewText} lang={langForFilePath(previewFilePath)} />
+                  </pre>
                 )}
               </div>
             )}
@@ -635,27 +719,12 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
                 <h2>{selectedElement.name}</h2>
                 <button
                   type="button"
-                  onClick={() => handleRunCoding(selectedElement)}
-                  disabled={busy || !!projectLock}
-                >
-                  Code
-                </button>
-                <button
-                  type="button"
                   className="coding-recode-button"
                   onClick={() => handleRunCoding(selectedElement, true)}
                   disabled={busy || !!projectLock}
+                  title="Codes this element for the first time, or updates its existing code to reflect a requirement/interface change or a manual re-code request."
                 >
-                  Recode
-                </button>
-                <button
-                  type="button"
-                  className="coding-recode-button"
-                  onClick={() => handleRunCoding(selectedElement, true, true)}
-                  disabled={busy || !!projectLock}
-                  title="Deletes everything in this element's code folder first, so the agent writes fresh code instead of reviewing the existing implementation. Always available — a Coding run always targets exactly one element's own folder, so no shared-scope conflict is possible."
-                >
-                  Recode from scratch
+                  Update Code
                 </button>
                 <button
                   type="button"
@@ -716,15 +785,20 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
                       <span className="coding-live-log-stale">
                         {' '}
                         No output for {Math.round(liveLogMsSinceActivity / 1000)}s — may be stuck
-                        <button type="button" onClick={handleCancelRun} disabled={cancelBusy}>
-                          {cancelBusy ? 'Cancelling…' : 'Cancel run'}
-                        </button>
                       </span>
                     ) : (
                       liveLog && <span className="coding-live-log-fresh"> (updated {Math.round(liveLogMsSinceActivity / 1000)}s ago)</span>
                     )}
+                    <button
+                      type="button"
+                      className="coding-live-log-cancel"
+                      onClick={handleCancelRun}
+                      disabled={cancelBusy}
+                    >
+                      {cancelBusy ? 'Cancelling…' : 'Cancel run'}
+                    </button>
                   </div>
-                  <pre ref={liveLogRef}>{liveLog ? formatCodingLog(liveLog) : 'Waiting for output...'}</pre>
+                  <pre ref={liveLogRef}>{liveLog ? <FormattedLog text={liveLog} /> : 'Waiting for output...'}</pre>
                 </div>
               ) : latestRunForSelected ? (
                 <>
@@ -749,10 +823,11 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
                       {latestRunForSelected.status === 'cli-error' && 'The coding agent CLI run failed. See the raw log below.'}
                     </div>
                   )}
+                  <RunTimingSummary run={latestRunForSelected} />
                   <DiffView diff={latestRunForSelected.diff} />
                   <details className="coding-raw-log">
                     <summary>Raw output</summary>
-                    <pre>{formatCodingLog(latestRunForSelected.rawLog)}</pre>
+                    <pre><FormattedLog text={latestRunForSelected.rawLog} /></pre>
                   </details>
                 </>
               ) : (
@@ -765,73 +840,6 @@ export function CodingScreen({ api, projectId, onOperationChange, onOpenSettings
               )}
             </>
           )}
-        </div>
-      </div>
-
-      <div className="analyst-chat-dock" style={{ height: chatHeight }}>
-        <div className="analyst-chat-resize-handle" onMouseDown={handleResizeStart} />
-        <div className="analyst-chat-panel">
-          <div className="analyst-chat-heading-row">
-            <h2>Dev chat</h2>
-            <span className="analyst-chat-hint">
-              Discuss the selected element or a Coding run's diff/log with Dev — this does not write code.
-            </span>
-            <label className="coding-chat-scope-picker">
-              Code context
-              <select value={chatCodeScope} onChange={(e) => setChatCodeScope(e.target.value as typeof chatCodeScope)}>
-                <option value="none">None (element details only)</option>
-                <option value="element" disabled={!selectedElement}>
-                  This element's files{!selectedElement ? ' (select an element)' : ''}
-                </option>
-                <option value="project">Whole project</option>
-              </select>
-            </label>
-          </div>
-          <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>
-            {chatHistory.length === 0 && !chatBusy && (
-              <p className="analyst-chat-empty">No messages yet — start the conversation below.</p>
-            )}
-            {chatHistory.map((entry, i) => (
-              <div key={i} className={`analyst-chat-entry analyst-chat-entry-${entry.role}`}>
-                <strong>{entry.role === 'user' ? 'You' : 'Dev'}</strong>
-                <p>{highlightRequirementIds(entry.text)}</p>
-              </div>
-            ))}
-            {chatBusy && <p className="analyst-chat-empty">Dev is thinking...</p>}
-          </div>
-
-          {chatError && (
-            <div className="analyst-chat-error">
-              <span>{chatError}</span>
-              {chatErrorIsLlmNotConfigured ? (
-                <button type="button" onClick={onOpenSettings}>
-                  Open Settings
-                </button>
-              ) : (
-                <button type="button" onClick={handleChatSend}>
-                  Retry
-                </button>
-              )}
-            </div>
-          )}
-
-          <div className="analyst-chat-input-row">
-            <textarea
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleChatSend()
-                }
-              }}
-              placeholder="Ask Dev..."
-              rows={2}
-            />
-            <button type="button" onClick={handleChatSend} disabled={!chatInput.trim() || chatBusy}>
-              Send
-            </button>
-          </div>
         </div>
       </div>
     </div>

@@ -1,5 +1,5 @@
 import type { LlmMessage } from './LlmClient.js'
-import type { ArchitectureElement, InterfaceContract, InterfaceContractOperation, Requirement } from './types.js'
+import type { ArchitectureElement, InterfaceDefinition, InterfaceContractOperation, Requirement } from './types.js'
 
 // These prompts propose WHAT tests should exist (title + requirement/
 // contract linkage) — they do NOT generate test source code. Source-code
@@ -71,13 +71,13 @@ function formatOperations(operations: InterfaceContractOperation[]): string {
 export function buildIntegrationTestProposalMessages(
   fromElement: ArchitectureElement,
   toElement: ArchitectureElement,
-  contract: InterfaceContract,
+  definition: InterfaceDefinition,
 ): LlmMessage[] {
   return [
     { role: 'system', content: INTEGRATION_TEST_PROPOSAL_SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `Interface connection:\n${formatElement(fromElement)}\n${formatElement(toElement)}\n\nContract operations:\n${formatOperations(contract.operations)}`,
+      content: `Interface connection:\n${formatElement(fromElement)}\n${formatElement(toElement)}\n\nContract operations:\n${formatOperations(definition.operations)}`,
     },
   ]
 }

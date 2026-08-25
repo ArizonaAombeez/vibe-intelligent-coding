@@ -1,8 +1,10 @@
+import path from 'node:path'
+import { readdir } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { elementSubfolderName, sourceTreeRoot } from 'vic-coding'
 import { connectedPairs } from 'vic-requirements-elicitation'
-import type { Project, TestCase, TestCaseOutcome, TestRegressionRun, TestRun } from 'vic-requirements-elicitation'
+import type { Project, TestCase, TestCaseOutcome, TestRegressionRun, TestRun, SwTestOutcome } from 'vic-requirements-elicitation'
 import { resolveExecutionScope } from './executionScopeGate.js'
-import { readElementTestCommand } from './testCommandResolution.js'
 import { runTestCommand } from './testRunner.js'
 import { applyPassThreshold } from './requirementStatusFlip.js'
 
@@ -12,6 +14,76 @@ function elementSubfolderById(project: Project): Map<string, string> {
     map.set(element.id, elementSubfolderName(element))
   }
   return map
+}
+
+// Interpreter derived purely from a test file's own extension — no stored
+// per-element/per-file command needed. Each test file the coding agent (or
+// Test Creation's own "Generate Test File") writes is a single,
+// directly-runnable script by construction (see buildTestGenerationPrompt
+// and runCoding's equivalent instruction for inline tests); running it is
+// just re-invoking that same interpreter on that same file, exactly as it
+// was run once already at generation/coding time. Extensions are the only
+// ones actually observed in real generated projects so far — extend this
+// map if a project introduces a new test language, not by resurrecting a
+// stored RUN: command.
+const INTERPRETER_BY_EXTENSION: Record<string, string> = {
+  '.mjs': 'node',
+  '.cjs': 'node',
+  '.js': 'node',
+  '.py': 'python',
+}
+
+const TEST_FILE_SUFFIX_PATTERN = /\.test\.[^./\\]+$/
+
+// Recursively finds every "*.test.<ext>" file under an element's (or
+// interface pair's) own scoped subfolder — an element's generated tests can
+// live nested a level or two deep (e.g. <element>/<element>/foo.test.mjs,
+// mirroring how vic-coding scaffolds each element's own package folder), so
+// a single-level readdir would miss most of them.
+async function findTestFiles(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true })
+  const files: string[] = []
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+      files.push(...(await findTestFiles(full)))
+    } else if (entry.isFile() && TEST_FILE_SUFFIX_PATTERN.test(entry.name)) {
+      files.push(full)
+    }
+  }
+  return files
+}
+
+interface TestFileResult {
+  filePath: string // absolute
+  passed: boolean
+  output: string
+}
+
+// Runs every discovered test file in a scope as its own process (extension
+// -> interpreter, see INTERPRETER_BY_EXTENSION) and returns one result per
+// file. A file whose extension isn't recognized is skipped entirely (not
+// reported as a failure) — there is nothing to run it with, and guessing
+// would be worse than omitting it; see the caller for how an unrecognized
+// file still shows up as "present but unrunnable" via rawLog.
+async function runTestFiles(cwd: string, testFiles: string[]): Promise<{ results: TestFileResult[]; skipped: string[] }> {
+  const results: TestFileResult[] = []
+  const skipped: string[] = []
+  for (const filePath of testFiles) {
+    const ext = path.extname(filePath)
+    const interpreter = INTERPRETER_BY_EXTENSION[ext]
+    if (!interpreter) {
+      skipped.push(filePath)
+      continue
+    }
+    const relativeToScope = path.relative(cwd, filePath)
+    const commandResult = await runTestCommand({ command: interpreter, args: [relativeToScope], cwd })
+    const output =
+      commandResult.stdout + (commandResult.stderr ? `\n${commandResult.stderr}` : '') + (commandResult.timedOut ? '\n(timed out)' : '')
+    results.push({ filePath, passed: commandResult.exitCode === 0 && !commandResult.timedOut, output })
+  }
+  return { results, skipped }
 }
 
 function activeTestsForScope(
@@ -27,60 +99,83 @@ function activeTestsForScope(
   return tests.filter((t) => t.architectureElementId === architectureElementId)
 }
 
-// Pragmatic per-test outcome attribution (confirmed acceptable for v1):
-// tries a handful of common pass/fail line patterns (Jest/Vitest/Mocha's
-// checkmark-ish "✓ <name>"/"✗ <name>", "PASS"/"FAIL <name>", pytest's
-// "<name> PASSED"/"<name> FAILED"). If none of a scope's test titles can
-// be matched against the output this way, every TestCase in the scope
-// shares one aggregate outcome (the whole command's exit code) rather than
-// guessing — a real, load-bearing v1 simplification, not full generality.
-const PASS_PATTERNS = [/✓\s*(.+)$/m, /PASS(?:ED)?\s+(.+)$/m]
-const FAIL_PATTERNS = [/[✗x]\s*(.+)$/m, /FAIL(?:ED)?\s+(.+)$/m]
+// Path headers ("diff --git a/<path> b/<path>") from a Coding run's stored
+// diff text — the only persisted record of exactly which files a Step 5
+// coding run touched (CodingRun itself keeps the diff, not a separate file
+// list). Used to recognize every file the coding agent wrote, regardless of
+// whether it also happens to be linked to a Step 4 TestCase.
+const DIFF_GIT_HEADER_PATTERN = /^diff --git a\/(.+) b\/(.+)$/gm
 
-// Only a TestCase with a generated file (filePath set by a prior "Generate
-// Test File" run — see writeTestFiles.ts) can have actually contributed to
-// this command's exit code or output; one with no file yet has no test code
-// backing it. Excluded before attribution runs, in both the per-title-match
-// and aggregate-fallback branches — a title match against a file-less test
-// case would be coincidental, not meaningful, and the aggregate fallback
-// existing at all is exactly what let a real test's pass silently vouch for
-// unrelated, never-generated test cases sharing the same element scope
-// (confirmed real behavior, not hypothetical: running one generated test
-// among several ungenerated ones previously marked all of them "passing").
-function attributeOutcomes(testCases: TestCase[], stdout: string, exitCode: number | null): TestCaseOutcome[] {
-  const generated = testCases.filter((t) => t.filePath)
-  if (generated.length === 0) return []
+function pathsTouchedByDiff(diff: string): string[] {
+  const paths = new Set<string>()
+  for (const match of diff.matchAll(DIFF_GIT_HEADER_PATTERN)) {
+    paths.add(match[2])
+  }
+  return [...paths]
+}
 
-  const lines = stdout.split('\n')
-  const passedTitles = new Set<string>()
-  const failedTitles = new Set<string>()
-
-  for (const line of lines) {
-    for (const pattern of PASS_PATTERNS) {
-      const m = line.match(pattern)
-      if (m) passedTitles.add(m[1].trim())
-    }
-    for (const pattern of FAIL_PATTERNS) {
-      const m = line.match(pattern)
-      if (m) failedTitles.add(m[1].trim())
+// Every test file path (relative to srcRoot, forward-slash) written by a
+// Step 5 Coding run for this scope — one architecture element's own
+// successful CodingRuns, since Coding always runs against a single element
+// (see runCoding.ts). An interface-pair scope has no CodingRun of its own,
+// so it never contributes here.
+//
+// A Coding run's diff is captured from an isolated copy of just
+// allowedSubfolder's own contents (see withIsolatedElementWorkspace in
+// vic-coding: cp(srcRoot/allowedSubfolder, isolatedRoot, ...) makes
+// allowedSubfolder's contents the isolated repo root) — so the diff's own
+// paths are already exactly what runTestFiles/attributeResults see once
+// re-anchored onto allowedSubfolder (matching the coding agent's own
+// observed convention of nesting a same-named subfolder inside its scope,
+// e.g. user-interface/user-interface/foo.test.mjs).
+function stepFiveTestFilesForScope(project: Project, architectureElementId: string | undefined): Set<string> {
+  const paths = new Set<string>()
+  if (!architectureElementId) return paths
+  for (const run of project.codingRuns ?? []) {
+    if (run.architectureElementId !== architectureElementId || run.status !== 'success' || !run.diff) continue
+    for (const p of pathsTouchedByDiff(run.diff)) {
+      if (TEST_FILE_SUFFIX_PATTERN.test(p)) paths.add(`${run.allowedSubfolder}/${p}`)
     }
   }
+  return paths
+}
 
-  const anyMatched = generated.some((t) => passedTitles.has(t.title) || failedTitles.has(t.title))
-  if (anyMatched) {
-    return generated.map((t) => ({
-      testCaseId: t.id,
-      passed: passedTitles.has(t.title) && !failedTitles.has(t.title),
-      output: stdout,
-    }))
+// Per-file outcome attribution: each discovered test file was already run
+// on its own (runTestFiles above), so attribution is exact file-identity
+// matching, not text parsing — no framework-specific pass/fail markup to
+// guess at, since every file's own real exit code is already known. A
+// result whose file matches a TestCase's filePath (relative to srcRoot) is
+// that TestCase's requirement-traced outcome (shown in Test Execution's
+// Test Creation column). Independently, a result whose file was written by
+// a Step 5 Coding run (per stepFiveTestFilesForScope) is always also an
+// SW-based (coding-agent) outcome (Area F "SW-based tests" / the Test
+// Execution SW tests column) — the two are not mutually exclusive: a test
+// case's own generated file can show up in both, since the reader wants to
+// see every test file the coding agent produced regardless of whether it's
+// also traced to a requirement.
+function attributeResults(
+  testCases: TestCase[],
+  results: TestFileResult[],
+  srcRoot: string,
+  stepFiveTestFiles: Set<string>,
+): { outcomes: TestCaseOutcome[]; swOutcomes: SwTestOutcome[] } {
+  const testCaseByRelativePath = new Map(
+    testCases.filter((t) => t.filePath).map((t) => [path.resolve(srcRoot, t.filePath!), t]),
+  )
+
+  const outcomes: TestCaseOutcome[] = []
+  const swOutcomes: SwTestOutcome[] = []
+  for (const result of results) {
+    const relativePath = path.relative(srcRoot, result.filePath).split(path.sep).join('/')
+    const testCase = testCaseByRelativePath.get(path.resolve(result.filePath))
+    if (testCase) {
+      outcomes.push({ testCaseId: testCase.id, passed: result.passed, output: result.output })
+    }
+    if (stepFiveTestFiles.has(relativePath) || !testCase) {
+      swOutcomes.push({ name: path.basename(result.filePath), passed: result.passed })
+    }
   }
-
-  // Aggregate fallback: exit code 0 means every generated test in this
-  // scope passed; non-zero means every generated test in this scope is
-  // marked failed (unattributed triage until a human/LLM sorts out which
-  // one(s) actually broke).
-  const aggregatePassed = exitCode === 0
-  return generated.map((t) => ({ testCaseId: t.id, passed: aggregatePassed, output: stdout }))
+  return { outcomes, swOutcomes }
 }
 
 function requireTestRuns(project: Project): TestRun[] {
@@ -95,11 +190,13 @@ export interface RunElementTestSuiteScope {
 
 // Element-scoped test run (Area F, resolved) — resolves scope (rejects
 // before spawning a subprocess for an unresolvable scope, same "no
-// subprocess cost for a rejected scope" economy as Coding), runs the
-// element's own test command once (a single invocation covers every test
-// file already written into that subfolder — most frameworks report at
-// suite level, not per-invocation), attributes per-test outcomes
-// pragmatically, and persists a new TestRun onto project.testRuns.
+// subprocess cost for a rejected scope" economy as Coding), discovers and
+// runs every test file already written into that subfolder as its own
+// process (see findTestFiles/runTestFiles — one real exit code per file,
+// not a single shared command guessed at project-generation time),
+// attributes each file's own outcome by matching its path against known
+// TestCases (attributeResults), and persists a new TestRun onto
+// project.testRuns.
 //
 // Deliberately does NOT apply the pass-threshold status flip itself — a
 // freshly-failed outcome has no triage yet by construction (triage is a
@@ -134,7 +231,7 @@ export async function runElementTestSuite(
 
   if ('rejected' in resolved) {
     const run: TestRun = {
-      id: `TESTRUN-${startedAt}`,
+      id: `TESTRUN-${startedAt}-${randomUUID()}`,
       kind: 'element-scoped',
       architectureElementId: scope.architectureElementId ?? null,
       interfaceElementIds: scope.interfaceElementIds,
@@ -146,20 +243,18 @@ export async function runElementTestSuite(
           ? 'This element/interface pair has not been scaffolded/coded yet — nothing to test.'
           : 'Could not resolve a single element/interface scope for this test run.',
       outcomes: [],
+      swOutcomes: [],
     }
     requireTestRuns(project).push(run)
     return run
   }
 
   const testCases = activeTestsForScope(project.testSuite, scope.architectureElementId, scope.interfaceElementIds)
-  const testCommand = await readElementTestCommand(srcRoot, resolved.allowedRelativePrefix, project.testCommand)
-  const commandResult = await runTestCommand({
-    command: testCommand.command,
-    args: testCommand.args,
-    cwd: resolved.cwd,
-  })
+  const testFiles = await findTestFiles(resolved.cwd)
+  const { results, skipped } = await runTestFiles(resolved.cwd, testFiles)
 
-  const outcomes = attributeOutcomes(testCases, commandResult.stdout, commandResult.exitCode)
+  const stepFiveTestFiles = stepFiveTestFilesForScope(project, scope.architectureElementId)
+  const { outcomes, swOutcomes } = attributeResults(testCases, results, srcRoot, stepFiveTestFiles)
   for (const outcome of outcomes) {
     const testCase = testCases.find((t) => t.id === outcome.testCaseId)
     if (testCase) {
@@ -168,16 +263,26 @@ export async function runElementTestSuite(
     }
   }
 
+  const allPassed = results.length > 0 && results.every((r) => r.passed)
+  const rawLogSections = results.map((r) => `--- ${path.relative(srcRoot, r.filePath)} ---\n${r.output}`)
+  if (skipped.length > 0) {
+    rawLogSections.push(`(no interpreter known for: ${skipped.map((f) => path.relative(srcRoot, f)).join(', ')})`)
+  }
+  if (results.length === 0 && skipped.length === 0) {
+    rawLogSections.push('No test files found in this scope.')
+  }
+
   const run: TestRun = {
-    id: `TESTRUN-${startedAt}`,
+    id: `TESTRUN-${startedAt}-${randomUUID()}`,
     kind: 'element-scoped',
     architectureElementId: scope.architectureElementId ?? null,
     interfaceElementIds: scope.interfaceElementIds,
     startedAt,
     finishedAt: new Date().toISOString(),
-    exitCode: commandResult.exitCode,
-    rawLog: commandResult.stdout + (commandResult.stderr ? `\n${commandResult.stderr}` : '') + (commandResult.timedOut ? '\n(test command timed out)' : ''),
+    exitCode: results.length === 0 ? null : allPassed ? 0 : 1,
+    rawLog: rawLogSections.join('\n\n'),
     outcomes,
+    swOutcomes,
   }
   requireTestRuns(project).push(run)
 
@@ -213,39 +318,33 @@ function requireRegressionRuns(project: Project): TestRegressionRun[] {
 
 // Full regression (Area F "Full regression policy", resolved) — not a
 // separate artefact; the union of every element's own scoped run. Loops
-// runElementTestSuite over every architecture element with active
-// functional tests, and every connected pair with active integration
-// tests, collects the resulting TestRun ids into one TestRegressionRun,
-// and calls the pass-threshold flip exactly once over the COMBINED
-// outcome set from every element-scoped run in this pass (so a
-// requirement whose tests span two runs still needs all of them green in
-// the same regression pass to flip to complete).
+// runElementTestSuite over every architecture element and every connected
+// pair — not just ones with an active requirement-based TestCase, so an
+// element whose only tests are the coding agent's own inline SW-based ones
+// (Area F "SW-based tests") still gets swept and reported; a scope that was
+// never scaffolded still resolves cheaply via runElementTestSuite's own
+// rejected-scope short-circuit (no subprocess spawned). Collects the
+// resulting TestRun ids into one TestRegressionRun, and calls the
+// pass-threshold flip exactly once over the COMBINED requirement-traced
+// outcome set from every element-scoped run in this pass (so a requirement
+// whose tests span two runs still needs all of them green in the same
+// regression pass to flip to complete) — SW outcomes never participate in
+// that flip, since they have no requirement to satisfy.
 export async function runFullRegression(
   project: Project,
   projectDir: string,
   trigger: 'coding-success' | 'manual',
 ): Promise<TestRegressionRun> {
   const startedAt = new Date().toISOString()
-  const suite = project.testSuite
-  const activeCases = (suite?.tests ?? []).filter((t) => !t.deletedAt)
 
-  const elementIds = new Set(
-    activeCases.filter((t) => t.type === 'functional' && t.architectureElementId).map((t) => t.architectureElementId as string),
-  )
-  const interfacePairs = new Set(
-    activeCases
-      .filter((t) => t.type === 'integration' && t.interfaceElementIds)
-      .map((t) => [...t.interfaceElementIds!].sort().join('|')),
-  )
+  const elementIds = (project.architecture?.elements ?? []).map((e) => e.id)
+  const connected = project.architecture ? connectedPairs(project.architecture.elements) : []
 
   const runs: TestRun[] = []
   for (const elementId of elementIds) {
     runs.push(await runElementTestSuite(project, projectDir, { architectureElementId: elementId }, true))
   }
-  const connected = project.architecture ? connectedPairs(project.architecture.elements) : []
   for (const pair of connected) {
-    const key = [pair.fromId, pair.toId].sort().join('|')
-    if (!interfacePairs.has(key)) continue
     runs.push(await runElementTestSuite(project, projectDir, { interfaceElementIds: [pair.fromId, pair.toId] }, true))
   }
 

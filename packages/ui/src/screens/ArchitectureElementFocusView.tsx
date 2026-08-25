@@ -18,6 +18,8 @@ interface ArchitectureElementFocusViewProps {
   onRemoveInterface: (fromId: string, toId: string) => void
   onCheckInterfaceConflict: (fromId: string, toId: string) => void
   onAskArchitectAboutInterface: (fromId: string, toId: string) => void
+  onDefineInterface: (fromId: string, toId: string) => void
+  onEditInterface: (fromId: string, toId: string) => void
 }
 
 const KIND_LABEL: Record<ArchitectureElementKind, string> = {
@@ -53,6 +55,8 @@ export function ArchitectureElementFocusView({
   onRemoveInterface,
   onCheckInterfaceConflict,
   onAskArchitectAboutInterface,
+  onDefineInterface,
+  onEditInterface,
 }: ArchitectureElementFocusViewProps) {
   const [editing, setEditing] = useState(false)
   const [draftName, setDraftName] = useState(element.name)
@@ -267,24 +271,62 @@ export function ArchitectureElementFocusView({
             <ul className="architecture-interface-list">
               {element.interfaces.map((id) => {
                 const target = architecture.elements.find((e) => e.id === id)
-                const contract = (architecture.interfaceContracts ?? []).find(
-                  (c) => (c.fromId === element.id && c.toId === id) || (c.fromId === id && c.toId === element.id),
+                const contract = (architecture.interfaceDefinitions ?? []).find(
+                  (d) => d.participants.some((p) => p.elementId === element.id) && d.participants.some((p) => p.elementId === id),
                 )
-                const contractLabel =
-                  contract?.status === 'defined' && contract.operations.length > 0
-                    ? `Defined (${contract.operations.length})`
-                    : contract?.status === 'stale'
-                      ? 'Stale'
-                      : 'Not defined'
+                const isDefined = contract?.status === 'defined' && contract.operations.length > 0
+                const contractLabel = isDefined ? `Defined (${contract.operations.length})` : contract?.status === 'stale' ? 'Stale' : 'Not defined'
                 return (
                   <li key={id} className="architecture-interface-row">
                     <span>
                       {target ? `${target.id} — ${target.name}` : id}
-                      <span className="architecture-focus-kind" style={{ marginLeft: '0.5em' }}>
+                      <span
+                        className="architecture-focus-kind"
+                        style={{ marginLeft: '0.5em', color: isDefined ? undefined : 'var(--status-red)', fontWeight: isDefined ? undefined : 600 }}
+                      >
                         {contractLabel}
                       </span>
                     </span>
+                    {isDefined && (
+                      <ul className="architecture-interface-operation-list">
+                        {contract.operations.map((op) => {
+                          const ioDetail = [
+                            op.range && `range: ${op.range}`,
+                            op.resolution && `resolution: ${op.resolution}`,
+                            op.unit && `unit: ${op.unit}`,
+                            op.drivenDirectly ? 'driven directly' : op.updateFrequency && `min update: ${op.updateFrequency}`,
+                          ].filter(Boolean)
+                          const missing = ioDetail.length === 0
+                          return (
+                            <li key={op.name} className="requirement-detail-note" style={missing ? { color: 'var(--status-red)' } : undefined}>
+                              <strong>{op.name}</strong>
+                              {missing ? ' — I/O detail not defined' : ` — ${ioDetail.join(', ')}`}
+                            </li>
+                          )
+                        })}
+                      </ul>
+                    )}
                     <div className="architecture-interface-actions">
+                      <button
+                        type="button"
+                        className="requirement-detail-edit-btn"
+                        onClick={() => onDefineInterface(element.id, id)}
+                        title={
+                          contractLabel === 'Not defined'
+                            ? 'Define this interface'
+                            : 'Redefine this interface (overwrites the existing contract, e.g. to fill in newly-added I/O detail fields)'
+                        }
+                      >
+                        {contractLabel === 'Not defined' ? 'Define' : 'Redefine'}
+                      </button>
+                      <button
+                        type="button"
+                        className="requirement-detail-edit-btn"
+                        onClick={() => onEditInterface(element.id, id)}
+                        title="Manually edit this interface's operations (no LLM call)"
+                      >
+                        Edit
+                      </button>
                       <button
                         type="button"
                         className="requirement-detail-edit-btn"

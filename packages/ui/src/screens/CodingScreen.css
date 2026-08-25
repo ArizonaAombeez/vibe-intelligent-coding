@@ -283,6 +283,66 @@
   background: #fff;
 }
 
+.coding-code-preview {
+  background: var(--bg);
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  padding: 10px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  overflow: auto;
+  max-height: 420px;
+  white-space: pre;
+}
+
+.code-tok-comment {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.code-tok-string {
+  color: var(--status-green);
+}
+
+.code-tok-keyword {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.code-tok-number {
+  color: var(--status-amber);
+}
+
+.code-tok-type {
+  color: #7c9fd6;
+}
+
+.code-tok-tag {
+  color: var(--accent);
+}
+
+.code-tok-attr {
+  color: #7c9fd6;
+}
+
+.code-tok-punct {
+  color: var(--text-muted);
+}
+
+.coding-log-line-tool {
+  color: var(--accent);
+}
+
+.coding-log-line-error {
+  color: var(--status-red);
+}
+
+.coding-log-line-thinking {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .coding-layout {
   display: grid;
   grid-template-columns: 320px 1fr;
@@ -452,6 +512,23 @@
   margin-left: auto;
 }
 
+.coding-run-timing {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 6px 0 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.coding-run-timing-item {
+  white-space: nowrap;
+}
+
+.coding-run-timing-warning {
+  color: var(--status-amber);
+}
+
 .coding-diff {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -501,7 +578,20 @@
 }
 
 .coding-live-log {
-  margin-top: 12px;
+  position: fixed;
+  top: 72px;
+  right: 20px;
+  bottom: 20px;
+  width: 420px;
+  max-width: calc(100vw - 40px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel, var(--bg));
+  border: 1px solid var(--status-green);
+  border-radius: 10px;
+  padding: 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  z-index: 20;
 }
 
 .coding-live-log-heading {
@@ -511,6 +601,11 @@
   font-size: 13px;
   color: var(--text-muted);
   margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+
+.coding-live-log-cancel {
+  margin-left: auto;
 }
 
 .coding-live-log-dot {
@@ -543,25 +638,6 @@
   font-weight: 600;
 }
 
-.coding-chat-scope-picker {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: auto;
-  font-size: 12px;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.coding-chat-scope-picker select {
-  font: inherit;
-  font-size: 12px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--bg);
-  color: var(--text-h);
-}
 
 .coding-live-log pre {
   background: var(--bg);
@@ -572,6 +648,7 @@
   font-size: 12px;
   overflow-x: auto;
   white-space: pre-wrap;
-  max-height: 480px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
 }

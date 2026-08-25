@@ -1,4 +1,4 @@
-import express from 'express'
+import express, { type ErrorRequestHandler } from 'express'
 import {
   ProjectStore,
   createRequirementFromForm,
@@ -42,14 +42,16 @@ import {
   removeLayer,
   checkArchitectureConflicts,
   autoConfigureAndAllocate,
-  autoAllocateHeuristic,
   autoAllocateLlm,
+  generateProjectOverview,
   chatWithArchitect,
   acceptProposedInterface,
   removeArchitectureInterface,
   checkInterfaceConflict,
-  defineInterfaceContract,
-  defineAllInterfaceContracts,
+  defineInterfaceDefinition,
+  defineAllInterfaceDefinitions,
+  setInterfaceDefinition,
+  reconcileElementInterface,
   checkInterfaces,
   nextFreeColumn,
   EXTERNAL_CONTEXT_ROW,
@@ -61,16 +63,6 @@ import {
   DEFAULT_CODE_STRIP_OPTIONS,
   CODE_GAP_SCAN_SYSTEM_PROMPT,
   ANALYSIS_SYSTEM_PROMPT,
-  createStory,
-  updateStory,
-  deleteStory,
-  addStoryDependency,
-  removeStoryDependency,
-  sequenceStories,
-  generateStoriesForElement,
-  generateStoriesForAllUnplannedElements,
-  researchStory,
-  chatWithPM,
   createTestCase,
   updateTestCase,
   deleteTestCase,
@@ -81,6 +73,8 @@ import {
   triageTestFailure,
   confirmTestCaseFailure,
   chatWithQATestExecution,
+  classifyAndDispatchUserReportedIssue,
+  formatCodeContextForTriage,
   importLegacyTestCases,
   deleteImportedTestCase,
   type ArchitectureTypeId,
@@ -90,7 +84,6 @@ import {
   type LlmCallOptions,
   type LlmUsage,
   type LlmClient,
-  type Story,
   type ProjectPartId,
   type RequirementsPartData,
   type ArchitecturePartData,
@@ -100,26 +93,22 @@ import {
   type RequirementStatus,
   type CodeStripOptions,
   type UnitTestMode,
+  type InterfaceContractOperation,
 } from 'vic-requirements-elicitation'
 import { generateMigrationPlan } from 'vic-planning'
-import { GlmApiError, resolveGlmBaseUrl, type GlmAccessMethod } from 'vic-llm-glm'
-import { checkClaudeCodeInstalled, ClaudeCodeAgentClient } from 'vic-llm-claude-code'
-import { OpenCodeAgentClient } from 'vic-llm-opencode'
+import type { GlmAccessMethod } from 'vic-llm-glm'
+import { glmModelCapabilities } from 'vic-llm-glm'
 import {
   scaffoldProjectSourceTree,
-  runCodingForStory,
   runCodingForElement,
   elementSubfolderName,
   sharedInterfaceSubfolderName,
   sourceTreeRoot,
-  chatWithDev,
-  DEFAULT_DEV_SYSTEM_PROMPT,
   scanCodeForRequirementReferences,
   checkInterfaceCodeAlignment,
-  wipeScopedSubfolder,
-  findStoriesSharingScope,
+  interfaceGateReasonForElement,
+  interfaceChangedSinceLastCoding,
   MARKER_FILENAME,
-  type CodeContextFile,
 } from 'vic-coding'
 import type { CodingAgentClient } from 'vic-coding'
 import {
@@ -127,8 +116,7 @@ import {
   runElementTestSuite,
   runFullRegression,
   evaluateRequirementStatus,
-  readElementTestCommand,
-  writeElementTestCommand,
+  scopeReadinessEntries,
 } from 'vic-testing'
 import JSZip from 'jszip'
 import path from 'node:path'
@@ -156,6 +144,11 @@ import {
   findPluginManifest,
   findInstalledPlugin,
   CLI_BACKED_PLUGIN_IDS,
+  codingAgentClient,
+  openCodeAgentClient,
+  checkClaudeCodeInstalled,
+  GlmApiError,
+  resolveGlmBaseUrl,
 } from './settingsRegistry.js'
 
 // Defaults live under the user's home directory, not process.cwd() — the
@@ -204,15 +197,14 @@ const PROJECTS_ROOT_SOURCE: 'env' | 'override' | 'default' = process.env.VIC_PRO
 
 const store = new ProjectStore({ projectsRoot: PROJECTS_ROOT })
 const usersStore = new UsersStore(PROJECTS_ROOT)
-// Options-free instances — per-call model/effort/apiKey/baseUrl travel
-// through runAgentTask's options (resolved from the Dev/QA persona per
-// request, same as every chat-backed route), matching how
-// getClientForPersona is never cached either. Two singletons, one per
-// agent-CLI kind (Claude Code vs OpenCode) — see
-// getCodingAgentClientForPersona below for which one a given request
-// actually uses.
-const codingAgentClient = new ClaudeCodeAgentClient()
-const openCodeAgentClient = new OpenCodeAgentClient()
+// codingAgentClient/openCodeAgentClient are options-free singletons built by
+// settingsRegistry.ts at startup — per-call model/effort/apiKey/baseUrl
+// travel through runAgentTask's options (resolved from the Dev/QA persona
+// per request, same as every chat-backed route), matching how
+// getClientForPersona is never cached either. Either can be undefined if its
+// plugin module (modules/llm/claude-code, modules/llm/opencode) isn't
+// present — see getCodingAgentClientForPersona below, which surfaces that as
+// LlmNotConfiguredError rather than crashing.
 
 // Running total across this server process's lifetime, accumulated from
 // each GLM call's real reported usage (not estimated, unlike the UI's mock
@@ -253,7 +245,7 @@ function sendLlmError(res: express.Response, err: unknown): void {
     res.status(503).json({ error: err.message, code: 'llm-not-configured' })
     return
   }
-  if (err instanceof GlmApiError) {
+  if (GlmApiError && err instanceof GlmApiError) {
     res.status(502).json({ error: err.message })
     return
   }
@@ -374,20 +366,57 @@ async function resolvePersonaLlmOptions(scope: PersonaScope, personaId: string):
 // OpenAI-compatible endpoint via apiKey/baseUrl, no Anthropic software
 // involved at all), anything else (Claude Code, or no plugin selected
 // yet) -> codingAgentClient, unchanged from today's behavior.
+// thinking/reasoningEffort are resolved generically by
+// resolvePersonaLlmOptions (any plugin's personaOverridableFields, keyed by
+// field.key) with no idea which concrete model they'll end up applied to.
+// GLM's own capabilities are genuinely per-model (see vic-llm-glm's
+// GLM_MODEL_CAPABILITIES) — GLM-5.3 cannot disable thinking at all, and
+// reasoning_effort's accepted values differ by model — so gating happens
+// here, the one place that knows both "this is actually GLM" and the
+// resolved model id, rather than inside OpenCodeAgentClient (deliberately
+// provider-agnostic, see its own comment) or ClaudeCodeAgentClient (which
+// never sees these fields — ignores them entirely, so no gating is needed
+// there).
+function resolveGlmThinkingAndEffort(
+  model: string | undefined,
+  thinking: string | undefined,
+  reasoningEffort: string | undefined,
+): { thinking?: string; reasoningEffort?: string } {
+  const capabilities = glmModelCapabilities(model)
+  return {
+    thinking: thinking && (thinking === 'enabled' || capabilities.canDisableThinking) ? thinking : undefined,
+    reasoningEffort:
+      reasoningEffort && capabilities.reasoningEffortValues?.includes(reasoningEffort) ? reasoningEffort : undefined,
+  }
+}
+
 async function getCodingAgentClientForPersona(
   scope: PersonaScope,
   personaId: string,
-): Promise<{ client: CodingAgentClient; extraOptions: { apiKey?: string; baseUrl?: string } }> {
+  model: string | undefined,
+  thinking: string | undefined,
+  reasoningEffort: string | undefined,
+): Promise<{
+  client: CodingAgentClient
+  extraOptions: { apiKey?: string; baseUrl?: string; thinking?: string; reasoningEffort?: string }
+}> {
   const pluginId = await resolvePersonaPluginId(scope, personaId)
   if (pluginId === 'vic-llm-glm') {
+    if (!openCodeAgentClient || !resolveGlmBaseUrl) {
+      throw new LlmNotConfiguredError()
+    }
     const values = await secretsStore.getPluginValues('vic-llm-glm')
     return {
       client: openCodeAgentClient,
       extraOptions: {
         apiKey: values.apiKey,
         baseUrl: resolveGlmBaseUrl(values.accessMethod as GlmAccessMethod | undefined),
+        ...resolveGlmThinkingAndEffort(model, thinking, reasoningEffort),
       },
     }
+  }
+  if (!codingAgentClient) {
+    throw new LlmNotConfiguredError()
   }
   return { client: codingAgentClient, extraOptions: {} }
 }
@@ -1225,22 +1254,16 @@ app.post('/api/projects/:id/architecture/auto-allocate', async (req, res) => {
     return
   }
   const mode = req.body?.mode
-  if (mode !== 'heuristic' && mode !== 'llm') {
-    res.status(400).json({ error: 'mode must be "heuristic" or "llm"' })
+  if (mode !== 'llm') {
+    res.status(400).json({ error: 'mode must be "llm"' })
     return
   }
   try {
     const personaScope = await resolvePersonaScope(req)
-    const result =
-      mode === 'heuristic'
-        ? autoAllocateHeuristic(project)
-        : await (async () => {
-            const llmClient = await getClientForPersona(personaScope, 'architect')
-            const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
-            const llmResult = await autoAllocateLlm(project, llmClient, llmOptions)
-            recordTokenUsage(llmResult.usage)
-            return llmResult
-          })()
+    const llmClient = await getClientForPersona(personaScope, 'architect')
+    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
+    const result = await autoAllocateLlm(project, llmClient, llmOptions)
+    recordTokenUsage(result.usage)
     await store.saveProject(project)
     res.json({
       architecture: project.architecture,
@@ -1397,12 +1420,90 @@ app.post('/api/projects/:id/architecture/interfaces/define', async (req, res) =>
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'architect')
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
-    const result = await defineInterfaceContract(project, llmClient, fromId, toId, llmOptions)
+    const result = await defineInterfaceDefinition(project, llmClient, fromId, toId, llmOptions)
     recordTokenUsage(result.usage)
     await store.saveProject(project)
-    res.json({ contract: result.contract })
+    res.json({ definition: result.definition })
   } catch (err) {
     sendLlmError(res, err)
+  }
+})
+
+function cleanOperations(operations: unknown[]): InterfaceContractOperation[] {
+  return operations.map((op: any) => ({
+    name: String(op?.name ?? ''),
+    description: String(op?.description ?? ''),
+    request: String(op?.request ?? ''),
+    response: String(op?.response ?? ''),
+    errors: String(op?.errors ?? ''),
+    range: op?.range ? String(op.range) : undefined,
+    resolution: op?.resolution ? String(op.resolution) : undefined,
+    unit: op?.unit ? String(op.unit) : undefined,
+    updateFrequency: op?.drivenDirectly ? undefined : op?.updateFrequency ? String(op.updateFrequency) : undefined,
+    drivenDirectly: op?.drivenDirectly === true ? true : undefined,
+  }))
+}
+
+// Manual counterpart to /interfaces/define — sets a definition's
+// participants/operations directly from the request body, no LLM call.
+// Backs the "list and edit all interfaces" manual CRUD requirement (both
+// the global Interfaces list and the per-element focus view use this same
+// endpoint). Creates a new definition when definitionId is omitted.
+app.put('/api/projects/:id/architecture/interfaces', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const { definitionId, name, participants, operations } = req.body ?? {}
+  if (
+    typeof name !== 'string' ||
+    !Array.isArray(participants) ||
+    participants.length < 2 ||
+    !Array.isArray(operations)
+  ) {
+    res.status(400).json({ error: 'name, a participants array (>= 2), and an operations array are required' })
+    return
+  }
+  const cleanedParticipants = participants.map((p: any) => ({
+    elementId: String(p?.elementId ?? ''),
+    role: p?.role === 'produces' || p?.role === 'consumes' || p?.role === 'both' ? p.role : 'both',
+  }))
+  try {
+    const definition = setInterfaceDefinition(
+      project,
+      typeof definitionId === 'string' ? definitionId : undefined,
+      name,
+      cleanedParticipants,
+      cleanOperations(operations),
+    )
+    await store.saveProject(project)
+    res.json({ definition })
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message })
+  }
+})
+
+// Reconciles one element's own local interface copy against its current
+// master definition (Area B/D, resolved) — the human review step required
+// before Coding unblocks for that element after a master interface change.
+app.put('/api/projects/:id/architecture/interfaces/:definitionId/reconcile', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const { elementId, operations } = req.body ?? {}
+  if (typeof elementId !== 'string' || !Array.isArray(operations)) {
+    res.status(400).json({ error: 'elementId and an operations array are required' })
+    return
+  }
+  try {
+    const entry = reconcileElementInterface(project, elementId, req.params.definitionId, cleanOperations(operations))
+    await store.saveProject(project)
+    res.json({ elementInterface: entry })
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message })
   }
 })
 
@@ -1416,10 +1517,11 @@ app.post('/api/projects/:id/architecture/interfaces/define-all', async (req, res
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'architect')
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
-    const result = await defineAllInterfaceContracts(project, llmClient, llmOptions)
+    const force = req.body?.force === true
+    const result = await defineAllInterfaceDefinitions(project, llmClient, llmOptions, force)
     recordTokenUsage(result.usage)
     await store.saveProject(project)
-    res.json({ contracts: result.contracts })
+    res.json({ definitions: result.definitions })
   } catch (err) {
     sendLlmError(res, err)
   }
@@ -1459,237 +1561,12 @@ app.post('/api/projects/:id/architecture/interfaces/check-code-alignment', async
   res.json(result)
 })
 
-// Planning (Area C) — backlog/stories, mirroring the architecture route
-// block above: loadProjectOr404 -> validate -> call -> save -> respond,
-// LLM-backed routes wrapped with the 'pm' persona and sendLlmError.
-app.get('/api/projects/:id/backlog', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  res.json(project.backlog ?? null)
-})
-
-app.post('/api/projects/:id/backlog/stories', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const { title, description, architectureElementId, requirementIds, interfaceElementIds } = req.body ?? {}
-  if (typeof title !== 'string' || !title.trim() || typeof description !== 'string') {
-    res.status(400).json({ error: 'title and description are required' })
-    return
-  }
-  const story = createStory(project, {
-    title,
-    description,
-    architectureElementId,
-    requirementIds,
-    interfaceElementIds,
-  })
-  await store.saveProject(project)
-  res.status(201).json(story)
-})
-
-app.put('/api/projects/:id/backlog/stories/:storyId', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  try {
-    const story = updateStory(project, req.params.storyId, req.body ?? {})
-    await store.saveProject(project)
-    res.json(story)
-  } catch (err) {
-    res.status(404).json({ error: (err as Error).message })
-  }
-})
-
-app.delete('/api/projects/:id/backlog/stories/:storyId', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  try {
-    deleteStory(project, req.params.storyId)
-    await store.saveProject(project)
-    res.status(204).end()
-  } catch (err) {
-    res.status(404).json({ error: (err as Error).message })
-  }
-})
-
-app.post('/api/projects/:id/backlog/stories/:storyId/dependencies', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const dependsOnId = req.body?.dependsOnId
-  if (typeof dependsOnId !== 'string' || !dependsOnId.trim()) {
-    res.status(400).json({ error: 'dependsOnId is required' })
-    return
-  }
-  try {
-    const story = addStoryDependency(project, req.params.storyId, dependsOnId)
-    await store.saveProject(project)
-    res.json(story)
-  } catch (err) {
-    res.status(400).json({ error: (err as Error).message })
-  }
-})
-
-app.delete('/api/projects/:id/backlog/stories/:storyId/dependencies/:dependsOnId', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  try {
-    const story = removeStoryDependency(project, req.params.storyId, req.params.dependsOnId)
-    await store.saveProject(project)
-    res.json(story)
-  } catch (err) {
-    res.status(404).json({ error: (err as Error).message })
-  }
-})
-
-app.post('/api/projects/:id/backlog/generate-stories', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const architectureElementId = req.body?.architectureElementId
-  if (typeof architectureElementId !== 'string' || !architectureElementId.trim()) {
-    res.status(400).json({ error: 'architectureElementId is required' })
-    return
-  }
-  try {
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'pm')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'pm')
-    const { stories, usage } = await generateStoriesForElement(project, llmClient, architectureElementId, llmOptions)
-    recordTokenUsage(usage)
-    await store.saveProject(project)
-    res.json({ stories })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
-app.post('/api/projects/:id/backlog/generate-stories-all', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  try {
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'pm')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'pm')
-    const { stories, usage } = await generateStoriesForAllUnplannedElements(project, llmClient, llmOptions)
-    recordTokenUsage(usage)
-    await store.saveProject(project)
-    res.json({ stories })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
-app.post('/api/projects/:id/backlog/sequence', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  sequenceStories(project)
-  await store.saveProject(project)
-  res.json(project.backlog)
-})
-
-app.post('/api/projects/:id/backlog/stories/:storyId/research', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  try {
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'pm')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'pm')
-    const { research, usage } = await researchStory(project, llmClient, req.params.storyId, llmOptions)
-    recordTokenUsage(usage)
-    await store.saveProject(project)
-    res.json({ research })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
-app.post('/api/projects/:id/backlog/chat', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const message = req.body?.message
-  if (typeof message !== 'string' || !message.trim()) {
-    res.status(400).json({ error: 'message is required' })
-    return
-  }
-  try {
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'pm')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'pm')
-    const result = await chatWithPM(project, llmClient, message, llmOptions)
-    recordTokenUsage(result.usage)
-    res.json({ reply: result.reply, proposedStories: result.proposedStories })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
-app.post('/api/projects/:id/backlog/stories/from-proposal', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const { architectureElementName, title, description } = req.body ?? {}
-  if (
-    typeof architectureElementName !== 'string' ||
-    typeof title !== 'string' ||
-    typeof description !== 'string' ||
-    !title.trim()
-  ) {
-    res.status(400).json({ error: 'architectureElementName, title, and description are required' })
-    return
-  }
-  const element = project.architecture?.elements.find((e) => e.name === architectureElementName)
-  if (!element) {
-    res.status(400).json({ error: `Architecture element "${architectureElementName}" not found` })
-    return
-  }
-  const story = createStory(project, {
-    title,
-    description,
-    architectureElementId: element.id,
-  })
-  await store.saveProject(project)
-  res.status(201).json(story)
-})
-
-// Coding & Review-Rework (Area D) — subfolder scaffolding, per-story CLI
-// runs, and the coding-conventions free-text field the prompt builder
-// reads. "Run Coding" does NOT go through getClientForPersona's
-// plugin-manifest indirection (the agent client isn't a registered LLM
-// plugin, see modules/coding's design notes) — "not installed" surfaces as
-// a cli-error-status CodingRun in a 200 response, not an HTTP error,
+// Coding & Review-Rework (Area D) — subfolder scaffolding and the
+// coding-conventions free-text field the prompt builder reads. "Run
+// Coding" does NOT go through getClientForPersona's plugin-manifest
+// indirection (the agent client isn't a registered LLM plugin, see
+// modules/coding's design notes) — "not installed" surfaces as a
+// cli-error-status CodingRun in a 200 response, not an HTTP error,
 // mirroring the "greyed out/disabled rather than hidden" degradation the
 // Coding screen already anticipates.
 app.post('/api/projects/:id/coding/scaffold', async (req, res) => {
@@ -1729,225 +1606,8 @@ app.get('/api/projects/:id/coding/runs/:runId', async (req, res) => {
   res.json(run)
 })
 
-app.post('/api/projects/:id/backlog/stories/:storyId/run-coding', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const story = project.backlog?.stories.find((s) => s.id === req.params.storyId)
-  if (!story) {
-    res.status(404).json({ error: 'story not found' })
-    return
-  }
-  // Client-generated (see CodingScreen.tsx) so the browser can start
-  // polling GET /api/coding/runs/:token/log immediately, before this
-  // blocking request resolves — falls back to a server-generated one for
-  // any caller that doesn't send it, so the route still works without it.
-  const runToken = typeof req.body?.runToken === 'string' ? req.body.runToken : randomUUID()
-  // Manual recode of an already-coded story (see CodingScreen's "Recode"
-  // button) — the story's covered requirements are otherwise stuck at
-  // 'coded' or later, which isStoryEligibleForCoding treats as "nothing
-  // pending," so a plain re-run would silently no-op. Regressing them back
-  // to 'allocated' first re-uses that same eligibility path unchanged
-  // rather than adding a second, parallel "force" code path through
-  // runCodingForStory.
-  if (req.body?.recode === true) {
-    for (const requirementId of story.requirementIds) {
-      const requirement = project.requirements.find((r) => r.id === requirementId && !r.deletedAt)
-      if (requirement) regressStatusForRecode(requirement)
-    }
-  }
-  // "Recode from scratch" — wipes the story's scoped subfolder before the
-  // agent runs, so it writes fresh code instead of reviewing (and
-  // potentially keeping) whatever's already there, which is what let a
-  // wrong prior implementation survive an ordinary Recode unchanged.
-  // Refuses outright if another story shares the same subfolder, since a
-  // wipe has no way to tell that story's files apart from this one's — see
-  // findStoriesSharingScope.
-  if (req.body?.fromScratch === true) {
-    const sharing = findStoriesSharingScope(project, story)
-    if (sharing.length > 0) {
-      res.status(409).json({
-        error: `Can't recode from scratch — this story shares its code folder with ${sharing.length === 1 ? 'another story' : `${sharing.length} other stories`} (${sharing.map((s) => `${s.id} "${s.title}"`).join(', ')}). Wiping the folder would delete their code too. Use a normal Recode instead.`,
-        code: 'shared-scope',
-      })
-      return
-    }
-    if (!project.architecture) {
-      res.status(400).json({ error: 'Project has no architecture — select an Architecture type and add elements first' })
-      return
-    }
-    const elementSubfolderById = new Map(
-      project.architecture.elements.map((e) => [e.id, elementSubfolderName(e)]),
-    )
-    const allowedRelativePrefix = story.interfaceElementIds
-      ? path.join('_shared-interfaces', sharedInterfaceSubfolderName(story.interfaceElementIds[0], story.interfaceElementIds[1]))
-      : story.architectureElementId
-        ? elementSubfolderById.get(story.architectureElementId)
-        : undefined
-    if (!allowedRelativePrefix) {
-      res.status(400).json({ error: "This story isn't scoped to a single architecture element or interface pair — split it before recoding." })
-      return
-    }
-    await wipeScopedSubfolder(store.projectDir(project.id), allowedRelativePrefix)
-    await scaffoldProjectSourceTree(project, store.projectDir(project.id))
-  }
-  const abortController = new AbortController()
-  try {
-    acquireProjectRunLock(project.id, runToken, {
-      storyId: story.id,
-      userId: await resolveUserDisplayName(req),
-      cancel: () => abortController.abort(),
-    })
-  } catch (err) {
-    if (err instanceof ProjectRunLockedError) {
-      res.status(409).json({
-        error: `Coding is already running for this project${err.lock.userId ? ` (started by ${err.lock.userId})` : ''} — try again once it finishes.`,
-        code: 'project-run-locked',
-      })
-      return
-    }
-    throw err
-  }
-  const appendLog = startRunLog(runToken)
-  try {
-    const personaScope = await resolvePersonaScope(req)
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'dev')
-    // Agent-level delegation (a second model the master model could invoke
-    // mid-run) is resolved so Settings > Personas' agent-level selection is
-    // honoured end-to-end for storage/UI, but has no effect on the run:
-    // neither ClaudeCodeAgentClient nor OpenCodeAgentClient exposes a custom-
-    // tool/MCP registration hook for the master to delegate through yet.
-    // TODO(dev-agent-delegation): pass agentClient into runCodingForStory
-    // once one of the agent clients exposes a tool-call extension point.
-    const agentClient = await getAgentClientForPersona(personaScope, 'dev')
-    void agentClient
-    // Which CLI actually runs (Claude Code vs OpenCode) follows the Dev
-    // persona's own resolved plugin — see getCodingAgentClientForPersona.
-    const { client: codingClient, extraOptions } = await getCodingAgentClientForPersona(personaScope, 'dev')
-    const codingRun = await runCodingForStory(project, store.projectDir(project.id), story, codingClient, {
-      model: llmOptions.model,
-      effort: llmOptions.effort,
-      ...extraOptions,
-      onChunk: appendLog,
-      signal: abortController.signal,
-    })
-    project.codingRuns = [...(project.codingRuns ?? []), codingRun]
-    if (codingRun.status === 'success') {
-      story.status = 'complete'
-      // A successful Coding run is what "coded" means for every requirement
-      // this story covers (Area D) — completes the pipeline's own
-      // requirement-status progression (elicited -> architected ->
-      // allocated -> coded, the last of which had no automatic trigger
-      // until now) so Test Execution's pass-threshold flip (which requires
-      // 'coded' before it will advance to 'tested') has something to build
-      // on for a requirement that has actually been implemented.
-      for (const requirementId of story.requirementIds) {
-        const requirement = project.requirements.find((r) => r.id === requirementId && !r.deletedAt)
-        if (requirement) advanceStatusForward(requirement, 'coded')
-      }
-    } else if (codingRun.status === 'rejected-scope' || codingRun.status === 'rejected-multi-element') {
-      story.status = 'blocked'
-    }
-    // 'rejected-not-eligible' deliberately leaves story.status untouched —
-    // unlike a scope violation, "nothing impacted yet" isn't a problem to
-    // surface as blocked, just a normal no-op result.
-    // Automatic full-regression trigger (Area F, resolved: "triggered
-    // automatically after any accepted Coding run") — the literal
-    // implementation of that rule. Only fires on a genuinely accepted
-    // change; a rejected/errored Coding run has nothing new to regress
-    // against.
-    if (codingRun.status === 'success') {
-      await runFullRegression(project, store.projectDir(project.id), 'coding-success')
-    }
-    await store.saveProject(project)
-    res.json({ codingRun })
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message })
-  } finally {
-    finishRunLog(runToken)
-    releaseProjectRunLock(project.id, runToken)
-  }
-})
-
-// "Analyse Code" (Dev/Coding phase), story-scoped — untouched (hide-not-
-// delete) alongside the rest of this /backlog/stories/:storyId/... block.
-// Checks the code currently in a story's scoped subfolder against the
-// specific requirements that story covers, independent of whether/how it
-// was coded (works the same after a normal Code run, a Recode, or a
-// from-scratch Recode). Read-only: unlike run-coding this never touches the
-// working tree or story/requirement status, only records the verdict on
-// project.elementCodeChecks (shared storage with the new element-scoped
-// analyze-code route below — runElementCodeCheck itself doesn't know or
-// care whether its caller derived the element id/requirements from a Story
-// or from a live allocation query). Uses the dev persona since this is
-// reviewing Dev's own output, same reasoning as code alignment analysis
-// using the architect persona for architecture-adjacent work.
-app.post('/api/projects/:id/backlog/stories/:storyId/analyze-code', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const story = project.backlog?.stories.find((s) => s.id === req.params.storyId)
-  if (!story) {
-    res.status(404).json({ error: 'story not found' })
-    return
-  }
-  try {
-    if (!project.architecture) {
-      res.status(400).json({ error: 'Project has no architecture — select an Architecture type and add elements first' })
-      return
-    }
-    const elementSubfolderById = new Map(
-      project.architecture.elements.map((e) => [e.id, elementSubfolderName(e)]),
-    )
-    const allowedRelativePrefix = story.interfaceElementIds
-      ? path.join('_shared-interfaces', sharedInterfaceSubfolderName(story.interfaceElementIds[0], story.interfaceElementIds[1]))
-      : story.architectureElementId
-        ? elementSubfolderById.get(story.architectureElementId)
-        : undefined
-    if (!allowedRelativePrefix) {
-      res.status(400).json({ error: "This story isn't scoped to a single architecture element or interface pair." })
-      return
-    }
-    const root = sourceTreeRoot(store.projectDir(project.id))
-    const prefix = allowedRelativePrefix.split(path.sep).join('/')
-    const allFiles = await listSourceTreeFiles(root)
-    const scopedFiles = allFiles.filter((f) => f.path === prefix || f.path.startsWith(`${prefix}/`))
-    const codeFiles = await Promise.all(
-      scopedFiles
-        .filter((f) => f.path.split('/').pop() !== MARKER_FILENAME)
-        .map(async (f) => ({ path: f.path, content: await readFile(path.join(root, f.path), 'utf-8') })),
-    )
-
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'dev')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'dev')
-    const result = await runElementCodeCheck(
-      project,
-      story.architectureElementId ?? story.id,
-      story.requirementIds
-        .map((rid) => project.requirements.find((r) => r.id === rid && !r.deletedAt))
-        .filter((r): r is NonNullable<typeof r> => r !== undefined),
-      codeFiles,
-      llmClient,
-      llmOptions,
-    )
-    recordTokenUsage(result.usage)
-    await store.saveProject(project)
-    res.json({ coverage: result.coverage })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
-// Element-scoped Coding (new element-based Coding path) — parallel to the
-// untouched /backlog/stories/:storyId/run-coding and .../analyze-code
-// routes above, which stay exactly as they are and remain fully callable.
-// This is the route the new CodingScreen actually uses: no Story involved
-// at all, no shared-scope guard (impossible now — a Coding run always
+// Element-scoped Coding — the only Coding path (Story-based Coding has
+// been removed): no shared-scope guard (impossible — a Coding run always
 // targets exactly one element's own folder), eligibility/prompt/status
 // advancement all driven by requirement.architectureElements live queries.
 app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async (req, res) => {
@@ -1962,10 +1622,9 @@ app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async 
     return
   }
   const runToken = typeof req.body?.runToken === 'string' ? req.body.runToken : randomUUID()
-  // Manual recode of an already-coded element — the same
-  // regressStatusForRecode mechanism the story-based route uses, applied to
-  // every requirement currently allocated to this element (live query, not
-  // a cached list) rather than a fixed story.requirementIds array.
+  // Manual recode of an already-coded element — regresses every requirement
+  // currently allocated to this element (live query, not a cached list)
+  // back to 'allocated' so isElementEligibleForCoding treats it as pending.
   if (req.body?.recode === true) {
     for (const requirement of project.requirements) {
       if (!requirement.deletedAt && requirement.architectureElements.includes(element.id)) {
@@ -1973,16 +1632,14 @@ app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async 
       }
     }
   }
-  // "Recode from scratch" — wipes the element's own scoped subfolder before
-  // the agent runs. No shared-scope conflict is possible anymore (Area B/D,
-  // resolved): a Coding run always targets exactly one element's own
-  // folder, so unlike the story-based route above, there is no
-  // "does another story share this folder" guard to check first.
-  if (req.body?.fromScratch === true) {
-    const allowedRelativePrefix = elementSubfolderName(element)
-    await wipeScopedSubfolder(store.projectDir(project.id), allowedRelativePrefix)
-    await scaffoldProjectSourceTree(project, store.projectDir(project.id))
-  }
+  // "Recode from scratch" (fromScratch:true, forwarded to
+  // runCodingForElement below) wipes the element's own scoped subfolder
+  // before the agent runs. This used to happen here as a separate,
+  // network-facing wipe+scaffold pair directly against the project's (often
+  // SMB-mapped) directory — now performed inside runCodingForElement's own
+  // local working copy instead (see localSourceTree.ts), so this route no
+  // longer does any of that work itself; passing fromScratch through is
+  // enough.
   const abortController = new AbortController()
   try {
     acquireProjectRunLock(project.id, runToken, {
@@ -2004,11 +1661,18 @@ app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async 
   try {
     const personaScope = await resolvePersonaScope(req)
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'dev')
-    const { client: codingClient, extraOptions } = await getCodingAgentClientForPersona(personaScope, 'dev')
+    const { client: codingClient, extraOptions } = await getCodingAgentClientForPersona(
+      personaScope,
+      'dev',
+      llmOptions.model,
+      llmOptions.thinking,
+      llmOptions.reasoningEffort,
+    )
     const codingRun = await runCodingForElement(project, store.projectDir(project.id), element.id, codingClient, {
       model: llmOptions.model,
       effort: llmOptions.effort,
       ...extraOptions,
+      fromScratch: req.body?.fromScratch === true,
       onChunk: appendLog,
       signal: abortController.signal,
     })
@@ -2050,11 +1714,10 @@ app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async 
   }
 })
 
-// "Analyse Code" for an architecture element — parallel to the untouched
-// /backlog/stories/:storyId/analyze-code route above. Read-only: checks the
-// code currently in the element's own scoped subfolder against the
-// requirements currently allocated to it (live query), records the verdict
-// on project.elementCodeChecks.
+// "Analyse Code" for an architecture element. Read-only: checks the code
+// currently in the element's own scoped subfolder against the requirements
+// currently allocated to it (live query), records the verdict on
+// project.elementCodeChecks.
 app.post('/api/projects/:id/architecture/elements/:elementId/analyze-code', async (req, res) => {
   const project = await loadProjectOr404(req.params.id)
   if (!project) {
@@ -2109,7 +1772,6 @@ app.get('/api/projects/:id/coding/run-lock', (req, res) => {
   const lock = readProjectRunLock(req.params.id)
   res.json({
     locked: !!lock,
-    storyId: lock?.storyId,
     architectureElementId: lock?.architectureElementId,
     userId: lock?.userId,
     startedAt: lock?.startedAt,
@@ -2157,12 +1819,66 @@ app.put('/api/projects/:id/coding-conventions', async (req, res) => {
   res.status(204).end()
 })
 
+// Project Overview panel (Architecture tab) — what the app is, what tech
+// it's built with, and how to build/run it. Same GET/PUT shape as
+// coding-conventions above; read by buildCodingPrompt (vic-coding) as extra
+// context and shown alongside Test Full App.
+app.get('/api/projects/:id/overview', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  res.json({ description: project.description ?? '', runInstructions: project.runInstructions ?? '' })
+})
+
+app.put('/api/projects/:id/overview', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const { description, runInstructions } = req.body ?? {}
+  if (typeof description !== 'string' || typeof runInstructions !== 'string') {
+    res.status(400).json({ error: 'description and runInstructions must both be strings' })
+    return
+  }
+  project.description = description
+  project.runInstructions = runInstructions
+  await store.saveProject(project)
+  res.status(204).end()
+})
+
+// Auto-populates the Project Overview panel from the project's requirements
+// and (if present) architecture elements — one LLM call, doesn't persist;
+// the UI saves the result via PUT /overview like a normal edit once the
+// user is happy with it.
+app.post('/api/projects/:id/overview/auto-populate', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  try {
+    const personaScope = await resolvePersonaScope(req)
+    const llmClient = await getClientForPersona(personaScope, 'architect')
+    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
+    const result = await generateProjectOverview(project, llmClient, llmOptions)
+    recordTokenUsage(result.usage)
+    res.json({ description: result.description, runInstructions: result.runInstructions })
+  } catch (err) {
+    sendLlmError(res, err)
+  }
+})
+
 // Reads every recognised source file (CODE_FILE_EXTENSIONS — text only,
 // same allowlist Import Project uses, so a binary asset in the tree is
 // never read and fed to the LLM as if it were text) under a directory, for
-// Dev chat's opt-in code context (see codeScope on the coding-chat route
-// below). Missing directory (never scaffolded/coded yet) yields an empty
-// list rather than an error — same tolerance as listSourceTreeFiles.
+// the QA dispatch chat's code context (test-runs/chat route, Area F "User-
+// reported issue triage") — the element's own code helps the triage call
+// distinguish a code failure from a requirement issue. Missing directory
+// (never scaffolded/coded yet) yields an empty list rather than an error —
+// same tolerance as listSourceTreeFiles.
 async function readCodeContextFiles(rootPath: string, subdir?: string): Promise<Array<{ path: string; content: string }>> {
   const startDir = subdir ? path.join(rootPath, subdir) : rootPath
   const files: Array<{ path: string; content: string }> = []
@@ -2193,98 +1909,6 @@ async function readCodeContextFiles(rootPath: string, subdir?: string): Promise<
   return files.sort((a, b) => a.path.localeCompare(b.path))
 }
 
-// Story-scoped Dev chat, kept working unchanged for the untouched Planning/
-// Story-based Coding path (the old CodingScreen.tsx-era flow, still
-// reachable via the still-live /backlog/stories/:storyId/run-coding
-// route's own persona). vic-coding's own chatWithDev/buildCodingChatMessages
-// dropped their Story-formatting logic as part of the element-based Coding
-// rewrite (Coding's own code no longer knows what a Story is), so this
-// small adapter — local to the server, not vic-coding — reproduces the old
-// formatStory behaviour verbatim to keep this one legacy call site working.
-function formatStoryForChat(story: Story): string {
-  const scope = story.interfaceElementIds
-    ? `interface ${story.interfaceElementIds.join(' <-> ')}`
-    : (story.architectureElementId ?? '(unscoped)')
-  return `${story.id}: ${story.title} — ${story.description}\nScope: ${scope}\nStatus: ${story.status}`
-}
-
-async function chatWithDevLegacyStory(
-  llmClient: LlmClient,
-  story: Story | null,
-  userMessage: string,
-  llmOptions?: LlmCallOptions,
-  codeFiles?: CodeContextFile[],
-): Promise<{ reply: string; usage?: LlmUsage }> {
-  const context = story ? `Story in focus:\n${formatStoryForChat(story)}` : 'No story currently selected.'
-  const codeContext =
-    codeFiles && codeFiles.length > 0
-      ? `Source files:\n\n${codeFiles.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n')}`
-      : null
-  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }> = [
-    { role: 'system', content: DEFAULT_DEV_SYSTEM_PROMPT },
-    { role: 'system', content: context },
-  ]
-  if (codeContext) messages.push({ role: 'system', content: codeContext })
-  messages.push({ role: 'user', content: userMessage })
-  const result = await llmClient.chat(messages, llmOptions)
-  return { reply: result.content, usage: result.usage }
-}
-
-app.post('/api/projects/:id/coding-chat', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const message = req.body?.message
-  if (typeof message !== 'string' || !message.trim()) {
-    res.status(400).json({ error: 'message is required' })
-    return
-  }
-  // Both the old story-scoped path and the new element-scoped path are
-  // supported — never remove the story-based one (hide-not-delete).
-  // architectureElementId takes precedence if a caller (bug or otherwise)
-  // somehow sends both, since it's the new Coding screen's own field.
-  const storyId = typeof req.body?.storyId === 'string' ? req.body.storyId : null
-  const story = storyId ? (project.backlog?.stories.find((s) => s.id === storyId) ?? null) : null
-  const architectureElementId =
-    typeof req.body?.architectureElementId === 'string' ? req.body.architectureElementId : null
-  const codeScope = req.body?.codeScope === 'element' || req.body?.codeScope === 'project' ? req.body.codeScope : 'none'
-  try {
-    let codeFiles: Array<{ path: string; content: string }> | undefined
-    if (codeScope === 'project') {
-      codeFiles = await readCodeContextFiles(sourceTreeRoot(store.projectDir(project.id)))
-    } else if (codeScope === 'element' && architectureElementId) {
-      const element = project.architecture?.elements.find((e) => e.id === architectureElementId)
-      if (element) {
-        codeFiles = await readCodeContextFiles(sourceTreeRoot(store.projectDir(project.id)), elementSubfolderName(element))
-      }
-    } else if (codeScope === 'element' && story) {
-      const subdir = story.interfaceElementIds
-        ? path.join('_shared-interfaces', sharedInterfaceSubfolderName(story.interfaceElementIds[0], story.interfaceElementIds[1]))
-        : story.architectureElementId
-          ? elementSubfolderName(
-              project.architecture?.elements.find((e) => e.id === story.architectureElementId) ?? {
-                name: story.architectureElementId,
-              },
-            )
-          : undefined
-      if (subdir) codeFiles = await readCodeContextFiles(sourceTreeRoot(store.projectDir(project.id)), subdir)
-    }
-
-    const personaScope = await resolvePersonaScope(req)
-    const llmClient = await getClientForPersona(personaScope, 'dev')
-    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'dev')
-    const result = architectureElementId
-      ? await chatWithDev(llmClient, project, architectureElementId, message, llmOptions, codeFiles)
-      : await chatWithDevLegacyStory(llmClient, story, message, llmOptions, codeFiles)
-    recordTokenUsage(result.usage)
-    res.json({ reply: result.reply })
-  } catch (err) {
-    sendLlmError(res, err)
-  }
-})
-
 // Test Creation (Area E) — test suite CRUD, LLM-assisted proposal
 // generation gated by the mechanical requirement-traceability check
 // (createTestCase itself, not a separate route — a manually-entered test
@@ -2302,13 +1926,22 @@ app.get('/api/projects/:id/test-suite', async (req, res) => {
   res.json(project.testSuite ?? null)
 })
 
+app.get('/api/projects/:id/test-suite/readiness', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  res.json(scopeReadinessEntries(project))
+})
+
 app.post('/api/projects/:id/test-suite/tests', async (req, res) => {
   const project = await loadProjectOr404(req.params.id)
   if (!project) {
     res.status(404).json({ error: 'project not found' })
     return
   }
-  const { type, title, requirementIds, interfaceContractRef, architectureElementId, interfaceElementIds } = req.body ?? {}
+  const { type, title, requirementIds, interfaceDefinitionId, architectureElementId, interfaceElementIds } = req.body ?? {}
   if (type !== 'functional' && type !== 'integration') {
     res.status(400).json({ error: 'type must be "functional" or "integration"' })
     return
@@ -2321,7 +1954,7 @@ app.post('/api/projects/:id/test-suite/tests', async (req, res) => {
     type,
     title,
     requirementIds,
-    interfaceContractRef,
+    interfaceDefinitionId,
     architectureElementId,
     interfaceElementIds,
   })
@@ -2512,7 +2145,13 @@ app.post('/api/projects/:id/test-suite/tests/:testId/generate-file', async (req,
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'qa')
     // Same CLI-follows-persona-plugin resolution as /run-coding — GLM
     // selected for QA gets OpenCode, not a broken `claude --model glm-...`.
-    const { client: codingClient, extraOptions } = await getCodingAgentClientForPersona(personaScope, 'qa')
+    const { client: codingClient, extraOptions } = await getCodingAgentClientForPersona(
+      personaScope,
+      'qa',
+      llmOptions.model,
+      llmOptions.thinking,
+      llmOptions.reasoningEffort,
+    )
     const result = await generateTestFileForTestCase(project, store.projectDir(project.id), testCase, codingClient, {
       model: llmOptions.model,
       effort: llmOptions.effort,
@@ -2772,80 +2411,46 @@ app.post('/api/projects/:id/test-runs/chat', async (req, res) => {
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'qa')
     const result = await chatWithQATestExecution(project, llmClient, testCaseId, runId, message, llmOptions)
     recordTokenUsage(result.usage)
-    res.json({ reply: result.reply })
+
+    // Dispatch classification (Area F "User-reported issue triage",
+    // resolved) — runs alongside the conversational reply above, only
+    // when a test is actually in focus (nothing to attribute a verdict
+    // against otherwise). A separate try/catch so a dispatch-call failure
+    // (e.g. malformed LLM reply) still lets the conversational reply
+    // through rather than failing the whole request.
+    let dispatch: Awaited<ReturnType<typeof classifyAndDispatchUserReportedIssue>>['dispatch']
+    if (testCaseId) {
+      try {
+        const test = project.testSuite?.tests.find((t) => t.id === testCaseId)
+        let codeContext: string | undefined
+        if (test?.architectureElementId) {
+          const element = project.architecture?.elements.find((e) => e.id === test.architectureElementId)
+          if (element) {
+            const files = await readCodeContextFiles(sourceTreeRoot(store.projectDir(project.id)), elementSubfolderName(element))
+            codeContext = formatCodeContextForTriage(files)
+          }
+        }
+        const dispatchResult = await classifyAndDispatchUserReportedIssue(
+          project,
+          llmClient,
+          testCaseId,
+          runId,
+          message,
+          llmOptions,
+          codeContext,
+        )
+        for (const usage of dispatchResult.usage) recordTokenUsage(usage)
+        dispatch = dispatchResult.dispatch
+        if (dispatch) await store.saveProject(project)
+      } catch {
+        // Swallow — the conversational reply above already succeeded and
+        // is still worth returning even if classification failed.
+      }
+    }
+
+    res.json({ reply: result.reply, dispatch })
   } catch (err) {
     sendLlmError(res, err)
-  }
-})
-
-// Per-element test command (Area F, confirmed) — reads/writes the
-// element's own .vic-element.json marker file directly, not a Project
-// field. query/body scope is { architectureElementId } | { fromId, toId }.
-app.get('/api/projects/:id/test-command', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const architectureElementId = typeof req.query.architectureElementId === 'string' ? req.query.architectureElementId : undefined
-  const fromId = typeof req.query.fromId === 'string' ? req.query.fromId : undefined
-  const toId = typeof req.query.toId === 'string' ? req.query.toId : undefined
-  try {
-    let allowedRelativePrefix: string
-    if (fromId && toId) {
-      allowedRelativePrefix = path.join('_shared-interfaces', sharedInterfaceSubfolderName(fromId, toId))
-    } else if (architectureElementId) {
-      const element = project.architecture?.elements.find((e) => e.id === architectureElementId)
-      if (!element) {
-        res.status(404).json({ error: 'architecture element not found' })
-        return
-      }
-      allowedRelativePrefix = elementSubfolderName(element)
-    } else {
-      res.status(400).json({ error: 'architectureElementId, or fromId+toId, is required' })
-      return
-    }
-    const command = await readElementTestCommand(
-      sourceTreeRoot(store.projectDir(project.id)),
-      allowedRelativePrefix,
-      project.testCommand,
-    )
-    res.json(command)
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message })
-  }
-})
-
-app.put('/api/projects/:id/test-command', async (req, res) => {
-  const project = await loadProjectOr404(req.params.id)
-  if (!project) {
-    res.status(404).json({ error: 'project not found' })
-    return
-  }
-  const { architectureElementId, fromId, toId, command, args } = req.body ?? {}
-  if (typeof command !== 'string' || !command.trim() || !Array.isArray(args)) {
-    res.status(400).json({ error: 'command and args are required' })
-    return
-  }
-  try {
-    let allowedRelativePrefix: string
-    if (fromId && toId) {
-      allowedRelativePrefix = path.join('_shared-interfaces', sharedInterfaceSubfolderName(fromId, toId))
-    } else if (architectureElementId) {
-      const element = project.architecture?.elements.find((e) => e.id === architectureElementId)
-      if (!element) {
-        res.status(404).json({ error: 'architecture element not found' })
-        return
-      }
-      allowedRelativePrefix = elementSubfolderName(element)
-    } else {
-      res.status(400).json({ error: 'architectureElementId, or fromId+toId, is required' })
-      return
-    }
-    await writeElementTestCommand(sourceTreeRoot(store.projectDir(project.id)), allowedRelativePrefix, { command, args })
-    res.status(204).end()
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message })
   }
 })
 
@@ -3617,7 +3222,7 @@ app.put('/api/projects/:id/settings', async (req, res) => {
     res.status(404).json({ error: 'project not found' })
     return
   }
-  const { phaseTabGating, unitTestMode, allowCodingWithoutPlan } = req.body ?? {}
+  const { phaseTabGating, unitTestMode } = req.body ?? {}
   if (phaseTabGating !== undefined && !PHASE_TAB_GATING_VALUES.includes(phaseTabGating)) {
     res.status(400).json({ error: 'phaseTabGating must be "gated" or "always-accessible"' })
     return
@@ -3626,14 +3231,9 @@ app.put('/api/projects/:id/settings', async (req, res) => {
     res.status(400).json({ error: 'unitTestMode must be "llm", "scaffold", or "disabled"' })
     return
   }
-  if (allowCodingWithoutPlan !== undefined && typeof allowCodingWithoutPlan !== 'boolean') {
-    res.status(400).json({ error: 'allowCodingWithoutPlan must be a boolean' })
-    return
-  }
   const updates = {
     ...(phaseTabGating !== undefined ? { phaseTabGating } : {}),
     ...(unitTestMode !== undefined ? { unitTestMode } : {}),
-    ...(allowCodingWithoutPlan !== undefined ? { allowCodingWithoutPlan } : {}),
   }
   const settings = updateProjectSettings(project, updates)
   await store.saveProject(project)
@@ -3892,6 +3492,23 @@ app.put('/api/settings/personas/:id', async (req, res) => {
 
   res.status(204).end()
 })
+
+// Catches anything that reaches Express without going through a route's own
+// try/catch — e.g. express.json() throwing on a malformed request body, or
+// an async error a route forgot to catch. Without this, Express's default
+// handler sends a bare non-JSON 500, which requestJson (httpApi.ts) can't
+// parse an `error` message out of, so the UI falls back to a generic
+// "failed with status 500" — this restores the same { error: message } shape
+// every route already returns so that message is never lost.
+const jsonErrorHandler: ErrorRequestHandler = (err, _req, res, next) => {
+  if (res.headersSent) {
+    next(err)
+    return
+  }
+  console.error(err)
+  res.status(500).json({ error: (err as Error).message ?? 'Internal server error' })
+}
+app.use(jsonErrorHandler)
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`vic-server listening on http://0.0.0.0:${PORT} (reachable on the LAN)`)

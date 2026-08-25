@@ -91,6 +91,8 @@ export async function generateTestFileForTestCase(
     binaryArgs?: string[]
     apiKey?: string
     baseUrl?: string
+    thinking?: string
+    reasoningEffort?: string
     onChunk?: (chunk: string) => void
     signal?: AbortSignal
   } = {},
@@ -124,6 +126,8 @@ export async function generateTestFileForTestCase(
       binaryArgs: options.binaryArgs,
       apiKey: options.apiKey,
       baseUrl: options.baseUrl,
+      thinking: options.thinking,
+      reasoningEffort: options.reasoningEffort,
       onChunk: options.onChunk,
       signal: options.signal,
     })

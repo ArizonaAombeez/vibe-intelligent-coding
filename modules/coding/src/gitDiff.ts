@@ -10,7 +10,12 @@ import path from 'node:path'
 // ClaudeCodeCliClient's runCli — git takes args, not a piped prompt.
 function runGit(args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number | null }> {
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { shell: false, cwd })
+    // stdin: 'ignore' — without it, git inherits the parent process's stdin.
+    // If a particular git invocation/config ever needs interactive input
+    // (a credential prompt, GPG passphrase, etc.), it would otherwise hang
+    // indefinitely waiting on a TTY that never responds in this server/test
+    // context, rather than failing fast with a non-zero exit code.
+    const child = spawn('git', args, { shell: false, cwd, stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
     child.stdout?.on('data', (chunk) => {
@@ -33,13 +38,24 @@ function runGit(args: string[], cwd: string): Promise<{ stdout: string; stderr: 
 // resolve a SID for ("inconvertible" owner) — git's safe.directory check
 // then refuses to touch the repo at all ("detected dubious ownership"),
 // even for a repo VIC itself created. Registering it globally trusted is
-// safe here since VIC already treats the whole shared drive as trusted (no
-// auth, shared users.json, etc — see usersStore.ts). Runs on every call,
-// not just first-init, since a repo created by VIC on a previous run (or by
-// a different machine sharing this same drive) can still hit this the
-// first time *this* machine's git touches it.
-async function markSafeDirectory(srcRoot: string): Promise<void> {
-  await runGit(['config', '--global', '--add', 'safe.directory', srcRoot], srcRoot)
+// safe here since VIC already treats every path it touches as trusted (the
+// shared network drive: no auth, shared users.json, etc, see usersStore.ts;
+// and isolatedWorkspace.ts's local temp dirs, which this process itself just
+// created). Uses git's '*' wildcard (one config value, matches every path)
+// rather than appending srcRoot's own absolute path — appending grows the
+// global .gitconfig by one entry per distinct repo path forever (every
+// project, every isolated-workspace temp dir this process has ever created,
+// never pruned), which on a large accumulated file made every subsequent
+// `git config --global` rewrite of that file slower, compounding over the
+// life of the machine. First call each process actually writes '*';
+// `--add`'s own idempotency (git dedupes identical values) makes every call
+// after that this process's own no-op, so this is still safe to call
+// unconditionally from gitInitIfNeeded like before.
+let safeDirectoryWildcardEnsured = false
+async function markSafeDirectory(): Promise<void> {
+  if (safeDirectoryWildcardEnsured) return
+  await runGit(['config', '--global', '--add', 'safe.directory', '*'], process.cwd())
+  safeDirectoryWildcardEnsured = true
 }
 
 // Idempotent: does nothing beyond markSafeDirectory + the HEAD check below
@@ -56,7 +72,7 @@ async function markSafeDirectory(srcRoot: string): Promise<void> {
 // re-checks and repairs a HEAD-less repo rather than trusting a prior
 // partial run left it in the state this function is meant to guarantee.
 export async function gitInitIfNeeded(srcRoot: string): Promise<void> {
-  await markSafeDirectory(srcRoot)
+  await markSafeDirectory()
   if (existsSync(path.join(srcRoot, '.git'))) {
     const headCheck = await runGit(['rev-parse', '--verify', 'HEAD'], srcRoot)
     if (headCheck.exitCode === 0) return

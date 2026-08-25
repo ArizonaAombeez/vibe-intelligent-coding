@@ -156,7 +156,7 @@ export function importArchitecturePart(project: Project, data: ArchitecturePartD
   if (!data.architecture) return []
 
   if (!project.architecture) {
-    project.architecture = { layers: [], elements: [], nextElementSeq: 1 }
+    project.architecture = { layers: [], elements: [], nextElementSeq: 1, nextInterfaceSeq: 1 }
     if (!project.architectureType) {
       // The imported type id is external data (a previously-exported
       // architecture.json, possibly from an older tool version whose preset
@@ -190,6 +190,12 @@ export function importArchitecturePart(project: Project, data: ArchitecturePartD
     responsibility: remapResponsibilityText(source.responsibility, idMap),
     row: source.row === -1 ? source.row : source.row + rowOffset, // EXTERNAL_CONTEXT_ROW (-1) stays put — it's outside the layer grid
     interfaces: source.interfaces.map((id) => idMap.get(id) ?? `${IMPORTED_ID_PREFIX}${id}`),
+    // Imported InterfaceDefinition-based master data isn't carried over by
+    // this part import (only layers/elements are, per ArchitecturePartData)
+    // — an imported element always starts with no local interface copies,
+    // same as a freshly created one; the source project's own
+    // interfaceDefinitions aren't part of this exported part.
+    elementInterfaces: [],
   }))
 
   architecture.elements.push(...imported)

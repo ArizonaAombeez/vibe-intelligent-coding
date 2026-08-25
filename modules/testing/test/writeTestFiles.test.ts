@@ -13,7 +13,8 @@ const fixture = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
   '..',
-  'llm-claude-code',
+  'llm',
+  'claude-code',
   'test',
   'fixtures',
   'fake-claude-agent.mjs',
@@ -52,10 +53,11 @@ function baseProject(): Project {
     architecture: {
       layers: ['Core'],
       elements: [
-        { id: 'ARCH-001', kind: 'functional', name: 'Login UI', responsibility: 'Renders login', row: 0, col: 0, rowSpan: 1, colSpan: 1, interfaces: [] },
-        { id: 'ARCH-002', kind: 'service', name: 'Auth Service', responsibility: 'Authenticates users', row: 0, col: 1, rowSpan: 1, colSpan: 1, interfaces: [] },
+        { id: 'ARCH-001', kind: 'functional', name: 'Login UI', responsibility: 'Renders login', row: 0, col: 0, rowSpan: 1, colSpan: 1, interfaces: [], elementInterfaces: [] },
+        { id: 'ARCH-002', kind: 'service', name: 'Auth Service', responsibility: 'Authenticates users', row: 0, col: 1, rowSpan: 1, colSpan: 1, interfaces: [], elementInterfaces: [] },
       ],
       nextElementSeq: 3,
+      nextInterfaceSeq: 1,
     },
   }
 }
@@ -131,7 +133,7 @@ test('generateTestFileForTestCase: an interface test case is scoped to the share
       type: 'integration',
       title: 'Charges the card',
       requirementIds: [],
-      interfaceContractRef: { fromId: 'ARCH-001', toId: 'ARCH-002' },
+      interfaceDefinitionId: 'IFACE-001',
       architectureElementId: null,
       interfaceElementIds: ['ARCH-001', 'ARCH-002'],
       status: 'not-run',

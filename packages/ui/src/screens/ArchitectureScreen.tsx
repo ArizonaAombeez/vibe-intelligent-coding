@@ -9,6 +9,7 @@ import type {
   CodeAlignmentRecord,
   CreateArchitectureElementFields,
   CurrentOperation,
+  InterfaceContractOperation,
   PhaseInfo,
   ProjectMode,
   ProposedArchitectureElement,
@@ -26,6 +27,8 @@ import { ArchitectureRequirementList } from './ArchitectureRequirementList'
 import { AddArchitectureElementForm } from './AddArchitectureElementForm'
 import { EditableElementProposalCard } from './EditableElementProposalCard'
 import { MigrationPlanPanel } from './MigrationPlanPanel'
+import { InterfaceListPanel } from './InterfaceListPanel'
+import { InterfaceEditorModal } from './InterfaceEditorModal'
 import '../components/ModalOverlay.css'
 import './RequirementDetailPanel.css'
 import './RequirementsScreen.css'
@@ -93,6 +96,15 @@ export function ArchitectureScreen({
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [loading, setLoading] = useState(true)
 
+  // Project Overview panel — what the app is, what tech it's built with,
+  // and how to build/run it. Not tied to any one architecture element (an
+  // entrypoint conceptually spans all of them); read into every Coding-
+  // stage prompt as extra context and available to Test Full App.
+  const [overviewDescription, setOverviewDescription] = useState('')
+  const [overviewRunInstructions, setOverviewRunInstructions] = useState('')
+  const [overviewOpen, setOverviewOpen] = useState(true)
+  const [autoPopulatingOverview, setAutoPopulatingOverview] = useState(false)
+
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null)
   // Which requirement row is expanded in the left-hand requirement list —
   // only one open at a time, same "one thing expanded" rule the diagram's
@@ -112,6 +124,15 @@ export function ArchitectureScreen({
     undefined,
   )
   const [definingInterfaces, setDefiningInterfaces] = useState(false)
+  const [redefiningInterfaces, setRedefiningInterfaces] = useState(false)
+  const [interfaceListOpen, setInterfaceListOpen] = useState(false)
+  // Either an existing definition (opened from InterfaceListPanel's
+  // grouped rows) or a still-uncovered pair with no definition yet (opened
+  // from a "Define this interface" action, or an undefined-pair row) —
+  // exactly one is set at a time. The editor modal resolves whichever is
+  // present into its participant list/operations.
+  const [editingInterfaceDefinitionId, setEditingInterfaceDefinitionId] = useState<string | null>(null)
+  const [editingInterfacePair, setEditingInterfacePair] = useState<{ fromId: string; toId: string } | null>(null)
   const [checkingInterfaces, setCheckingInterfaces] = useState(false)
   const [interfacesCheckResult, setInterfacesCheckResult] = useState<CheckInterfacesResult | null>(null)
   const [checkingCodeAlignment, setCheckingCodeAlignment] = useState(false)
@@ -185,6 +206,37 @@ export function ArchitectureScreen({
       cancelled = true
     }
   }, [api, projectId, loadArchitecture])
+
+  useEffect(() => {
+    let cancelled = false
+    api.getProjectOverview(projectId).then(({ description, runInstructions }) => {
+      if (cancelled) return
+      setOverviewDescription(description)
+      setOverviewRunInstructions(runInstructions)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [api, projectId])
+
+  async function handleSaveOverview() {
+    await api.setProjectOverview(projectId, overviewDescription, overviewRunInstructions)
+  }
+
+  async function handleAutoPopulateOverview() {
+    if (autoPopulatingOverview) return
+    setAutoPopulatingOverview(true)
+    try {
+      const result = await api.autoPopulateProjectOverview(projectId)
+      setOverviewDescription(result.description)
+      setOverviewRunInstructions(result.runInstructions)
+      await api.setProjectOverview(projectId, result.description, result.runInstructions)
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    } finally {
+      setAutoPopulatingOverview(false)
+    }
+  }
 
   async function handleSelectType(typeId: ArchitectureTypeId) {
     setSelectedType(typeId)
@@ -275,13 +327,35 @@ export function ArchitectureScreen({
     setDefiningInterfaces(true)
     onOperationChange({ text: 'Architect is defining interfaces...' })
     try {
-      await api.defineAllArchitectureInterfaceContracts(projectId)
+      await api.defineAllArchitectureInterfaceDefinitions(projectId)
       await loadArchitecture()
       onOperationChange({ text: null })
     } catch (err) {
       onOperationChange(toOperationError(err))
     } finally {
       setDefiningInterfaces(false)
+    }
+  }
+
+  // Unlike "Define Interfaces" (non-destructive, only fills pairs with no
+  // contract at all), this re-asks the Architect for EVERY connected pair,
+  // overwriting whatever contract already exists — the bulk equivalent of
+  // the per-interface "Redefine" action, needed e.g. to backfill new
+  // contract fields (range/resolution/unit/update-frequency) onto contracts
+  // that were defined before those fields existed.
+  async function handleRedefineAllInterfaces() {
+    if (redefiningInterfaces) return
+    if (!window.confirm('Redefine every connected interface? This overwrites all existing interface contracts.')) return
+    setRedefiningInterfaces(true)
+    onOperationChange({ text: 'Architect is redefining all interfaces...' })
+    try {
+      await api.defineAllArchitectureInterfaceDefinitions(projectId, true)
+      await loadArchitecture()
+      onOperationChange({ text: null })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    } finally {
+      setRedefiningInterfaces(false)
     }
   }
 
@@ -295,6 +369,21 @@ export function ArchitectureScreen({
       onOperationChange(toOperationError(err))
     } finally {
       setCheckingInterfaces(false)
+    }
+  }
+
+  // The Interfaces list needs an up-to-date check result to know which rows
+  // are undefined/incomplete/stale (red) vs. fully defined (not red) — run
+  // it fresh every time the list opens rather than relying on whatever
+  // interfacesCheckResult happens to already hold (possibly null, or stale
+  // from before the user's last edit).
+  async function handleOpenInterfaceList() {
+    setInterfaceListOpen(true)
+    try {
+      const result = await api.checkArchitectureInterfaces(projectId)
+      setInterfacesCheckResult(result)
+    } catch (err) {
+      onOperationChange(toOperationError(err))
     }
   }
 
@@ -331,10 +420,10 @@ export function ArchitectureScreen({
     }
   }
 
-  async function handleAutoAllocate(mode: 'heuristic' | 'llm') {
+  async function handleAutoAllocate(mode: 'llm') {
     if (autoAllocating) return
     setAutoAllocating(true)
-    onOperationChange({ text: mode === 'heuristic' ? 'Allocating requirements...' : 'Architect is allocating requirements...' })
+    onOperationChange({ text: 'Architect is allocating requirements...' })
     try {
       const result = await api.autoAllocate(projectId, mode)
       await loadArchitecture()
@@ -448,6 +537,40 @@ export function ArchitectureScreen({
     const label = `${from?.name ?? fromId} → ${to?.name ?? toId}`
     if (!window.confirm(`Remove the interface "${label}"? This cannot be undone.`)) return
     await api.removeArchitectureInterface(projectId, fromId, toId)
+    await loadArchitecture()
+  }
+
+  // Redefines (overwrites) a single already-'defined' contract — unlike the
+  // bulk "Define Interfaces" action (non-destructive, only fills pairs with
+  // no contract at all), this always re-asks the Architect, which is the
+  // only way to backfill the range/resolution/unit/update-frequency fields
+  // onto a contract that was defined before those fields existed.
+  async function handleDefineInterface(fromId: string, toId: string) {
+    const from = architecture?.elements.find((e) => e.id === fromId)
+    const to = architecture?.elements.find((e) => e.id === toId)
+    onOperationChange({ text: `Architect is defining the interface between ${from?.name ?? fromId} and ${to?.name ?? toId}...` })
+    try {
+      await api.defineArchitectureInterfaceDefinition(projectId, fromId, toId)
+      await loadArchitecture()
+      onOperationChange({ text: null })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  // Manual counterpart to Define/Redefine — saves a user-authored operation
+  // list directly, no LLM call. Backs the InterfaceEditorModal opened from
+  // either the global Interfaces list or an element's own focus view.
+  // definitionId is undefined when editing a still-uncovered pair (creates
+  // a new 2-participant definition); participants/name are resolved by the
+  // caller from either the existing definition or the pair being edited.
+  async function handleSaveInterfaceDefinition(
+    definitionId: string | undefined,
+    name: string,
+    participants: Array<{ elementId: string; role: 'produces' | 'consumes' | 'both' }>,
+    operations: InterfaceContractOperation[],
+  ) {
+    await api.setArchitectureInterfaceDefinition(projectId, definitionId, name, participants, operations)
     await loadArchitecture()
   }
 
@@ -594,6 +717,49 @@ export function ArchitectureScreen({
       </div>
       {substepLabel && <p className="architecture-screen-substep">{substepLabel}</p>}
 
+      <section className="architecture-overview-panel">
+        <button
+          type="button"
+          className="architecture-overview-toggle"
+          onClick={() => setOverviewOpen((open) => !open)}
+        >
+          {overviewOpen ? '▾' : '▸'} Project Overview
+        </button>
+        {overviewOpen && (
+          <div className="architecture-overview-body">
+            <button
+              type="button"
+              className="architecture-action-secondary architecture-overview-auto-populate"
+              onClick={handleAutoPopulateOverview}
+              disabled={autoPopulatingOverview}
+              title="Has the Architect draft both fields below from the project's requirements and architecture — overwrites whatever is currently there."
+            >
+              {autoPopulatingOverview ? 'Auto Populating...' : 'Auto Populate'}
+            </button>
+            <label className="architecture-overview-label">
+              What this app is, and the tech it's built with
+              <textarea
+                value={overviewDescription}
+                onChange={(e) => setOverviewDescription(e.target.value)}
+                onBlur={handleSaveOverview}
+                placeholder="e.g. A React + Node/Express task tracker, using SQLite for storage..."
+                rows={3}
+              />
+            </label>
+            <label className="architecture-overview-label">
+              How to build and run it
+              <textarea
+                value={overviewRunInstructions}
+                onChange={(e) => setOverviewRunInstructions(e.target.value)}
+                onBlur={handleSaveOverview}
+                placeholder="e.g. npm install && npm run dev, starts on http://localhost:3000..."
+                rows={3}
+              />
+            </label>
+          </div>
+        )}
+      </section>
+
       <section className="architecture-type-selector">
         {selectedOption ? (
           <p className="architecture-type-line">
@@ -656,95 +822,117 @@ export function ArchitectureScreen({
           <div className="architecture-left-col" style={{ flexBasis: `${splitFraction * 100}%` }}>
             <div className="architecture-action-box">
               <div className="architecture-action-bar">
-                <button type="button" onClick={() => setAddFormOpen(true)}>
-                  Add element
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={handleAutoConfigureAndAllocate}
-                  disabled={autoConfiguring || hasElements}
-                  title={
-                    hasElements
-                      ? 'Architecture elements already exist — use Auto Allocate to allocate onto them, or delete existing elements first.'
-                      : 'Groups unallocated requirements into modules, creates the architecture elements, connects their interfaces, and allocates the requirements.'
-                  }
-                >
-                  {autoConfiguring ? 'Auto Configuring...' : 'Auto Configure & Allocate'}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={() => handleAutoAllocate('heuristic')}
-                  disabled={autoAllocating || !hasElements}
-                  title={
-                    hasElements
-                      ? 'Allocates unallocated requirements onto existing elements using local keyword matching — no LLM call.'
-                      : 'Add at least one architecture element first.'
-                  }
-                >
-                  {autoAllocating ? 'Allocating...' : 'Auto Allocate (Heuristic)'}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={() => handleAutoAllocate('llm')}
-                  disabled={autoAllocating || !hasElements}
-                  title={
-                    hasElements
-                      ? 'Allocates unallocated requirements onto existing elements using the Architect (LLM).'
-                      : 'Add at least one architecture element first.'
-                  }
-                >
-                  {autoAllocating ? 'Allocating...' : 'Auto Allocate (LLM)'}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={handleCheckConflicts}
-                  disabled={checkingConflicts}
-                  title="Checks for interface/contract mismatches, overlapping responsibilities, and circular dependencies."
-                >
-                  Check Conflicts{conflicts.length > 0 ? ` (${conflicts.length})` : ''}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={handleDefineInterfaces}
-                  disabled={definingInterfaces || !hasElements}
-                  title="Has the Architect define a structured contract (operations, request/response shape) for every connected pair that doesn't have one yet."
-                >
-                  {definingInterfaces ? 'Defining Interfaces...' : 'Define Interfaces'}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={handleCheckInterfaces}
-                  disabled={checkingInterfaces || !hasElements}
-                  title="Checks that every connected pair has a defined interface contract before you move on to coding."
-                >
-                  {checkingInterfaces ? 'Checking Interfaces...' : 'Check Interfaces'}
-                </button>
-                <button
-                  type="button"
-                  className="architecture-action-secondary"
-                  onClick={handleCheckCodeAlignment}
-                  disabled={checkingCodeAlignment || !hasElements}
-                  title="Compares each defined interface contract's operations against the generated source tree: flags contract operations no code appears to implement, and code that appears to implement an interface the Architecture never defined."
-                >
-                  {checkingCodeAlignment ? 'Checking Code Alignment...' : 'Check Interface/Code Alignment'}
-                </button>
-                {projectMode === 'import' && (
-                  <button
-                    type="button"
-                    className="architecture-action-secondary"
-                    onClick={handleAnalyzeCodeAlignment}
-                    disabled={analyzingAlignment}
-                    title="Compares the imported codebase's files against this confirmed architecture."
-                  >
-                    {analyzingAlignment ? 'Analysing Alignment...' : 'Analyze Code Alignment'}
-                  </button>
-                )}
+                <div className="architecture-action-group">
+                  <span className="architecture-action-group-label">Build</span>
+                  <div className="architecture-action-group-buttons">
+                    <button type="button" onClick={() => setAddFormOpen(true)}>
+                      Add element
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleAutoConfigureAndAllocate}
+                      disabled={autoConfiguring || hasElements}
+                      title={
+                        hasElements
+                          ? 'Architecture elements already exist — use Auto Allocate to allocate onto them, or delete existing elements first.'
+                          : 'Groups unallocated requirements into modules, creates the architecture elements, connects their interfaces, and allocates the requirements.'
+                      }
+                    >
+                      {autoConfiguring ? 'Auto Configuring...' : 'Auto Configure & Allocate'}
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={() => handleAutoAllocate('llm')}
+                      disabled={autoAllocating || !hasElements}
+                      title={
+                        hasElements
+                          ? 'Allocates unallocated requirements onto existing elements using the Architect (LLM).'
+                          : 'Add at least one architecture element first.'
+                      }
+                    >
+                      {autoAllocating ? 'Allocating...' : 'Auto Allocate (LLM)'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="architecture-action-group">
+                  <span className="architecture-action-group-label">Interfaces</span>
+                  <div className="architecture-action-group-buttons">
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleDefineInterfaces}
+                      disabled={definingInterfaces || !hasElements}
+                      title="Has the Architect define a structured contract (operations, request/response shape) for every connected pair that doesn't have one yet. Leaves already-defined contracts untouched."
+                    >
+                      {definingInterfaces ? 'Defining Interfaces...' : 'Define Interfaces'}
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleRedefineAllInterfaces}
+                      disabled={redefiningInterfaces || !hasElements}
+                      title="Re-asks the Architect for EVERY connected interface, overwriting all existing contracts. Use this to backfill fields added after a contract was already defined."
+                    >
+                      {redefiningInterfaces ? 'Redefining All...' : 'Redefine All Interfaces'}
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleOpenInterfaceList}
+                      disabled={!hasElements}
+                      title="Lists every connected interface (defined, undefined, or incomplete) — click any to edit its operations manually, no LLM call."
+                    >
+                      Interface Inspector
+                    </button>
+                  </div>
+                </div>
+
+                <div className="architecture-action-group">
+                  <span className="architecture-action-group-label">Check</span>
+                  <div className="architecture-action-group-buttons">
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleCheckConflicts}
+                      disabled={checkingConflicts}
+                      title="Checks for interface/contract mismatches, overlapping responsibilities, and circular dependencies."
+                    >
+                      Check Conflicts{conflicts.length > 0 ? ` (${conflicts.length})` : ''}
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleCheckInterfaces}
+                      disabled={checkingInterfaces || !hasElements}
+                      title="Checks that every connected pair has a defined interface contract before you move on to coding."
+                    >
+                      {checkingInterfaces ? 'Checking Interfaces...' : 'Check Interfaces'}
+                    </button>
+                    <button
+                      type="button"
+                      className="architecture-action-secondary"
+                      onClick={handleCheckCodeAlignment}
+                      disabled={checkingCodeAlignment || !hasElements}
+                      title="Compares each defined interface contract's operations against the generated source tree: flags contract operations no code appears to implement, and code that appears to implement an interface the Architecture never defined."
+                    >
+                      {checkingCodeAlignment ? 'Checking Code Alignment...' : 'Check Interface/Code Alignment'}
+                    </button>
+                    {projectMode === 'import' && (
+                      <button
+                        type="button"
+                        className="architecture-action-secondary"
+                        onClick={handleAnalyzeCodeAlignment}
+                        disabled={analyzingAlignment}
+                        title="Compares the imported codebase's files against this confirmed architecture."
+                      >
+                        {analyzingAlignment ? 'Analysing Alignment...' : 'Analyze Code Alignment'}
+                      </button>
+                    )}
+                  </div>
+                </div>
               </div>
 
               {alignmentCounts && (
@@ -929,6 +1117,11 @@ export function ArchitectureScreen({
                 onRemoveInterface={handleRemoveInterface}
                 onCheckInterfaceConflict={handleCheckInterfaceConflict}
                 onAskArchitectAboutInterface={handleAskArchitectAboutInterface}
+                onDefineInterface={handleDefineInterface}
+                onEditInterface={(fromId, toId) => {
+                  setEditingInterfaceDefinitionId(null)
+                  setEditingInterfacePair({ fromId, toId })
+                }}
               />
             ) : (
               <ArchitectureGrid
@@ -998,8 +1191,18 @@ export function ArchitectureScreen({
                         const from = architecture?.elements.find((e) => e.id === p.fromId)
                         const to = architecture?.elements.find((e) => e.id === p.toId)
                         return (
-                          <li key={`${p.fromId}-${p.toId}`} className="quality-score-conflict-value">
-                            {from?.name ?? p.fromId} ↔ {to?.name ?? p.toId}
+                          <li key={`${p.fromId}-${p.toId}`}>
+                            <button
+                              type="button"
+                              className="interface-check-clickable-row"
+                              onClick={() => {
+                                setInterfacesCheckResult(null)
+                                setEditingInterfaceDefinitionId(null)
+                                setEditingInterfacePair({ fromId: p.fromId, toId: p.toId })
+                              }}
+                            >
+                              {from?.name ?? p.fromId} ↔ {to?.name ?? p.toId}
+                            </button>
                           </li>
                         )
                       })}
@@ -1010,12 +1213,45 @@ export function ArchitectureScreen({
                   <div className="analyst-chat-proposal">
                     <strong>Stale ({interfacesCheckResult.staleContracts.length})</strong>
                     <ul className="quality-score-deductions">
-                      {interfacesCheckResult.staleContracts.map((c) => {
-                        const from = architecture?.elements.find((e) => e.id === c.fromId)
-                        const to = architecture?.elements.find((e) => e.id === c.toId)
+                      {interfacesCheckResult.staleContracts.map((d) => (
+                        <li key={d.id}>
+                          <button
+                            type="button"
+                            className="interface-check-clickable-row"
+                            onClick={() => {
+                              setInterfacesCheckResult(null)
+                              setEditingInterfacePair(null)
+                              setEditingInterfaceDefinitionId(d.id)
+                            }}
+                          >
+                            {d.name}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {interfacesCheckResult.incompleteOperations.length > 0 && (
+                  <div className="analyst-chat-proposal">
+                    <strong>Missing I/O detail ({interfacesCheckResult.incompleteOperations.length})</strong>
+                    <ul className="quality-score-deductions">
+                      {interfacesCheckResult.incompleteOperations.map((o) => {
+                        const from = architecture?.elements.find((e) => e.id === o.fromId)
+                        const to = architecture?.elements.find((e) => e.id === o.toId)
                         return (
-                          <li key={`${c.fromId}-${c.toId}`} className="quality-score-conflict-value">
-                            {from?.name ?? c.fromId} ↔ {to?.name ?? c.toId}
+                          <li key={`${o.fromId}-${o.toId}-${o.operationName}`}>
+                            <button
+                              type="button"
+                              className="interface-check-clickable-row"
+                              onClick={() => {
+                                setInterfacesCheckResult(null)
+                                setEditingInterfaceDefinitionId(null)
+                                setEditingInterfacePair({ fromId: o.fromId, toId: o.toId })
+                              }}
+                            >
+                              {from?.name ?? o.fromId} ↔ {to?.name ?? o.toId} — <strong>{o.operationName}</strong>:
+                              missing {o.missingFields.join(', ')}
+                            </button>
                           </li>
                         )
                       })}
@@ -1027,6 +1263,71 @@ export function ArchitectureScreen({
           </div>
         </div>
       )}
+
+      {interfaceListOpen && architecture && (
+        <InterfaceListPanel
+          architecture={architecture}
+          checkResult={interfacesCheckResult}
+          onSelectDefinition={(definitionId) => {
+            setInterfaceListOpen(false)
+            setEditingInterfacePair(null)
+            setEditingInterfaceDefinitionId(definitionId)
+          }}
+          onSelectPair={(fromId, toId) => {
+            setInterfaceListOpen(false)
+            setEditingInterfaceDefinitionId(null)
+            setEditingInterfacePair({ fromId, toId })
+          }}
+          onClose={() => setInterfaceListOpen(false)}
+        />
+      )}
+
+      {editingInterfaceDefinitionId &&
+        architecture &&
+        (() => {
+          const definition = (architecture.interfaceDefinitions ?? []).find((d) => d.id === editingInterfaceDefinitionId)
+          if (!definition) return null
+          const participantLabels = definition.participants.map((p) => {
+            const element = architecture.elements.find((e) => e.id === p.elementId)
+            return `${element?.name ?? p.elementId} (${p.role})`
+          })
+          return (
+            <InterfaceEditorModal
+              participantLabels={participantLabels}
+              operations={definition.operations}
+              onSave={(operations) =>
+                handleSaveInterfaceDefinition(definition.id, definition.name, definition.participants, operations)
+              }
+              onClose={() => setEditingInterfaceDefinitionId(null)}
+            />
+          )
+        })()}
+
+      {editingInterfacePair &&
+        architecture &&
+        (() => {
+          const { fromId, toId } = editingInterfacePair
+          const from = architecture.elements.find((e) => e.id === fromId)
+          const to = architecture.elements.find((e) => e.id === toId)
+          return (
+            <InterfaceEditorModal
+              participantLabels={[from?.name ?? fromId, to?.name ?? toId]}
+              operations={[]}
+              onSave={(operations) =>
+                handleSaveInterfaceDefinition(
+                  undefined,
+                  `${from?.name ?? fromId} ↔ ${to?.name ?? toId}`,
+                  [
+                    { elementId: fromId, role: 'both' },
+                    { elementId: toId, role: 'both' },
+                  ],
+                  operations,
+                )
+              }
+              onClose={() => setEditingInterfacePair(null)}
+            />
+          )
+        })()}
 
       {codeAlignmentCheckResult && (
         <div className="modal-overlay" onClick={() => setCodeAlignmentCheckResult(null)}>

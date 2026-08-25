@@ -9,7 +9,11 @@ When you believe the conversation has surfaced a new architecture element
 (a module, service, interface spine, runtime, or external system) that
 should be added, propose it on its own line using exactly this format:
 
-MODULE: <kind>|<layer>|<name>|<short responsibility>
+MODULE: <kind>|<layer>|<name>|<responsibility>
+  responsibility should be one or two sentences, concrete enough to later
+  infer what data/calls cross this module's interfaces from it alone (what
+  it owns, what it reads or receives, what it produces or reports) — not
+  just a category label.
   kind is one of: functional, service, interface-spine, runtime, external
   layer must exactly match one of the layers listed below, or the word
   NONE for an external module (external modules are not placed on a
@@ -49,16 +53,32 @@ For each distinct operation (method call, message, request/response, or
 event) that plausibly crosses this interface, reply on its own line using
 exactly this format:
 
-OPERATION: <name>|<short description>|<request shape>|<response shape>|<error cases, or NONE>
+OPERATION: <name>|<short description>|<request shape>|<response shape>|<error cases, or NONE>|<range, or NONE>|<resolution, or NONE>|<unit, or NONE>|<update frequency, or DRIVEN if the value has no periodic cadence and must be driven/pushed directly into the consumer before it can be read>
   name is a short identifier (e.g. a method or endpoint name).
   request shape and response shape are brief descriptions of the data
   involved (e.g. "userId: string" or "list of Order records"), not full
   type definitions.
+  range is the valid minimum/maximum or enumerated set of values this
+  operation's data can take (e.g. "0-100" or "PENDING|ACTIVE|CLOSED").
+  resolution is the smallest meaningful increment/precision (e.g. "1" or
+  "0.01").
+  unit is the physical or logical unit of the value (e.g. "ms", "%",
+  "count"), or NONE if the operation isn't a measured value.
+  The final field is either a concrete minimum update frequency (e.g.
+  "every 100ms", "on user action") or the literal word DRIVEN if the value
+  is not produced periodically and must instead be driven/pushed directly
+  before it can be consumed — never leave this ambiguous between the two.
 
-Propose only operations you are reasonably confident belong on this
-interface, based on the two elements' stated responsibilities — 2 to 6
-operations is typical. If the responsibilities give you nothing concrete to
-infer, reply with the single word: NONE.`
+Propose operations you are reasonably confident belong on this interface,
+based on the two elements' stated responsibilities — 2 to 6 operations is
+typical. If a responsibility is thin (a one-line summary rather than a
+detailed spec), still infer the most obvious operations implied by the two
+elements' names, kinds, and roles (e.g. a controller/opponent element
+feeding a game engine plausibly reports a chosen move or action, and reads
+back the state it needs to choose one) rather than giving up — this is a
+best-effort draft the human will review and correct, not a final contract.
+Only reply with the single word NONE when the two elements are so unrelated
+or abstract that no plausible operation can be inferred at all.`
 
 function formatExistingElements(elements: ArchitectureElement[]): string {
   if (elements.length === 0) return '(none yet)'

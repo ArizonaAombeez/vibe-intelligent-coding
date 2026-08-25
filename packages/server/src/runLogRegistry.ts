@@ -75,12 +75,6 @@ export function readRunLog(
 
 interface ProjectLock {
   runToken: string
-  // storyId is kept for Planning's own still-live /backlog/stories/:storyId/
-  // run-coding route (hide-not-delete — that route is untouched);
-  // architectureElementId is the new element-scoped Coding path's
-  // equivalent. A given lock only ever populates whichever one is relevant
-  // to how it was acquired — never both.
-  storyId?: string
   architectureElementId?: string
   userId?: string
   startedAt: number
@@ -110,7 +104,7 @@ export class ProjectRunLockedError extends Error {
 export function acquireProjectRunLock(
   projectId: string,
   runToken: string,
-  info: { storyId?: string; architectureElementId?: string; userId?: string; cancel: () => void },
+  info: { architectureElementId?: string; userId?: string; cancel: () => void },
 ): void {
   const existing = projectLocks.get(projectId)
   if (existing) throw new ProjectRunLockedError(existing)

@@ -1,5 +1,12 @@
-import { buildTestExecutionChatMessages, buildTriageMessages } from './testExecutionPersona.js'
-import type { LlmCallOptions, LlmClient, LlmUsage } from './LlmClient.js'
+import {
+  buildTestExecutionChatMessages,
+  buildTriageMessages,
+  buildUserReportedIssueTriageMessages,
+  formatLatestRun,
+  formatTestCase,
+} from './testExecutionPersona.js'
+import { updateRequirementText } from './elicitation.js'
+import type { LlmCallOptions, LlmClient, LlmMessage, LlmUsage } from './LlmClient.js'
 import type { Project, TestCase, TestCaseOutcome, TestOutcomeTriage, TestRun } from './types.js'
 
 function describeVerification(project: Project, testCaseId: string): string {
@@ -13,12 +20,10 @@ function describeVerification(project: Project, testCaseId: string): string {
       .map((r) => `${r.id}: ${r.text}`)
       .join('\n')
   }
-  const ref = testCase.interfaceContractRef
-  if (!ref) return '(no contract reference)'
-  const contract = (project.architecture?.interfaceContracts ?? []).find(
-    (c) => [c.fromId, c.toId].sort().join('|') === [ref.fromId, ref.toId].sort().join('|'),
-  )
-  return contract ? `Interface contract ${ref.fromId} <-> ${ref.toId}` : '(contract not found)'
+  const definitionId = testCase.interfaceDefinitionId
+  if (!definitionId) return '(no contract reference)'
+  const definition = (project.architecture?.interfaceDefinitions ?? []).find((d) => d.id === definitionId)
+  return definition ? `Interface contract ${definition.name}` : '(contract not found)'
 }
 
 const CODE_FAILURE_LINE = /^CODE-FAILURE:\s*(.+)$/m
@@ -98,9 +103,13 @@ export interface ChatWithQATestExecutionResult {
   usage?: LlmUsage
 }
 
-// QA Test-Execution-chat path (mirrors chatWithDev) — conversational only,
-// never sets a triage verdict itself (see testExecutionPersona.ts's
-// DEFAULT_QA_TEST_EXECUTION_SYSTEM_PROMPT). Does not mutate project state.
+// QA Test-Execution-chat path (Coding's former Dev chat was removed rather
+// than mirrored — see "User-reported issue triage" in the spec) —
+// conversational reply only; never sets a triage verdict or mutates
+// project state itself (see testExecutionPersona.ts's
+// DEFAULT_QA_TEST_EXECUTION_SYSTEM_PROMPT). Dispatch is a separate call —
+// classifyAndDispatchUserReportedIssue below — invoked alongside this one
+// by the server route, not by this function.
 export async function chatWithQATestExecution(
   project: Project,
   llmClient: LlmClient,
@@ -122,4 +131,133 @@ export async function chatWithQATestExecution(
     reply: result.content,
     usage: result.usage,
   }
+}
+
+const USER_ISSUE_CODE_FAILURE_LINE = /^CODE-FAILURE:\s*(.+)$/m
+const USER_ISSUE_TEST_CASE_FAILURE_LINE = /^TEST-CASE-FAILURE:\s*(.+)$/m
+const USER_ISSUE_REQUIREMENT_ISSUE_LINE = /^REQUIREMENT-ISSUE:\s*(.+)$/m
+
+export interface UserReportedIssueDispatch {
+  verdict: 'code-failure' | 'test-case-failure' | 'requirement-issue'
+  rationale: string
+  dispatchedTo?: string
+}
+
+export interface ClassifyUserReportedIssueResult {
+  dispatch?: UserReportedIssueDispatch
+  usage: LlmUsage[]
+}
+
+function buildAmendRequirementMessages(requirement: { id: string; text: string }, rationale: string, userMessage: string): LlmMessage[] {
+  return [
+    {
+      role: 'system',
+      content: `You are QA, drafting an amended requirement after triaging a user-reported issue as a requirement problem
+(not a code or test problem). Given the requirement's current text, your own rationale for
+why it's the requirement at fault, and the user's original description, write the corrected
+requirement text. Reply with ONLY the new requirement text — no preamble, no explanation,
+no surrounding quotes.`,
+    },
+    {
+      role: 'user',
+      content: `Requirement ${requirement.id} (current text): ${requirement.text}\n\nWhy this requirement needs to change: ${rationale}\n\nUser's original description: ${userMessage}`,
+    },
+  ]
+}
+
+// User-reported issue triage + auto-dispatch (Area F "User-reported issue
+// triage", resolved) — the classification half of Test Execution's QA
+// chat's dispatch power. Called by the server route alongside (not
+// instead of) chatWithQATestExecution's plain conversational reply, over
+// the same test/run/message. Requires a test in focus (testCaseId) — with
+// nothing selected there is no element/requirement to dispatch to, so the
+// route skips this call entirely rather than invoking it with nothing to
+// attribute against.
+//
+// code-failure and requirement-issue both mutate project state
+// immediately (no separate confirmation step) — mirrors how an automated
+// code-failure verdict already flows straight into Coding via
+// pendingRecodeReason with no human gate. test-case-failure returns the
+// verdict only; unlike the automated-failure path (which has a TestRun
+// outcome to attach testCaseFailureConfirmedAt to via
+// confirmTestCaseFailure), a chat-reported issue has no run outcome to
+// confirm against, so it's surfaced to the human as a proposal with no
+// stored triage state — the human acts on it manually (edit/delete the
+// test case) the same way they always could.
+export async function classifyAndDispatchUserReportedIssue(
+  project: Project,
+  llmClient: LlmClient,
+  testCaseId: string,
+  latestRunId: string | null,
+  userMessage: string,
+  llmOptions?: LlmCallOptions,
+  codeContext?: string,
+): Promise<ClassifyUserReportedIssueResult> {
+  const test = project.testSuite?.tests.find((t) => t.id === testCaseId)
+  if (!test) {
+    throw new Error(`Test case ${testCaseId} not found`)
+  }
+  const latestRun: TestRun | null = latestRunId ? (project.testRuns?.find((r) => r.id === latestRunId) ?? null) : null
+
+  const messages = buildUserReportedIssueTriageMessages(
+    formatTestCase(test),
+    describeVerification(project, testCaseId),
+    formatLatestRun(latestRun, testCaseId),
+    userMessage,
+    codeContext,
+  )
+  const result = await llmClient.chat(messages, llmOptions)
+  const usage: LlmUsage[] = result.usage ? [result.usage] : []
+
+  if (result.content.trim() === 'NOT-AN-ISSUE-REPORT') {
+    return { usage }
+  }
+
+  const codeFailure = result.content.match(USER_ISSUE_CODE_FAILURE_LINE)
+  const testCaseFailure = result.content.match(USER_ISSUE_TEST_CASE_FAILURE_LINE)
+  const requirementIssue = result.content.match(USER_ISSUE_REQUIREMENT_ISSUE_LINE)
+
+  if (testCaseFailure) {
+    return { dispatch: { verdict: 'test-case-failure', rationale: testCaseFailure[1].trim() }, usage }
+  }
+
+  if (requirementIssue && test.type === 'functional' && test.requirementIds[0]) {
+    const rationale = requirementIssue[1].trim()
+    const requirement = project.requirements.find((r) => r.id === test.requirementIds[0] && !r.deletedAt)
+    if (requirement) {
+      const draftMessages = buildAmendRequirementMessages(requirement, rationale, userMessage)
+      const draftResult = await llmClient.chat(draftMessages, llmOptions)
+      if (draftResult.usage) usage.push(draftResult.usage)
+      const newText = draftResult.content.trim()
+      if (newText) {
+        updateRequirementText(project, requirement.id, newText)
+        return { dispatch: { verdict: 'requirement-issue', rationale, dispatchedTo: requirement.id }, usage }
+      }
+    }
+    // Fall through to code-failure treatment if there's no single
+    // requirement to amend (integration test, or the drafted text came
+    // back empty) — same "default to CODE-FAILURE when uncertain" rule
+    // the persona prompt already states for its own uncertainty.
+  }
+
+  const rationale = (codeFailure?.[1] ?? requirementIssue?.[1] ?? '').trim() || 'Reported by user in Test Execution chat.'
+  // A functional test's code failure dispatches to its one element. An
+  // integration test's code failure dispatches to BOTH connected elements
+  // — same treatment interfaceChangedSinceLastCoding already gives an
+  // interface-contract change, since either side (or both) could be where
+  // the reported behavior actually breaks and there's no reliable signal
+  // here to pick just one.
+  const targetElementIds = test.architectureElementId
+    ? [test.architectureElementId]
+    : (test.interfaceElementIds ?? [])
+  const dispatchedIds: string[] = []
+  for (const elementId of targetElementIds) {
+    const element = project.architecture?.elements.find((e) => e.id === elementId)
+    if (!element) continue
+    element.pendingRecodeReason = 'user-reported-issue'
+    element.pendingRecodeDetail = userMessage
+    dispatchedIds.push(element.id)
+  }
+
+  return { dispatch: { verdict: 'code-failure', rationale, dispatchedTo: dispatchedIds.join(', ') || undefined }, usage }
 }

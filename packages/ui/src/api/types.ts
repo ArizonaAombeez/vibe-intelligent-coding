@@ -5,19 +5,10 @@
 
 export type Status = 'not-started' | 'in-progress' | 'blocked' | 'complete'
 
-// 'planning' remains a valid PhaseId value — kept in this union (rather
-// than removed, as an earlier draft of this migration's plan called for)
-// because ProjectPartId = Exclude<PhaseId, 'dashboard'> and
-// PROJECT_PARTS'/httpApi.ts's still-intact 'planning' Import/Export part
-// entry both depend on it type-checking. Nav reachability is controlled
-// entirely by omitting the 'planning' PhaseInfo entry from
-// defaultPhases()'s returned array (see httpApi.ts) and by App.tsx never
-// rendering PlanningScreen — not by narrowing this type.
 export type PhaseId =
   | 'dashboard'
   | 'requirements'
   | 'architecture'
-  | 'planning'
   | 'test-creation'
   | 'coding'
   | 'test-execution'
@@ -75,11 +66,6 @@ export interface ProjectSettings {
   lightDarkMode: 'light' | 'dark' | 'system'
   autoSave: boolean
   phaseTabGating: 'gated' | 'always-accessible'
-  // For simpler projects only — import-mode projects always require the
-  // migration plan and ignore this toggle. When on, the Coding tab offers a
-  // quick inline story-creation form instead of requiring a trip through
-  // the full Planning (Backlog/Research/Sequencing) flow first.
-  allowCodingWithoutPlan: boolean
 }
 
 export interface CurrentOperation {
@@ -169,6 +155,7 @@ export interface ArchitectureElement {
   rowSpan: number
   colSpan: number
   interfaces: string[]
+  elementInterfaces: ElementInterfaceDefinition[]
   dynamicDesignEnabled?: boolean
 }
 
@@ -190,26 +177,68 @@ export interface InterfaceContractOperation {
   request: string
   response: string
   errors: string
+  range?: string
+  resolution?: string
+  unit?: string
+  updateFrequency?: string
+  drivenDirectly?: boolean
 }
 
-export interface InterfaceContract {
-  fromId: string
-  toId: string
+export type InterfaceRole = 'produces' | 'consumes' | 'both'
+
+// Project-wide master interface definition (Area B, resolved) — the single
+// source of truth every participant element's own ElementInterfaceDefinition
+// copy is checked against. Replaces the old pairwise InterfaceContract:
+// participants.length can be > 2, so one definition can represent a shared
+// bus/topic's whole fan-out/fan-in, not just one edge.
+export interface InterfaceDefinition {
+  id: string
+  name: string
+  participants: Array<{ elementId: string; role: InterfaceRole }>
   operations: InterfaceContractOperation[]
   status: 'defined' | 'stale'
+  updatedAt: string
+}
+
+// One element's own local copy of an interface it participates in — lives
+// on ArchitectureElement.elementInterfaces. aligned:false is a hard block
+// on Coding (see interfaceGateReasonForElement) until a human reconciles
+// this element's copy against the master (PUT .../interfaces/:id/reconcile).
+export interface ElementInterfaceDefinition {
+  masterDefinitionId: string
+  role: InterfaceRole
+  operations: InterfaceContractOperation[]
+  aligned: boolean
+  reqsCheckedAt?: string
 }
 
 export interface Architecture {
   layers: string[]
   elements: ArchitectureElement[]
   nextElementSeq: number
+  nextInterfaceSeq: number
   conflicts?: ArchitectureConflict[]
-  interfaceContracts?: InterfaceContract[]
+  interfaceDefinitions?: InterfaceDefinition[]
+}
+
+export interface IncompleteOperation {
+  fromId: string
+  toId: string
+  operationName: string
+  missingFields: string[]
 }
 
 export interface CheckInterfacesResult {
   undefinedPairs: Array<{ fromId: string; toId: string }>
-  staleContracts: InterfaceContract[]
+  staleContracts: InterfaceDefinition[]
+  incompleteOperations: IncompleteOperation[]
+  misalignedElements: Array<{ elementId: string; masterDefinitionId: string }>
+  // An element's own interface copy pointing at a masterDefinitionId that
+  // no longer exists — a broken reference, not merely out of date. See
+  // architecture.ts's own comment on this field for how this can happen
+  // (historical projects that generated an "IFACE-undefined" id before a
+  // counter-init bug was fixed).
+  danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }>
   complete: boolean
 }
 
@@ -292,89 +321,10 @@ export interface ArchitectChatResult {
   proposedInterfaces: ProposedInterface[]
 }
 
-// Planning (Area C, resolved) — mirrors
-// modules/requirements-elicitation/src/types.ts's Story/Backlog, kept as a
-// plain type here rather than importing the core module, per the
-// UI-as-a-pluggable-module principle.
-export type StoryStatus = Status
-
-export interface ResearchOption {
-  name: string
-  tradeoffs: string
-}
-
-export interface Research {
-  options: ResearchOption[]
-  recommendation: string
-  rationale: string
-  researchedAt: string
-}
-
-export interface Story {
-  id: string
-  title: string
-  description: string
-  architectureElementId: string | null
-  interfaceElementIds?: [string, string]
-  requirementIds: string[]
-  status: StoryStatus
-  dependsOn: string[]
-  sequence: number | null
-  research?: Research
-  createdAt: string
-  deletedAt?: string
-}
-
-export type StorySequencingConflictKind = 'circular-dependency'
-
-export interface StorySequencingConflict {
-  id: string
-  kind: StorySequencingConflictKind
-  storyIds: string[]
-  rationale: string
-}
-
-export interface Backlog {
-  stories: Story[]
-  nextStorySeq: number
-  conflicts?: StorySequencingConflict[]
-}
-
-export interface ProposedStory {
-  architectureElementName: string
-  title: string
-  description: string
-}
-
-export interface PlanningChatResult {
-  reply: string
-  proposedStories: ProposedStory[]
-}
-
-export interface CreateStoryFields {
-  title: string
-  description: string
-  architectureElementId?: string | null
-  interfaceElementIds?: [string, string]
-  requirementIds?: string[]
-}
-
-export interface UpdateStoryFields {
-  title?: string
-  description?: string
-  architectureElementId?: string | null
-  requirementIds?: string[]
-  status?: StoryStatus
-}
-
 // Coding & Review-Rework (Area D, resolved) — mirrors
 // modules/requirements-elicitation/src/types.ts's CodingRun, kept as a
 // plain type here per the UI-as-a-pluggable-module principle.
 export type CodingRunStatus = 'success' | 'rejected-scope' | 'rejected-multi-element' | 'rejected-not-eligible' | 'rejected-empty-output' | 'cli-error'
-
-export interface CodingChatResult {
-  reply: string
-}
 
 export interface CodingRun {
   id: string
@@ -388,6 +338,23 @@ export interface CodingRun {
   allowedSubfolder: string
   rejectedFiles?: string[]
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number }
+  // Which agent client/provider actually ran this (e.g. 'claude-code',
+  // 'opencode') and which model was requested — undefined only for runs
+  // that never reached the point of invoking an agent client at all
+  // (rejected-not-eligible). Lets the Coding screen show which provider a
+  // given run's timing belongs to, so a slow run can be attributed to a
+  // specific provider/model rather than left ambiguous.
+  providerId?: string
+  model?: string
+  // Provider-agnostic timing breakdown, derived purely from process
+  // lifecycle events (spawn/first output/exit) — works identically
+  // regardless of which provider ran. msToFirstOutput is the "how long
+  // before anything at all happened" signal that distinguishes a slow
+  // provider start from genuinely long agent work.
+  timing?: {
+    msToFirstOutput?: number
+    msTotal: number
+  }
 }
 
 // "Analyse Code" (Area D) — mirrors
@@ -412,7 +379,7 @@ export interface TestCase {
   type: TestType
   title: string
   requirementIds: string[]
-  interfaceContractRef?: { fromId: string; toId: string }
+  interfaceDefinitionId?: string
   architectureElementId: string | null
   interfaceElementIds?: [string, string]
   filePath?: string
@@ -458,7 +425,7 @@ export interface CreateTestCaseFields {
   type: TestType
   title: string
   requirementIds?: string[]
-  interfaceContractRef?: { fromId: string; toId: string }
+  interfaceDefinitionId?: string
   architectureElementId?: string | null
   interfaceElementIds?: [string, string]
 }
@@ -485,11 +452,28 @@ export interface TestCreationChatResult {
   proposedTests: ProposedTest[]
 }
 
-export interface TestExecutionChatResult {
-  reply: string
+// A user-described issue's dispatch outcome (Area F "User-reported issue
+// triage", resolved) — set only when a test/run is in focus and the QA
+// persona was able to classify the message; undefined for an ordinary
+// conversational reply (no test in focus, or the message didn't read as an
+// issue report). code-failure/requirement-issue are auto-dispatched by the
+// time this result is returned; test-case-failure is a proposal only,
+// mirroring the existing mandatory-human-confirmation gate.
+export interface TestExecutionChatDispatch {
+  verdict: 'code-failure' | 'test-case-failure' | 'requirement-issue'
+  rationale: string
+  // Which id the verdict was dispatched against — architectureElementId for
+  // code-failure, requirementId for requirement-issue. Undefined for
+  // test-case-failure (nothing is dispatched yet, pending confirmation).
+  dispatchedTo?: string
 }
 
-export type TestOutcomeTriage = 'code-failure' | 'test-case-failure' | 'unattributed'
+export interface TestExecutionChatResult {
+  reply: string
+  dispatch?: TestExecutionChatDispatch
+}
+
+export type TestOutcomeTriage = 'code-failure' | 'test-case-failure' | 'requirement-issue' | 'unattributed'
 
 export interface TestCaseOutcome {
   testCaseId: string
@@ -498,6 +482,15 @@ export interface TestCaseOutcome {
   triage?: TestOutcomeTriage
   triageRationale?: string
   testCaseFailureConfirmedAt?: string
+}
+
+// A test result from a scope's test command that didn't match any known
+// (requirement-traced) TestCase title — the coding agent's own inline tests
+// written while implementing the element, never registered via Test
+// Creation. No TestCase id to attach to, so identified by name only.
+export interface SwTestOutcome {
+  name: string
+  passed: boolean
 }
 
 export type TestRunKind = 'element-scoped' | 'full-regression'
@@ -512,6 +505,10 @@ export interface TestRun {
   exitCode: number | null
   rawLog: string
   outcomes: TestCaseOutcome[]
+  // Present (possibly empty) once this scope's test titles could be parsed
+  // out of the command output at all; undefined for runs that predate this
+  // field or whose output couldn't be parsed per-test.
+  swOutcomes?: SwTestOutcome[]
   mutationScore?: { killed: number; survived: number; percentage: number }
 }
 
@@ -524,12 +521,16 @@ export interface TestRegressionRun {
   trigger: 'coding-success' | 'manual'
 }
 
-export interface TestCommand {
-  command: string
-  args: string[]
-}
-
 export type TestCommandScope = { architectureElementId: string } | { interfaceElementIds: [string, string] }
+
+export type ScopeReadiness =
+  | { ready: true }
+  | { ready: false; reason: 'element-not-coded' | 'interface-element-not-coded' }
+
+export interface ScopeReadinessEntry {
+  scopeKey: string
+  readiness: ScopeReadiness
+}
 
 // Six requirement types (Area A, resolved) — assigned upon allocation, so
 // null until an architecture allocation exists.
@@ -609,8 +610,8 @@ export interface Requirement {
   // list's grouping. A requirement allocated to 2+ elements appears once
   // per element it belongs to in that grouped list.
   architectureElements: string[]
-  // Free-text hint the user can attach to steer Auto Allocate (heuristic and
-  // LLM) toward the right architecture element. Undefined until set.
+  // Free-text hint the user can attach to steer Auto Allocate (LLM) toward
+  // the right architecture element. Undefined until set.
   allocationRationale?: string
   // Set when the requirement has been soft-deleted (moved to the Bin).
   // Deleted requirements are excluded from listRequirements and only
@@ -639,11 +640,9 @@ export interface SplitRequirementResult {
 
 export type RequirementReferenceKind =
   | 'conflict'
-  | 'story'
   | 'test-case'
   | 'analyst-note-mention'
   | 'conflict-rationale-mention'
-  | 'story-text-mention'
   | 'test-case-title-mention'
 
 export interface RequirementReference {
@@ -671,7 +670,6 @@ export interface SplitPieceInput {
 
 export interface ApplySplitRequirementResult {
   createdRequirements: Requirement[]
-  updatedStoryIds: string[]
   updatedTestCaseIds: string[]
 }
 
@@ -1100,7 +1098,7 @@ export interface VicCoreApi {
   removeArchitectureLayer(projectId: string, rowIndex: number): Promise<Architecture>
   checkArchitectureConflicts(projectId: string): Promise<ArchitectureConflict[]>
   autoConfigureAndAllocate(projectId: string): Promise<AutoConfigureAndAllocateResult>
-  autoAllocate(projectId: string, mode: 'heuristic' | 'llm'): Promise<AutoAllocateResult>
+  autoAllocate(projectId: string, mode: 'llm'): Promise<AutoAllocateResult>
   architectChat(projectId: string, message: string): Promise<ArchitectChatResult>
   acceptProposedArchitectureElement(
     projectId: string,
@@ -1117,12 +1115,32 @@ export interface VicCoreApi {
     fromId: string,
     toId: string,
   ): Promise<ArchitectureConflict | null>
-  defineArchitectureInterfaceContract(
+  defineArchitectureInterfaceDefinition(
     projectId: string,
     fromId: string,
     toId: string,
-  ): Promise<InterfaceContract>
-  defineAllArchitectureInterfaceContracts(projectId: string): Promise<InterfaceContract[]>
+  ): Promise<InterfaceDefinition>
+  defineAllArchitectureInterfaceDefinitions(projectId: string, force?: boolean): Promise<InterfaceDefinition[]>
+  // Manual counterpart to defineArchitectureInterfaceDefinition — sets a
+  // definition's participants/operations directly, no LLM call. Backs the
+  // global/per-element manual interface editor. Creates a new definition
+  // when definitionId is omitted.
+  setArchitectureInterfaceDefinition(
+    projectId: string,
+    definitionId: string | undefined,
+    name: string,
+    participants: Array<{ elementId: string; role: InterfaceRole }>,
+    operations: InterfaceContractOperation[],
+  ): Promise<InterfaceDefinition>
+  // Reconciles one element's own local interface copy against its current
+  // master definition — the human review step required before Coding
+  // unblocks for that element after a master interface change.
+  reconcileArchitectureElementInterface(
+    projectId: string,
+    definitionId: string,
+    elementId: string,
+    operations: InterfaceContractOperation[],
+  ): Promise<ElementInterfaceDefinition>
   checkArchitectureInterfaces(projectId: string): Promise<CheckInterfacesResult>
   // Compares each defined interface contract's operations against the
   // generated source tree for that pair — the code-vs-Architecture half of
@@ -1134,26 +1152,8 @@ export interface VicCoreApi {
   // architecture and importedCode exist on the project.
   analyzeCodeAlignment(projectId: string): Promise<CodeAlignmentRecord>
 
-  // Planning (Area C — backlog, sequencing, research)
-  getBacklog(projectId: string): Promise<Backlog | null>
-  createStory(projectId: string, fields: CreateStoryFields): Promise<Story>
-  updateStory(projectId: string, storyId: string, fields: UpdateStoryFields): Promise<Story>
-  deleteStory(projectId: string, storyId: string): Promise<void>
-  addStoryDependency(projectId: string, storyId: string, dependsOnId: string): Promise<Story>
-  removeStoryDependency(projectId: string, storyId: string, dependsOnId: string): Promise<Story>
-  generateStories(projectId: string, architectureElementId: string): Promise<{ stories: Story[] }>
-  generateAllStories(projectId: string): Promise<{ stories: Story[] }>
-  sequenceStories(projectId: string): Promise<Backlog>
-  researchStory(projectId: string, storyId: string): Promise<{ research: Research | null }>
-  planningChat(projectId: string, message: string): Promise<PlanningChatResult>
-  acceptProposedStory(projectId: string, proposal: ProposedStory): Promise<Story>
-
-  // Coding & Review-Rework (Area D) — element-based (the new CodingScreen's
-  // own path). The old story-scoped runCoding/getCodingRunLock/codingChat
-  // parameters below (storyId) are kept working server-side (hide-not-
-  // delete: Planning's own routes stay callable) even though nothing in
-  // this UI calls them anymore now that CodingScreen no longer goes through
-  // Planning/Backlog at all.
+  // Coding & Review-Rework (Area D) — strictly element-based; coding is
+  // always scoped to exactly one architecture element's own folder.
   scaffoldSourceTree(projectId: string): Promise<{ createdFolders: string[] }>
   listCodingRuns(projectId: string): Promise<CodingRun[]>
   getCodingRun(projectId: string, runId: string): Promise<CodingRun>
@@ -1197,7 +1197,7 @@ export interface VicCoreApi {
   // running Coding here" proactively rather than only after a 409.
   getCodingRunLock(
     projectId: string,
-  ): Promise<{ locked: boolean; storyId?: string; architectureElementId?: string; userId?: string; startedAt?: number }>
+  ): Promise<{ locked: boolean; architectureElementId?: string; userId?: string; startedAt?: number }>
   // Aborts whichever CLI run currently holds this project's Coding
   // run-lock — the Coding screen's lock banner Cancel button. Throws if
   // nothing is locked; the lock is released by the cancelled run's own
@@ -1206,19 +1206,16 @@ export interface VicCoreApi {
   cancelCodingRun(projectId: string): Promise<void>
   getCodingConventions(projectId: string): Promise<string>
   setCodingConventions(projectId: string, text: string): Promise<void>
-  // codeScope lets the user pull real generated source into Dev chat's
-  // context on demand — 'none' (default, cheapest) sends only element
-  // metadata as before; 'element' reads just the selected element's own
-  // subfolder; 'project' reads the whole src/ tree. Bigger scopes cost more
-  // tokens per message, so the UI defaults to 'none'/'element' and lets the
-  // user opt up only when the narrower context isn't enough to diagnose
-  // something.
-  codingChat(
-    projectId: string,
-    architectureElementId: string | null,
-    message: string,
-    codeScope?: 'none' | 'element' | 'project',
-  ): Promise<CodingChatResult>
+  // Project Overview panel (Architecture tab) — what the app is, what tech
+  // it's built with, and how to build/run it. Read into every Coding-stage
+  // prompt as extra context; same undefined-until-set convention as coding
+  // conventions above.
+  getProjectOverview(projectId: string): Promise<{ description: string; runInstructions: string }>
+  setProjectOverview(projectId: string, description: string, runInstructions: string): Promise<void>
+  // Drafts description/runInstructions from the project's requirements and
+  // architecture elements via one LLM call. Does not persist — the caller
+  // still needs to call setProjectOverview to save the result.
+  autoPopulateProjectOverview(projectId: string): Promise<{ description: string; runInstructions: string }>
   // Lists every file under the project's generated src/ tree (Coding tab
   // "browse files" panel) — root is the absolute filesystem path so the UI
   // can show the user where the files live on disk, not just their names.
@@ -1231,6 +1228,7 @@ export interface VicCoreApi {
 
   // Test Creation (Area E)
   getTestSuite(projectId: string): Promise<TestSuite | null>
+  getTestScopeReadiness(projectId: string): Promise<ScopeReadinessEntry[]>
   createTestCase(
     projectId: string,
     fields: CreateTestCaseFields,
@@ -1273,8 +1271,6 @@ export interface VicCoreApi {
     testCaseId: string,
   ): Promise<{ triage: TestOutcomeTriage; triageRationale?: string }>
   confirmTestCaseFailure(projectId: string, runId: string, testCaseId: string): Promise<void>
-  getTestCommand(projectId: string, scope: TestCommandScope): Promise<TestCommand>
-  setTestCommand(projectId: string, scope: TestCommandScope, command: string, args: string[]): Promise<void>
   testExecutionChat(
     projectId: string,
     testCaseId: string | null,
@@ -1282,13 +1278,13 @@ export interface VicCoreApi {
     message: string,
   ): Promise<TestExecutionChatResult>
 
-  // Project settings (requirement 63) — phaseTabGating, unitTestMode
-  // (Area E, resolved requirements 53-54), and allowCodingWithoutPlan
-  // (Area C/D) are persisted server-side; the other ProjectSettings fields
-  // are still UI-only stub defaults until their backing features exist.
+  // Project settings (requirement 63) — phaseTabGating and unitTestMode
+  // (Area E, resolved requirements 53-54) are persisted server-side; the
+  // other ProjectSettings fields are still UI-only stub defaults until
+  // their backing features exist.
   updateProjectSettings(
     projectId: string,
-    updates: Partial<Pick<ProjectSettings, 'phaseTabGating' | 'unitTestMode' | 'allowCodingWithoutPlan'>>,
+    updates: Partial<Pick<ProjectSettings, 'phaseTabGating' | 'unitTestMode'>>,
   ): Promise<ProjectSettings>
 
   // Plugin settings (credentials/config for installed plugin modules)

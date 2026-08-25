@@ -1,6 +1,7 @@
 .test-execution-screen {
-  padding: 32px;
+  padding: 12px 32px 32px;
   max-width: 1200px;
+  position: relative;
 }
 
 .test-execution-screen h1 {
@@ -15,17 +16,13 @@
   margin: 0 0 12px;
 }
 
-.test-execution-action-bar {
-  margin-bottom: 16px;
+.test-execution-panel-actions {
   display: flex;
   align-items: center;
-  gap: 12px;
+  justify-content: center;
+  gap: 10px;
   flex-wrap: wrap;
-}
-
-.test-execution-status-text {
-  font-size: 13px;
-  color: var(--text-muted);
+  margin-bottom: 10px;
 }
 
 .test-execution-secondary-button {
@@ -42,7 +39,7 @@
   background: var(--hover-bg, rgba(128, 128, 128, 0.08));
 }
 
-.test-execution-action-bar button,
+.test-execution-panel-actions button,
 .test-execution-detail-header button,
 .test-execution-command-row button,
 .test-execution-triage-panel button,
@@ -56,7 +53,7 @@
   font: inherit;
 }
 
-.test-execution-action-bar button:disabled,
+.test-execution-panel-actions button:disabled,
 .test-execution-detail-header button:disabled,
 .test-execution-command-row button:disabled,
 .test-execution-triage-panel button:disabled,
@@ -65,11 +62,136 @@
   cursor: not-allowed;
 }
 
-.test-execution-layout {
+.test-execution-column-header {
+  position: absolute;
+  top: 0;
+  left: 16px;
+  right: 16px;
+  height: var(--notch-h);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  gap: 2px;
+}
+
+.test-execution-frame-left .test-execution-column-header {
+  right: calc(var(--notch-w) + 16px);
+}
+
+.test-execution-frame-right .test-execution-column-header {
+  left: calc(var(--notch-w) + 16px);
+}
+
+.test-execution-column-header h2 {
+  font-size: 15px;
+  color: var(--text-h);
+  margin: 0;
+}
+
+.test-execution-column-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.test-execution-group-title-clickable {
+  cursor: pointer;
+}
+
+/* Two boxed frames side by side with a centered Run Regression button
+   cut away from the top edge of both frames so it never overlaps them.
+   The notch (--notch-w wide, --notch-h deep) is sized generously beyond
+   the button's rendered footprint so text in the frame headers can
+   never sit under the button. */
+.test-execution-panels-row {
+  --notch-w: 100px;
+  --notch-h: 72px;
+  position: relative;
   display: grid;
-  grid-template-columns: 380px 1fr 300px;
-  gap: 20px;
-  align-items: start;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  margin-bottom: 20px;
+  margin-top: 10px;
+}
+
+.test-execution-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  padding-top: calc(var(--notch-h) + 16px);
+  background: var(--panel-bg, var(--bg));
+}
+
+.test-execution-frame-left {
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--notch-w)) 0,
+    calc(100% - var(--notch-w)) var(--notch-h),
+    100% var(--notch-h),
+    100% 100%,
+    0 100%
+  );
+}
+
+.test-execution-frame-right {
+  clip-path: polygon(
+    0 var(--notch-h),
+    var(--notch-w) var(--notch-h),
+    var(--notch-w) 0,
+    100% 0,
+    100% 100%,
+    0 100%
+  );
+}
+
+.test-execution-regression-frame {
+  position: absolute;
+  top: 4px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 8px 14px 10px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-bg, var(--bg));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+
+.test-execution-regression-button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  padding: 10px 20px;
+  font: inherit;
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.test-execution-regression-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.test-execution-regression-frame-summary {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.test-execution-bottom {
+  display: block;
 }
 
 .test-execution-regression-status {
@@ -81,7 +203,6 @@
   border-radius: 10px;
   border: 1px solid var(--tone-color);
   background: color-mix(in srgb, var(--tone-color) 10%, transparent);
-  margin-bottom: 16px;
 }
 
 .test-execution-regression-status .test-execution-status-dot {
@@ -111,18 +232,77 @@
   --tone-color: var(--status-grey);
 }
 
-.test-execution-history-pane {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 14px;
-  max-height: 70vh;
-  overflow-y: auto;
+.test-execution-history-tab {
+  position: fixed;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px 0 0 8px;
+  padding: 10px 8px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  writing-mode: vertical-rl;
+  box-shadow: -2px 0 8px rgba(0, 0, 0, 0.2);
 }
 
-.test-execution-history-pane h2 {
+.test-execution-history-tab-open {
+  right: 320px;
+}
+
+.test-execution-history-tab-icon {
+  writing-mode: horizontal-tb;
+}
+
+.test-execution-history-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 25;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.test-execution-history-pane {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 320px;
+  z-index: 30;
+  border-left: 1px solid var(--border);
+  background: var(--panel-bg, var(--bg));
+  padding: 14px;
+  overflow-y: auto;
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.25);
+}
+
+.test-execution-history-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.test-execution-history-pane-header h2 {
   font-size: 14px;
   color: var(--text-h);
-  margin: 0 0 10px;
+  margin: 0;
+}
+
+.test-execution-history-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px 6px;
 }
 
 .test-execution-history-list {
@@ -195,7 +375,19 @@
 .test-execution-group {
   border: 1px solid var(--border);
   border-radius: 10px;
-  overflow: hidden;
+}
+
+.test-execution-group-not-ready {
+  opacity: 0.55;
+}
+
+.test-execution-subsection-heading {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 6px 2px 0;
 }
 
 .test-execution-group-header {
@@ -205,17 +397,25 @@
   padding: 8px 10px;
   background: var(--hover-bg, rgba(128, 128, 128, 0.06));
   border-bottom: 1px solid var(--border);
+  border-radius: 9px 9px 0 0;
+  cursor: pointer;
+}
+
+.test-execution-group-header:hover {
+  background: var(--hover-bg-strong, rgba(128, 128, 128, 0.14));
+}
+
+.test-execution-group-header:last-child {
+  border-bottom: none;
+  border-radius: 9px;
 }
 
 .test-execution-group-toggle {
-  background: none;
-  border: none;
-  padding: 0;
-  width: 16px;
+  width: 18px;
   color: var(--text-muted);
-  cursor: pointer;
-  font-size: 11px;
+  font-size: 15px;
   flex-shrink: 0;
+  text-align: center;
 }
 
 .test-execution-group-title {
@@ -243,6 +443,34 @@
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.test-execution-sw-subsection {
+  border-top: 2px solid var(--accent);
+  margin-top: 4px;
+}
+
+.test-execution-sw-subsection-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.test-execution-sw-subsection-title {
+  flex: 1;
+  color: var(--text-h);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+
+.test-execution-sw-subsection-note {
+  padding: 6px 10px 10px;
+  font-size: 12px;
+  color: var(--text-muted);
 }
 
 .test-execution-row {

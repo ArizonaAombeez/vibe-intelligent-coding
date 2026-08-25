@@ -11,13 +11,14 @@ import type {
   ArchitectureTypeOption,
   AutoConfigureAndAllocateResult,
   AutoAllocateResult,
-  Backlog,
   CheckConflictsResult,
   CheckInterfacesResult,
   CheckInterfaceCodeAlignmentResult,
-  InterfaceContract,
+  InterfaceDefinition,
+  InterfaceRole,
+  ElementInterfaceDefinition,
+  InterfaceContractOperation,
   CodeAlignmentRecord,
-  CodingChatResult,
   CodingRun,
   ElementRequirementCoverage,
   CreateArchitectureElementFields,
@@ -30,14 +31,12 @@ import type {
   ScanCodeGapsOptions,
   CodeGapScanTokenEstimate,
   CodeStripOptions,
-  CreateStoryFields,
   CreateTestCaseFields,
   LastChecksResult,
   MigrationPlanRecord,
   OpenProjectResult,
   PersonaScope,
   PersonaSettings,
-  PlanningChatResult,
   PluginInstallStatus,
   PluginSettings,
   PluginUsage,
@@ -46,20 +45,16 @@ import type {
   ProjectPartInfo,
   ProjectSettings,
   ProjectSummary,
-  ProposedStory,
   ProposedTest,
   RejectedProposal,
   Requirement,
   RequirementProvenance,
   RequirementReferencesResult,
   RequirementStatus,
-  Research,
   SplitPieceInput,
   SplitRequirementResult,
   StorageInfo,
-  Story,
   TestCase,
-  TestCommand,
   TestCommandScope,
   TestCreationChatResult,
   TestExecutionChatResult,
@@ -67,11 +62,11 @@ import type {
   TestRegressionRun,
   TestRun,
   TestSuite,
+  ScopeReadinessEntry,
   TokenEstimate,
   TokenUsage,
   TraceabilityRejectionReason,
   UpdateArchitectureElementFields,
-  UpdateStoryFields,
   UpdateTestCaseFields,
   VicCoreApi,
   VicUser,
@@ -88,7 +83,6 @@ const defaultSettings: ProjectSettings = {
   // always-accessible until sign-off exists. Overridden below by whatever
   // the server has actually persisted for this project.
   phaseTabGating: 'always-accessible',
-  allowCodingWithoutPlan: false,
 }
 
 function defaultPhases(): OpenProjectResult['phases'] {
@@ -116,11 +110,6 @@ function defaultPhases(): OpenProjectResult['phases'] {
         { id: 'traceability', label: 'Traceability View', status: 'not-started' },
       ],
     },
-    // 'planning' PhaseInfo entry intentionally omitted — this is the single
-    // change that makes Planning unreachable from the nav (hide-not-delete).
-    // Its own screen/backend/methods below are otherwise fully intact and
-    // callable; there's simply no PhaseInfo for App.tsx to ever set as the
-    // active phase.
     { id: 'test-creation', label: 'Test Creation', status: 'not-started', substeps: [] },
     { id: 'coding', label: 'Coding', status: 'not-started', substeps: [] },
     { id: 'test-execution', label: 'Test Execution', status: 'not-started', substeps: [] },
@@ -181,7 +170,6 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
 const PROJECT_PARTS: ProjectPartInfo[] = [
   { id: 'requirements', label: 'Requirements', available: true },
   { id: 'architecture', label: 'Architecture', available: true },
-  { id: 'planning', label: 'Planning', available: false },
   { id: 'test-creation', label: 'Test Creation', available: false },
   { id: 'coding', label: 'Coding', available: false },
   { id: 'test-execution', label: 'Test Execution', available: false },
@@ -691,10 +679,10 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async autoAllocate(projectId: string, mode: 'heuristic' | 'llm') {
+    async autoAllocate(projectId: string, mode: 'llm') {
       try {
         currentOperation = {
-          text: mode === 'heuristic' ? 'Allocating requirements...' : 'Architect is allocating requirements...',
+          text: 'Architect is allocating requirements...',
         }
         const result = await requestJson<AutoAllocateResult>(
           `${baseUrl}/api/projects/${projectId}/architecture/auto-allocate`,
@@ -762,30 +750,57 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async defineArchitectureInterfaceContract(projectId: string, fromId: string, toId: string) {
+    async defineArchitectureInterfaceDefinition(projectId: string, fromId: string, toId: string) {
       try {
         currentOperation = { text: 'Architect is defining the interface...' }
-        const result = await requestJson<{ contract: InterfaceContract }>(
+        const result = await requestJson<{ definition: InterfaceDefinition }>(
           `${baseUrl}/api/projects/${projectId}/architecture/interfaces/define`,
           { method: 'POST', body: JSON.stringify({ fromId, toId }) },
         )
         currentOperation = { text: null }
-        return result.contract
+        return result.definition
       } catch (err) {
         currentOperation = toOperationError(err)
         throw err
       }
     },
 
-    async defineAllArchitectureInterfaceContracts(projectId: string) {
+    async setArchitectureInterfaceDefinition(
+      projectId: string,
+      definitionId: string | undefined,
+      name: string,
+      participants: Array<{ elementId: string; role: InterfaceRole }>,
+      operations: InterfaceContractOperation[],
+    ) {
+      const result = await requestJson<{ definition: InterfaceDefinition }>(
+        `${baseUrl}/api/projects/${projectId}/architecture/interfaces`,
+        { method: 'PUT', body: JSON.stringify({ definitionId, name, participants, operations }) },
+      )
+      return result.definition
+    },
+
+    async reconcileArchitectureElementInterface(
+      projectId: string,
+      definitionId: string,
+      elementId: string,
+      operations: InterfaceContractOperation[],
+    ) {
+      const result = await requestJson<{ elementInterface: ElementInterfaceDefinition }>(
+        `${baseUrl}/api/projects/${projectId}/architecture/interfaces/${definitionId}/reconcile`,
+        { method: 'PUT', body: JSON.stringify({ elementId, operations }) },
+      )
+      return result.elementInterface
+    },
+
+    async defineAllArchitectureInterfaceDefinitions(projectId: string, force = false) {
       try {
-        currentOperation = { text: 'Architect is defining interfaces...' }
-        const result = await requestJson<{ contracts: InterfaceContract[] }>(
+        currentOperation = { text: force ? 'Architect is redefining all interfaces...' : 'Architect is defining interfaces...' }
+        const result = await requestJson<{ definitions: InterfaceDefinition[] }>(
           `${baseUrl}/api/projects/${projectId}/architecture/interfaces/define-all`,
-          { method: 'POST' },
+          { method: 'POST', body: JSON.stringify({ force }) },
         )
         currentOperation = { text: null }
-        return result.contracts
+        return result.definitions
       } catch (err) {
         currentOperation = toOperationError(err)
         throw err
@@ -821,121 +836,6 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async getBacklog(projectId: string) {
-      return requestJson<Backlog | null>(`${baseUrl}/api/projects/${projectId}/backlog`)
-    },
-
-    async createStory(projectId: string, fields: CreateStoryFields) {
-      return requestJson<Story>(`${baseUrl}/api/projects/${projectId}/backlog/stories`, {
-        method: 'POST',
-        body: JSON.stringify(fields),
-      })
-    },
-
-    async updateStory(projectId: string, storyId: string, fields: UpdateStoryFields) {
-      return requestJson<Story>(`${baseUrl}/api/projects/${projectId}/backlog/stories/${storyId}`, {
-        method: 'PUT',
-        body: JSON.stringify(fields),
-      })
-    },
-
-    async deleteStory(projectId: string, storyId: string) {
-      const response = await fetch(`${baseUrl}/api/projects/${projectId}/backlog/stories/${storyId}`, {
-        method: 'DELETE',
-      })
-      if (!response.ok) {
-        const body = await response.json().catch(() => null)
-        throw new Error(body?.error ?? `Deleting story ${storyId} failed`)
-      }
-    },
-
-    async addStoryDependency(projectId: string, storyId: string, dependsOnId: string) {
-      return requestJson<Story>(
-        `${baseUrl}/api/projects/${projectId}/backlog/stories/${storyId}/dependencies`,
-        { method: 'POST', body: JSON.stringify({ dependsOnId }) },
-      )
-    },
-
-    async removeStoryDependency(projectId: string, storyId: string, dependsOnId: string) {
-      return requestJson<Story>(
-        `${baseUrl}/api/projects/${projectId}/backlog/stories/${storyId}/dependencies/${dependsOnId}`,
-        { method: 'DELETE' },
-      )
-    },
-
-    async generateStories(projectId: string, architectureElementId: string) {
-      try {
-        currentOperation = { text: 'PM is generating stories...' }
-        const result = await requestJson<{ stories: Story[] }>(
-          `${baseUrl}/api/projects/${projectId}/backlog/generate-stories`,
-          { method: 'POST', body: JSON.stringify({ architectureElementId }) },
-        )
-        currentOperation = { text: null }
-        return result
-      } catch (err) {
-        currentOperation = toOperationError(err)
-        throw err
-      }
-    },
-
-    async generateAllStories(projectId: string) {
-      try {
-        currentOperation = { text: 'PM is generating stories...' }
-        const result = await requestJson<{ stories: Story[] }>(
-          `${baseUrl}/api/projects/${projectId}/backlog/generate-stories-all`,
-          { method: 'POST' },
-        )
-        currentOperation = { text: null }
-        return result
-      } catch (err) {
-        currentOperation = toOperationError(err)
-        throw err
-      }
-    },
-
-    async sequenceStories(projectId: string) {
-      return requestJson<Backlog>(`${baseUrl}/api/projects/${projectId}/backlog/sequence`, {
-        method: 'POST',
-      })
-    },
-
-    async researchStory(projectId: string, storyId: string) {
-      try {
-        currentOperation = { text: 'PM is researching implementation options...' }
-        const result = await requestJson<{ research: Research | null }>(
-          `${baseUrl}/api/projects/${projectId}/backlog/stories/${storyId}/research`,
-          { method: 'POST' },
-        )
-        currentOperation = { text: null }
-        return result
-      } catch (err) {
-        currentOperation = toOperationError(err)
-        throw err
-      }
-    },
-
-    async planningChat(projectId: string, message: string) {
-      try {
-        currentOperation = { text: 'PM is thinking...' }
-        const result = await requestJson<PlanningChatResult>(
-          `${baseUrl}/api/projects/${projectId}/backlog/chat`,
-          { method: 'POST', body: JSON.stringify({ message }) },
-        )
-        currentOperation = { text: null }
-        return result
-      } catch (err) {
-        currentOperation = toOperationError(err)
-        throw err
-      }
-    },
-
-    async acceptProposedStory(projectId: string, proposal: ProposedStory) {
-      return requestJson<Story>(
-        `${baseUrl}/api/projects/${projectId}/backlog/stories/from-proposal`,
-        { method: 'POST', body: JSON.stringify(proposal) },
-      )
-    },
-
     async scaffoldSourceTree(projectId: string) {
       return requestJson<{ createdFolders: string[] }>(`${baseUrl}/api/projects/${projectId}/coding/scaffold`, {
         method: 'POST',
@@ -950,12 +850,8 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       return requestJson<CodingRun>(`${baseUrl}/api/projects/${projectId}/coding/runs/${runId}`)
     },
 
-    // Element-scoped Coding (the new CodingScreen's own path) — hits the
-    // new /architecture/elements/:elementId/run-coding route. The old
-    // story-scoped /backlog/stories/:storyId/run-coding route stays fully
-    // implemented server-side (hide-not-delete) but nothing in this UI
-    // calls it anymore now that CodingScreen no longer goes through
-    // Planning/Backlog.
+    // Element-scoped Coding — every Coding run always targets exactly one
+    // architecture element's own folder.
     async runCoding(
       projectId: string,
       architectureElementId: string,
@@ -1018,7 +914,6 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
     async getCodingRunLock(projectId: string) {
       return requestJson<{
         locked: boolean
-        storyId?: string
         architectureElementId?: string
         userId?: string
         startedAt?: number
@@ -1052,17 +947,30 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async codingChat(
-      projectId: string,
-      architectureElementId: string | null,
-      message: string,
-      codeScope: 'none' | 'element' | 'project' = 'none',
-    ) {
+    async getProjectOverview(projectId: string) {
+      return requestJson<{ description: string; runInstructions: string }>(
+        `${baseUrl}/api/projects/${projectId}/overview`,
+      )
+    },
+
+    async setProjectOverview(projectId: string, description: string, runInstructions: string) {
+      const response = await fetch(`${baseUrl}/api/projects/${projectId}/overview`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, runInstructions }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? 'Setting project overview failed')
+      }
+    },
+
+    async autoPopulateProjectOverview(projectId: string) {
       try {
-        currentOperation = { text: 'Dev is thinking...' }
-        const result = await requestJson<CodingChatResult>(
-          `${baseUrl}/api/projects/${projectId}/coding-chat`,
-          { method: 'POST', body: JSON.stringify({ architectureElementId, message, codeScope }) },
+        currentOperation = { text: 'Architect is drafting the project overview...' }
+        const result = await requestJson<{ description: string; runInstructions: string }>(
+          `${baseUrl}/api/projects/${projectId}/overview/auto-populate`,
+          { method: 'POST' },
         )
         currentOperation = { text: null }
         return result
@@ -1095,6 +1003,10 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
 
     async getTestSuite(projectId: string) {
       return requestJson<TestSuite | null>(`${baseUrl}/api/projects/${projectId}/test-suite`)
+    },
+
+    async getTestScopeReadiness(projectId: string) {
+      return requestJson<ScopeReadinessEntry[]>(`${baseUrl}/api/projects/${projectId}/test-suite/readiness`)
     },
 
     async createTestCase(projectId: string, fields: CreateTestCaseFields) {
@@ -1310,31 +1222,6 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async getTestCommand(projectId: string, scope: TestCommandScope) {
-      const params = new URLSearchParams(
-        'architectureElementId' in scope
-          ? { architectureElementId: scope.architectureElementId }
-          : { fromId: scope.interfaceElementIds[0], toId: scope.interfaceElementIds[1] },
-      )
-      return requestJson<TestCommand>(`${baseUrl}/api/projects/${projectId}/test-command?${params.toString()}`)
-    },
-
-    async setTestCommand(projectId: string, scope: TestCommandScope, command: string, args: string[]) {
-      const body =
-        'architectureElementId' in scope
-          ? { architectureElementId: scope.architectureElementId, command, args }
-          : { fromId: scope.interfaceElementIds[0], toId: scope.interfaceElementIds[1], command, args }
-      const response = await fetch(`${baseUrl}/api/projects/${projectId}/test-command`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-      if (!response.ok) {
-        const body2 = await response.json().catch(() => null)
-        throw new Error(body2?.error ?? 'Setting test command failed')
-      }
-    },
-
     async testExecutionChat(projectId: string, testCaseId: string | null, runId: string | null, message: string) {
       try {
         currentOperation = { text: 'QA is thinking...' }
@@ -1360,7 +1247,7 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
 
     async updateProjectSettings(
       projectId: string,
-      updates: Partial<Pick<ProjectSettings, 'phaseTabGating' | 'unitTestMode' | 'allowCodingWithoutPlan'>>,
+      updates: Partial<Pick<ProjectSettings, 'phaseTabGating' | 'unitTestMode'>>,
     ) {
       const persisted = await requestJson<Partial<ProjectSettings>>(
         `${baseUrl}/api/projects/${projectId}/settings`,

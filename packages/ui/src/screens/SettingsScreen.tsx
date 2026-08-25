@@ -283,7 +283,6 @@ export function SettingsScreen({
   const [savedId, setSavedId] = useState<string | null>(null)
   const [errorById, setErrorById] = useState<Record<string, string>>({})
   const [gatingSaving, setGatingSaving] = useState(false)
-  const [noPlanSaving, setNoPlanSaving] = useState(false)
   const [statusById, setStatusById] = useState<Record<string, PluginInstallStatus>>({})
   const [statusCheckingId, setStatusCheckingId] = useState<string | null>(null)
   const [storageInfo, setStorageInfo] = useState<StorageInfo | null>(null)
@@ -320,18 +319,6 @@ export function SettingsScreen({
     }
   }
 
-  async function handleNoPlanChange(allow: boolean) {
-    if (!project || noPlanSaving) return
-    setNoPlanSaving(true)
-    try {
-      const updated = await api.updateProjectSettings(project.projectId, {
-        allowCodingWithoutPlan: allow,
-      })
-      onProjectSettingsChange(updated)
-    } finally {
-      setNoPlanSaving(false)
-    }
-  }
 
   function setPluginDraftValue(pluginId: string, key: string, value: string) {
     setPluginDrafts((prev) => ({ ...prev, [pluginId]: { ...prev[pluginId], [key]: value } }))
@@ -587,33 +574,13 @@ export function SettingsScreen({
                     <span>Require sign-off before unlocking later phase tabs</span>
                   </span>
                   <p className="settings-field-description">
-                    When on, a phase tab (Architecture, Planning, ...) stays disabled until the
+                    When on, a phase tab (Architecture, Coding, ...) stays disabled until the
                     preceding phase is signed off. Off by default — sign-off isn't built yet and
                     this tool is single-user, so every phase tab is clickable at any time. Turn
                     this on later once phase sign-off exists, if you want to enforce working in
                     order.
                   </p>
                 </label>
-
-                {project.projectMode !== 'import' && (
-                  <label className="settings-field settings-field-checkbox">
-                    <span className="settings-field-label-row">
-                      <input
-                        type="checkbox"
-                        checked={project.settings.allowCodingWithoutPlan === true}
-                        disabled={noPlanSaving}
-                        onChange={(e) => handleNoPlanChange(e.target.checked)}
-                      />
-                      <span>Allow Coding without a full Planning pass</span>
-                    </span>
-                    <p className="settings-field-description">
-                      For simpler projects. When on, the Coding tab offers a quick inline
-                      story-creation form so you can start Coding without first running the full
-                      Planning flow (Backlog/Research/Sequencing). Off by default. Not available
-                      for imported projects — those always require the migration plan.
-                    </p>
-                  </label>
-                )}
               </section>
             )}
 

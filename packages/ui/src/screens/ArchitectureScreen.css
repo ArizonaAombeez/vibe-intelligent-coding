@@ -25,6 +25,48 @@
   margin: 8px 0 16px;
 }
 
+.architecture-overview-panel {
+  margin: 16px 0;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 8px 12px;
+}
+
+.architecture-overview-toggle {
+  background: none;
+  border: none;
+  color: var(--text-h);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.architecture-overview-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.architecture-overview-auto-populate {
+  align-self: flex-start;
+}
+
+.architecture-overview-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.architecture-overview-label textarea {
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+
 .architecture-type-selector {
   margin: 24px 0;
 }
@@ -158,7 +200,35 @@
 
 .architecture-action-bar {
   display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.architecture-action-group {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 220px;
   gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.architecture-action-group-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.architecture-action-group-label {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted, var(--text));
+  opacity: 0.7;
 }
 
 .architecture-action-bar button {
@@ -555,4 +625,20 @@
 .architecture-interface-actions .requirement-detail-edit-btn {
   padding: 3px 8px;
   font-size: 11px;
+}
+
+.interface-check-clickable-row {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--status-red);
+  cursor: pointer;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.interface-check-clickable-row:hover {
+  color: var(--accent);
 }

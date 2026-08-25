@@ -1,0 +1,46 @@
+.interface-editor-modal {
+  width: 720px;
+}
+
+.interface-editor-operation-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.interface-editor-operation {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.interface-editor-operation-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.interface-editor-operation-header input {
+  flex: 1;
+}
+
+.interface-editor-field-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+
+.interface-editor-frequency-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.interface-editor-frequency-row input[type='text'],
+.interface-editor-frequency-row .architecture-detail-input {
+  flex: 1;
+}

@@ -9,11 +9,11 @@ import {
   removeLayer,
   checkArchitectureConflicts,
   autoConfigureAndAllocate,
-  autoAllocateHeuristic,
   autoAllocateLlm,
   acceptProposedInterface,
-  defineInterfaceContract,
-  defineAllInterfaceContracts,
+  defineInterfaceDefinition,
+  defineAllInterfaceDefinitions,
+  setInterfaceDefinition,
   checkInterfaces,
   EXTERNAL_CONTEXT_ROW,
   createRequirementFromForm as createRequirementFromFormReal,
@@ -479,91 +479,6 @@ test('autoConfigureAndAllocate throws when no architecture exists yet', async ()
   await assert.rejects(() => autoConfigureAndAllocate(project, fake), /architecture/i)
 })
 
-test('autoAllocateHeuristic allocates a requirement onto the element whose name/responsibility it overlaps most with', () => {
-  const project = emptyProject()
-  setArchitectureType(project, 'custom')
-  addLayer(project, 'Core')
-  const login = createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Login UI',
-    responsibility: 'Renders the login form and handles user authentication',
-    row: 0,
-    col: 0,
-  })
-  const payments = createArchitectureElement(project, {
-    kind: 'external',
-    name: 'Stripe',
-    responsibility: 'Third-party payment card processor',
-    row: -1,
-    col: 0,
-  })
-  const r1 = createRequirementFromForm(project, {
-    text: 'The system shall render a login form for authentication',
-  })
-  const r2 = createRequirementFromForm(project, { text: 'The system shall charge cards via a payment processor' })
-
-  const result = autoAllocateHeuristic(project)
-
-  assert.deepEqual(result.unallocatedRequirementIds, [])
-  assert.deepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [login.id])
-  assert.deepEqual(project.requirements.find((r) => r.id === r2.id)?.architectureElements, [payments.id])
-})
-
-test('autoAllocateHeuristic leaves a requirement unallocated when nothing scores above the minimum threshold', () => {
-  const project = emptyProject()
-  setArchitectureType(project, 'custom')
-  addLayer(project, 'Core')
-  createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Login UI',
-    responsibility: 'Renders the login form',
-    row: 0,
-    col: 0,
-  })
-  const r1 = createRequirementFromForm(project, { text: 'Completely unrelated widget frobnicator behaviour' })
-
-  const result = autoAllocateHeuristic(project)
-
-  assert.deepEqual(result.unallocatedRequirementIds, [r1.id])
-  assert.deepEqual(project.requirements[0].architectureElements, [])
-})
-
-test('autoAllocateHeuristic never creates elements and throws when none exist yet', () => {
-  const project = emptyProject()
-  setArchitectureType(project, 'custom')
-  assert.throws(() => autoAllocateHeuristic(project), /architecture element/i)
-})
-
-test('autoAllocateHeuristic only touches unallocated requirements, leaving existing allocations untouched', () => {
-  const project = emptyProject()
-  setArchitectureType(project, 'custom')
-  addLayer(project, 'Core')
-  const elementA = createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Module A',
-    responsibility: 'Handles login',
-    row: 0,
-    col: 0,
-  })
-  const elementB = createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Module B',
-    responsibility: 'Handles login',
-    row: 0,
-    col: 1,
-  })
-  const allocated = createRequirementFromForm(project, { text: 'The system shall handle login' })
-  reassignArchitectureElement(project, allocated.id, elementB.id)
-
-  autoAllocateHeuristic(project)
-
-  assert.deepEqual(
-    project.requirements.find((r) => r.id === allocated.id)?.architectureElements,
-    [elementB.id],
-    'already-allocated requirement must not be reassigned to the higher-scoring element A',
-  )
-})
-
 test('autoAllocateLlm allocates onto existing elements only, never creating new ones', async () => {
   const project = emptyProject()
   setArchitectureType(project, 'web-app')
@@ -705,36 +620,6 @@ test('autoAllocateLlm includes a requirement\'s allocationRationale in the promp
   assert.match(fake.receivedMessages[0][1].content, /goes in the Telemetry module, not Logging/)
 })
 
-test('autoAllocateHeuristic folds allocationRationale keywords into its scoring', () => {
-  const project = emptyProject()
-  setArchitectureType(project, 'custom')
-  addLayer(project, 'Core')
-  const generic = createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Generic Module',
-    responsibility: 'Does generic things',
-    row: 0,
-    col: 0,
-  })
-  const telemetry = createArchitectureElement(project, {
-    kind: 'functional',
-    name: 'Telemetry Module',
-    responsibility: 'Collects and forwards telemetry events',
-    row: 0,
-    col: 1,
-  })
-  // Requirement text alone doesn't clearly favour either module; the
-  // rationale is what should tip the score toward Telemetry.
-  const r1 = createRequirementFromForm(project, { text: 'The system shall do a thing' })
-  r1.allocationRationale = 'telemetry events forwarding'
-
-  const result = autoAllocateHeuristic(project)
-
-  assert.deepEqual(result.unallocatedRequirementIds, [])
-  assert.deepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [telemetry.id])
-  assert.notDeepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [generic.id])
-})
-
 function twoConnectedElements(project: Project) {
   setArchitectureType(project, 'custom')
   addLayer(project, 'Core')
@@ -756,7 +641,7 @@ function twoConnectedElements(project: Project) {
   return { from, to }
 }
 
-test('defineInterfaceContract parses OPERATION lines from the LLM reply into a persisted contract', async () => {
+test('defineInterfaceDefinition parses OPERATION lines from the LLM reply into a persisted contract', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
   const llmClient = new FakeLlmClient(
@@ -764,49 +649,152 @@ test('defineInterfaceContract parses OPERATION lines from the LLM reply into a p
       'OPERATION: refund|Refunds a charge|receiptId: string|NONE|NONE',
   )
 
-  const result = await defineInterfaceContract(project, llmClient, from.id, to.id)
+  const result = await defineInterfaceDefinition(project, llmClient, from.id, to.id)
 
-  assert.equal(result.contract.fromId, from.id)
-  assert.equal(result.contract.toId, to.id)
-  assert.equal(result.contract.status, 'defined')
-  assert.equal(result.contract.operations.length, 2)
-  assert.equal(result.contract.operations[0].name, 'chargeCard')
-  assert.equal(result.contract.operations[0].errors, 'CardDeclined')
-  assert.equal(result.contract.operations[1].errors, '')
-  assert.deepEqual(project.architecture?.interfaceContracts, [result.contract])
+  assert.deepEqual(
+    result.definition.participants.map((p) => p.elementId).sort(),
+    [from.id, to.id].sort(),
+  )
+  assert.equal(result.definition.status, 'defined')
+  assert.equal(result.definition.operations.length, 2)
+  assert.equal(result.definition.operations[0].name, 'chargeCard')
+  assert.equal(result.definition.operations[0].errors, 'CardDeclined')
+  assert.equal(result.definition.operations[1].errors, '')
+  assert.deepEqual(project.architecture?.interfaceDefinitions, [result.definition])
 })
 
-test('defineInterfaceContract treats a NONE reply as zero operations, not an error', async () => {
+test('defineInterfaceDefinition treats a NONE reply as zero operations, not an error', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
   const llmClient = new FakeLlmClient('NONE')
 
-  const result = await defineInterfaceContract(project, llmClient, from.id, to.id)
+  const result = await defineInterfaceDefinition(project, llmClient, from.id, to.id)
 
-  assert.deepEqual(result.contract.operations, [])
-  assert.equal(result.contract.status, 'defined')
+  assert.deepEqual(result.definition.operations, [])
+  assert.equal(result.definition.status, 'defined')
 })
 
-test('defineInterfaceContract replaces any existing contract for the same pair rather than duplicating it', async () => {
+test('defineInterfaceDefinition replaces any existing contract for the same pair rather than duplicating it', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(project, new FakeLlmClient('OPERATION: a|d|r|s|NONE'), from.id, to.id)
+  await defineInterfaceDefinition(project, new FakeLlmClient('OPERATION: a|d|r|s|NONE'), from.id, to.id)
 
-  await defineInterfaceContract(project, new FakeLlmClient('OPERATION: b|d|r|s|NONE'), from.id, to.id)
+  await defineInterfaceDefinition(project, new FakeLlmClient('OPERATION: b|d|r|s|NONE'), from.id, to.id)
 
-  assert.equal(project.architecture?.interfaceContracts?.length, 1)
-  assert.equal(project.architecture?.interfaceContracts?.[0].operations[0].name, 'b')
+  assert.equal(project.architecture?.interfaceDefinitions?.length, 1)
+  assert.equal(project.architecture?.interfaceDefinitions?.[0].operations[0].name, 'b')
 })
 
-test('defineInterfaceContract throws when either element does not exist', async () => {
+test('defineInterfaceDefinition throws when either element does not exist', async () => {
   const project = emptyProject()
   const { from } = twoConnectedElements(project)
   const llmClient = new FakeLlmClient('NONE')
 
-  await assert.rejects(() => defineInterfaceContract(project, llmClient, from.id, 'ARCH-999'))
+  await assert.rejects(() => defineInterfaceDefinition(project, llmClient, from.id, 'ARCH-999'))
 })
 
-test('defineAllInterfaceContracts defines every connected pair that has no contract yet', async () => {
+test('setInterfaceDefinition persists a manually-authored operation list without any LLM call', () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+
+  const definition = setInterfaceDefinition(
+    project,
+    undefined,
+    'Order interface',
+    [
+      { elementId: from.id, role: 'both' },
+      { elementId: to.id, role: 'both' },
+    ],
+    [
+      {
+        name: 'submitOrder',
+        description: 'Submits a new order',
+        request: 'orderId: string',
+        response: 'confirmationId: string',
+        errors: '',
+        range: '0-999',
+        resolution: '1',
+        unit: 'count',
+        updateFrequency: 'on user action',
+      },
+    ],
+  )
+
+  assert.equal(definition.status, 'defined')
+  assert.equal(project.architecture?.interfaceDefinitions?.[0].operations[0].name, 'submitOrder')
+})
+
+test('setInterfaceDefinition replaces any existing definition with the same id rather than duplicating it', () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  const participants: Array<{ elementId: string; role: 'both' }> = [
+    { elementId: from.id, role: 'both' },
+    { elementId: to.id, role: 'both' },
+  ]
+  const first = setInterfaceDefinition(project, undefined, 'Order interface', participants, [
+    { name: 'a', description: 'd', request: 'r', response: 's', errors: '' },
+  ])
+
+  setInterfaceDefinition(project, first.id, 'Order interface', participants, [
+    { name: 'b', description: 'd', request: 'r', response: 's', errors: '' },
+  ])
+
+  assert.equal(project.architecture?.interfaceDefinitions?.length, 1)
+  assert.equal(project.architecture?.interfaceDefinitions?.[0].operations[0].name, 'b')
+})
+
+test('setInterfaceDefinition throws when a participant element does not exist', () => {
+  const project = emptyProject()
+  const { from } = twoConnectedElements(project)
+
+  assert.throws(() =>
+    setInterfaceDefinition(
+      project,
+      undefined,
+      'Bad interface',
+      [
+        { elementId: from.id, role: 'both' },
+        { elementId: 'ARCH-999', role: 'both' },
+      ],
+      [],
+    ),
+  )
+})
+
+test('setInterfaceDefinition throws when the participants are not connected', () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'custom')
+  addLayer(project, 'Core')
+  const a = createArchitectureElement(project, {
+    kind: 'functional',
+    name: 'A',
+    responsibility: 'x',
+    row: 0,
+    col: 0,
+  })
+  const b = createArchitectureElement(project, {
+    kind: 'functional',
+    name: 'B',
+    responsibility: 'y',
+    row: 0,
+    col: 1,
+  })
+
+  assert.throws(() =>
+    setInterfaceDefinition(
+      project,
+      undefined,
+      'Unconnected interface',
+      [
+        { elementId: a.id, role: 'both' },
+        { elementId: b.id, role: 'both' },
+      ],
+      [],
+    ),
+  )
+})
+
+test('defineAllInterfaceDefinitions defines every connected pair that has no contract yet', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
   const third = createArchitectureElement(project, {
@@ -819,33 +807,105 @@ test('defineAllInterfaceContracts defines every connected pair that has no contr
   acceptProposedInterface(project, to.id, third.id)
   const llmClient = new FakeLlmClient('OPERATION: op|d|r|s|NONE')
 
-  const result = await defineAllInterfaceContracts(project, llmClient)
+  const result = await defineAllInterfaceDefinitions(project, llmClient)
 
-  assert.equal(result.contracts.length, 2)
+  assert.equal(result.definitions.length, 2)
   assert.equal(llmClient.receivedMessages.length, 2)
 })
 
-test('defineAllInterfaceContracts skips pairs that already have a defined contract (non-destructive re-run)', async () => {
+test('defineAllInterfaceDefinitions skips pairs that already have a defined contract (non-destructive re-run)', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(project, new FakeLlmClient('OPERATION: original|d|r|s|NONE'), from.id, to.id)
+  await defineInterfaceDefinition(project, new FakeLlmClient('OPERATION: original|d|r|s|NONE'), from.id, to.id)
 
   const llmClient = new FakeLlmClient('OPERATION: shouldNotAppear|d|r|s|NONE')
-  const result = await defineAllInterfaceContracts(project, llmClient)
+  const result = await defineAllInterfaceDefinitions(project, llmClient)
 
   assert.equal(llmClient.receivedMessages.length, 0)
-  assert.equal(result.contracts[0].operations[0].name, 'original')
+  assert.equal(result.definitions[0].operations[0].name, 'original')
 })
 
-test('checkInterfaces reports complete:true once every connected pair has a defined, non-empty contract', async () => {
+test('defineAllInterfaceDefinitions with force:true re-asks the Architect for every connected pair, overwriting already-defined contracts', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(project, new FakeLlmClient('OPERATION: op|d|r|s|NONE'), from.id, to.id)
+  await defineInterfaceDefinition(project, new FakeLlmClient('OPERATION: original|d|r|s|NONE'), from.id, to.id)
+
+  const llmClient = new FakeLlmClient('OPERATION: replaced|d|r|s|NONE')
+  const result = await defineAllInterfaceDefinitions(project, llmClient, undefined, true)
+
+  assert.equal(llmClient.receivedMessages.length, 1)
+  assert.equal(result.definitions[0].operations[0].name, 'replaced')
+})
+
+test('checkInterfaces reports complete:true once every connected pair has a defined, non-empty contract with full data-contract detail', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('OPERATION: op|d|r|s|NONE|0-100|1|percent|every 100ms'),
+    from.id,
+    to.id,
+  )
 
   const result = checkInterfaces(project)
 
   assert.equal(result.complete, true)
   assert.deepEqual(result.undefinedPairs, [])
+  assert.deepEqual(result.incompleteOperations, [])
+})
+
+test('checkInterfaces flags an operation missing range/resolution/unit/update-frequency as incomplete, even though its contract is defined', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  await defineInterfaceDefinition(project, new FakeLlmClient('OPERATION: op|d|r|s|NONE'), from.id, to.id)
+
+  const result = checkInterfaces(project)
+
+  assert.equal(result.complete, false)
+  assert.deepEqual(result.undefinedPairs, [])
+  assert.equal(result.incompleteOperations.length, 1)
+  assert.equal(result.incompleteOperations[0].operationName, 'op')
+  assert.deepEqual(result.incompleteOperations[0].missingFields, [
+    'range',
+    'resolution',
+    'unit',
+    'update frequency (or driven-directly)',
+  ])
+})
+
+test('checkInterfaces treats DRIVEN as satisfying the update-frequency requirement without needing updateFrequency text', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('OPERATION: op|d|r|s|NONE|0-1|1|bool|DRIVEN'),
+    from.id,
+    to.id,
+  )
+
+  const result = checkInterfaces(project)
+
+  assert.deepEqual(result.incompleteOperations, [])
+})
+
+test('checkInterfaces treats an explicit NONE reply for range/resolution/unit as N/A, not a missing-field gap, for a non-measured operation', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('OPERATION: login|Authenticates a user|creds|token|InvalidCredentials|NONE|NONE|NONE|on user action'),
+    from.id,
+    to.id,
+  )
+
+  const result = checkInterfaces(project)
+
+  assert.deepEqual(result.incompleteOperations, [])
+  assert.equal(result.complete, true)
+  const op = project.architecture?.interfaceDefinitions?.[0].operations[0]
+  assert.equal(op?.range, 'N/A')
+  assert.equal(op?.resolution, 'N/A')
+  assert.equal(op?.unit, 'N/A')
 })
 
 test('checkInterfaces lists a connected pair as undefined when no contract has been defined for it', () => {
@@ -863,7 +923,7 @@ test('checkInterfaces lists a connected pair as undefined when no contract has b
 test('checkInterfaces treats a defined contract with zero operations as still undefined', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(project, new FakeLlmClient('NONE'), from.id, to.id)
+  await defineInterfaceDefinition(project, new FakeLlmClient('NONE'), from.id, to.id)
 
   const result = checkInterfaces(project)
 
@@ -887,4 +947,50 @@ test('checkInterfaces ignores elements with no connections at all', () => {
 
   assert.equal(result.complete, true)
   assert.deepEqual(result.undefinedPairs, [])
+})
+
+// Real-world corruption this guards against: an element's own
+// elementInterfaces entry can point at a masterDefinitionId with no
+// matching InterfaceDefinition at all (e.g. a historical "IFACE-undefined"
+// id from nextInterfaceId's old unguarded seq+1, or a definition deleted
+// out from under a participant). aligned:true alone doesn't catch this —
+// alignment only tracks staleness against a master that DOES exist — so
+// checkInterfaces needs a distinct dangling-reference check.
+test('checkInterfaces flags an elementInterfaces entry whose masterDefinitionId has no matching definition', () => {
+  const project = emptyProject()
+  const { from } = twoConnectedElements(project)
+  from.elementInterfaces.push({
+    masterDefinitionId: 'IFACE-undefined',
+    role: 'both',
+    operations: [{ name: 'op', description: 'x', request: 'x', response: 'x', errors: '' }],
+    aligned: true,
+  })
+
+  const result = checkInterfaces(project)
+
+  assert.equal(result.complete, false)
+  assert.equal(result.danglingElementInterfaces.length, 1)
+  assert.equal(result.danglingElementInterfaces[0].elementId, from.id)
+  assert.equal(result.danglingElementInterfaces[0].masterDefinitionId, 'IFACE-undefined')
+  // A dangling entry is a distinct problem from misalignment — aligned:true
+  // above must not also surface it as (or instead of) a misaligned entry,
+  // since there's no real master to reconcile against.
+  assert.deepEqual(result.misalignedElements, [])
+})
+
+// nextInterfaceId's own defensive fallback (architecture.ts): a corrupted
+// or missing nextInterfaceSeq must not keep producing bad ids forever —
+// this proves defineInterfaceDefinition (which calls nextInterfaceId
+// internally) self-heals from a bad counter instead of generating another
+// "IFACE-undefined"/"IFACE-NaN".
+test('defineInterfaceDefinition recovers a real id when nextInterfaceSeq is corrupted', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  ;(project.architecture as unknown as { nextInterfaceSeq: unknown }).nextInterfaceSeq = undefined
+
+  const result = await defineInterfaceDefinition(project, new FakeLlmClient('NONE'), from.id, to.id)
+
+  assert.equal(result.definition.id.includes('undefined'), false)
+  assert.equal(result.definition.id.includes('NaN'), false)
+  assert.match(result.definition.id, /^IFACE-\d+$/)
 })

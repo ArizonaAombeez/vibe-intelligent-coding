@@ -78,6 +78,13 @@ function formatLine(line: string): string | null {
   if (event.type === 'text' && part.type === 'text' && typeof part.text === 'string') {
     return part.text
   }
+  // GLM (and other reasoning-capable models via OpenCode) can emit a
+  // separate 'reasoning' part carrying the model's chain-of-thought text
+  // ahead of its actual tool calls/output — shown with a distinguishing
+  // prefix so it reads as "thinking" rather than the model's real reply.
+  if (event.type === 'reasoning' && part.type === 'reasoning' && typeof part.text === 'string') {
+    return `\u{1F4AD} ${part.text}`
+  }
   // step_start/step_finish and anything else recognised-but-uninteresting —
   // deliberately omitted rather than shown as noise.
   if (event.type === 'step_start' || event.type === 'step_finish') return ''

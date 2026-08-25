@@ -4,7 +4,7 @@ import {
   setArchitectureType,
   createArchitectureElement,
   acceptProposedInterface,
-  defineInterfaceContract,
+  defineInterfaceDefinition,
   createRequirementFromForm as createRequirementFromFormReal,
   reassignArchitectureElement,
   createTestCase,
@@ -181,12 +181,12 @@ test('createTestCase rejects an integration test with no contract ref', () => {
 
 test('createTestCase rejects an integration test whose contract does not exist', () => {
   const project = emptyProject()
-  const { from, to } = twoConnectedElements(project)
+  twoConnectedElements(project)
 
   const result = createTestCase(project, {
     type: 'integration',
     title: 'Some test',
-    interfaceContractRef: { fromId: from.id, toId: to.id },
+    interfaceDefinitionId: 'IFACE-999',
   })
 
   assert.equal(result.rejected, 'contract-not-found')
@@ -195,12 +195,12 @@ test('createTestCase rejects an integration test whose contract does not exist',
 test('createTestCase rejects an integration test whose contract has zero operations', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(project, new FakeLlmClient('NONE'), from.id, to.id)
+  const { definition } = await defineInterfaceDefinition(project, new FakeLlmClient('NONE'), from.id, to.id)
 
   const result = createTestCase(project, {
     type: 'integration',
     title: 'Some test',
-    interfaceContractRef: { fromId: from.id, toId: to.id },
+    interfaceDefinitionId: definition.id,
   })
 
   assert.equal(result.rejected, 'contract-not-defined')
@@ -209,7 +209,7 @@ test('createTestCase rejects an integration test whose contract has zero operati
 test('createTestCase accepts an integration test against a defined contract with operations', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(
+  const { definition } = await defineInterfaceDefinition(
     project,
     new FakeLlmClient('OPERATION: chargeCard|Charges the customer|orderId|receiptId|NONE'),
     from.id,
@@ -219,7 +219,7 @@ test('createTestCase accepts an integration test against a defined contract with
   const result = createTestCase(project, {
     type: 'integration',
     title: 'Charges the customer',
-    interfaceContractRef: { fromId: from.id, toId: to.id },
+    interfaceDefinitionId: definition.id,
     interfaceElementIds: [from.id, to.id],
   })
 
@@ -295,7 +295,7 @@ test('generateIntegrationTestsForContract throws when the contract has no define
 test('generateIntegrationTestsForContract only accepts TEST lines naming a real operation', async () => {
   const project = emptyProject()
   const { from, to } = twoConnectedElements(project)
-  await defineInterfaceContract(
+  await defineInterfaceDefinition(
     project,
     new FakeLlmClient('OPERATION: chargeCard|Charges|orderId|receiptId|NONE'),
     from.id,

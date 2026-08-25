@@ -29,7 +29,7 @@ function projectWithArchitecture(): Project {
           col: 0,
           rowSpan: 1,
           colSpan: 1,
-          interfaces: ['ARCH-002'],
+          interfaces: ['ARCH-002'], elementInterfaces: [],
         },
         {
           id: 'ARCH-002',
@@ -40,10 +40,11 @@ function projectWithArchitecture(): Project {
           col: 1,
           rowSpan: 1,
           colSpan: 1,
-          interfaces: [],
+          interfaces: [], elementInterfaces: [],
         },
       ],
       nextElementSeq: 3,
+      nextInterfaceSeq: 1,
     },
   }
 }

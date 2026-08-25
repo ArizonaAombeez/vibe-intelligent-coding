@@ -321,7 +321,7 @@ export function ArchitectureGrid({
         // not actually leaving the card, so ignore it unless relatedTarget
         // is truly outside this group (or absent, e.g. leaving the window).
         const related = event.relatedTarget as Node | null
-        if (related && this.contains(related)) return
+        if (related && (this as Element).contains(related)) return
         if (d.id === dropTargetElementIdRef.current) onDropTargetChange(null)
       })
       .on('drop', function (event: DragEvent, d) {

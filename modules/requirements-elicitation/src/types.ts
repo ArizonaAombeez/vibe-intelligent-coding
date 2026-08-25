@@ -99,7 +99,7 @@ export interface Requirement {
   // A requirement may be allocated to more than one element (interface/
   // shared work is expressed this way — each allocated element codes its
   // own side independently, guided by this requirement's text and any
-  // relevant InterfaceContract).
+  // relevant InterfaceDefinition).
   architectureElements: string[]
   // Free-text hint the user can attach to steer Auto Allocate (heuristic and
   // LLM) toward the right architecture element — included in the LLM prompt
@@ -141,7 +141,10 @@ export interface ArchitectureElement {
   name: string
   // One-line responsibility statement (Area B, "Service block definition") —
   // captured for every element kind, not just services, since it's what
-  // architecture-level conflict detection compares for overlap.
+  // architecture-level conflict detection compares for overlap. This is
+  // also this element's required purpose/description (Area B, "each element
+  // shall have a description of its purpose") — a required, non-empty
+  // field, not a separate optional description on top of it.
   responsibility: string
   row: number
   col: number
@@ -152,10 +155,40 @@ export interface ArchitectureElement {
   // Populated for functional/service elements; interface-spine elements
   // themselves don't use this field.
   interfaces: string[]
+  // This element's own local copy of every InterfaceDefinition it
+  // participates in — see ElementInterfaceDefinition's own comment for why
+  // this is a separate per-element copy rather than a live read of the
+  // architecture-level definition. Always an array, never undefined; empty
+  // means this element hasn't been added as a participant to any
+  // definition yet.
+  elementInterfaces: ElementInterfaceDefinition[]
   // Per-element opt-in override of the project-level dynamic-design
   // default (Area B, "Static vs. dynamic design") — undefined defers to the
   // architecture type's dynamicDesignDefault.
   dynamicDesignEnabled?: boolean
+  // Set by updateRequirementText's regression when an already-coded
+  // requirement's text changes, so the next Coding run's prompt can say
+  // "you're updating existing code because a requirement changed" instead
+  // of a generic re-code framing. Consumed once by buildCodingPrompt
+  // (vic-coding) on the next run against this element, then cleared
+  // regardless of run outcome — a later plain "Update Code" click with no
+  // fresh cause falls back to the generic reason. (Interface-change framing
+  // needs no equivalent stored flag — interfaceChangedSinceLastCoding
+  // already derives it live from elementInterfaces/codingRuns.) Undefined
+  // also covers "no prior successful run yet," which buildCodingPrompt
+  // derives itself from an empty codingRuns history.
+  //
+  // 'user-reported-issue' is set by the Test Execution QA-chat CODE-FAILURE
+  // dispatch path (Area F "User-reported issue triage", resolved) — same
+  // one-shot consume-then-clear lifecycle, but paired with
+  // pendingRecodeDetail since the framing here is the user's own words, not
+  // a fixed sentence.
+  pendingRecodeReason?: 'requirement-update' | 'user-reported-issue'
+  // The user's free-text issue description, set only alongside
+  // pendingRecodeReason: 'user-reported-issue' — buildCodingPrompt folds
+  // this verbatim into the next run's prompt. Cleared together with
+  // pendingRecodeReason.
+  pendingRecodeDetail?: string
 }
 
 export type ArchitectureConflictKind =
@@ -175,29 +208,94 @@ export interface ArchitectureConflict {
 // short prose descriptions of data shape, not formal typed schemas,
 // matching how the rest of the Architect's proposals stay text-based
 // rather than introducing a second schema language into the tool.
+//
+// range/resolution/unit/updateFrequency (Area B, interface data-contract
+// requirement) describe the signal/value crossing this operation, not just
+// its shape — e.g. a sensor reading's valid min/max, its smallest
+// meaningful increment, its physical unit, and how often a fresh value is
+// available. All four are optional prose (same "text, not a schema
+// language" principle as request/response) since not every operation is a
+// periodic value (an RPC-style call may have none of these). drivenDirectly
+// is set instead of updateFrequency when the value isn't produced on any
+// periodic cadence at all and must be pushed/driven into the consumer
+// directly before it can be read — the two are mutually exclusive framings
+// of the same "when is this fresh" question, not independent fields.
 export interface InterfaceContractOperation {
   name: string
   description: string
   request: string
   response: string
   errors: string
+  range?: string
+  resolution?: string
+  unit?: string
+  updateFrequency?: string
+  drivenDirectly?: boolean
 }
 
-// Structured contract for a single interface connection (one entry per
-// fromId|toId pair, undirected — order matches whichever direction was
-// defined, not necessarily ArchitectureElement.interfaces' caller|callee
-// order). Lives at the architecture level, alongside conflicts, rather
-// than on the element itself, since a contract describes the pair, not
-// either endpoint alone.
-export interface InterfaceContract {
+// Whether a participant element produces, consumes, or both produces and
+// consumes an interface — replaces the old undirected fromId/toId pair
+// with an explicit per-participant role, since "which side writes/reads
+// this" is real information the old model had no way to express.
+export type InterfaceRole = 'produces' | 'consumes' | 'both'
+
+// The project-wide, single source of truth for one interface (Area B) —
+// replaces the old one-contract-per-connected-pair model. A definition
+// names every element that participates in it (>= 2) and each one's role,
+// so a shared bus/topic with N producers/subscribers is ONE definition
+// with N participants, not N independently-authored pairwise contracts.
+export interface InterfaceDefinition {
+  id: string
+  name: string
+  participants: Array<{ elementId: string; role: InterfaceRole }>
+  operations: InterfaceContractOperation[]
+  // 'stale' means the participant set still exists but the architecture
+  // has changed (an endpoint's responsibility text was edited) since this
+  // definition was last defined — surfaced by Check Interfaces, not
+  // computed automatically on every edit. Distinct from an element's own
+  // copy going out of alignment (ElementInterfaceDefinition.aligned,
+  // below), which tracks a different kind of drift.
+  status: 'defined' | 'stale'
+  // Stamped every time operations or participants change — what
+  // ElementInterfaceDefinition.aligned and Coding's
+  // interfaceChangedSinceLastCoding compare a coding run's finishedAt
+  // against.
+  updatedAt: string
+}
+
+// One element's own local copy of an interface it participates in (Area
+// B/D) — lives on ArchitectureElement.elementInterfaces, not here, so an
+// element can be coded/tested from its own folder using only what's
+// already denormalized onto it, without needing the whole architecture
+// loaded. The instant the master InterfaceDefinition it points at changes,
+// `aligned` is flipped to false for every participant (architecture.ts) —
+// a hard, blocking state (Coding's interfaceGateReasonForElement refuses
+// to run while any of an element's own entries are misaligned), not an
+// advisory one. A human then reviews the change against this element's
+// own requirements, updates `operations` to match the master, which flips
+// `aligned` back to true and stamps `reqsCheckedAt`.
+export interface ElementInterfaceDefinition {
+  masterDefinitionId: string
+  role: InterfaceRole
+  operations: InterfaceContractOperation[]
+  aligned: boolean
+  reqsCheckedAt?: string
+}
+
+// One operation on a 'defined' definition whose data-contract detail (Area
+// B, interface definitions) is incomplete: missing one or more of
+// range/resolution/unit, and missing both updateFrequency and
+// drivenDirectly (an operation must state one or the other — how often a
+// fresh value is available, or that it must be driven/pushed directly —
+// never neither). Distinct from an undefined pair (checkInterfaces'
+// existing undefinedPairs), which has no definition/operations at all;
+// this flags a definition that exists but whose operations aren't fully
+// specified.
+export interface IncompleteOperation {
   fromId: string
   toId: string
-  operations: InterfaceContractOperation[]
-  // 'stale' means the connection still exists but the architecture has
-  // changed (an endpoint's responsibility text was edited) since this
-  // contract was last defined — surfaced by Check Interfaces, not
-  // computed automatically on every edit.
-  status: 'defined' | 'stale'
+  operationName: string
+  missingFields: string[]
 }
 
 export interface Architecture {
@@ -206,13 +304,19 @@ export interface Architecture {
   layers: string[]
   elements: ArchitectureElement[]
   nextElementSeq: number
+  // Sequential id counter for InterfaceDefinition (IFACE-NNN), same
+  // never-reused rationale as nextElementSeq. Only meaningful once
+  // interfaceDefinitions is non-empty; starts at 1 like nextElementSeq.
+  nextInterfaceSeq: number
   // Most recent architecture-level conflict check result (Area B,
   // "Architecture-level conflict detection") — undefined until Check
   // Conflicts has been run at least once, mirroring requirement conflicts.
   conflicts?: ArchitectureConflict[]
-  // Structured interface contracts, one per connected element pair —
-  // undefined until Define Interfaces has been run at least once.
-  interfaceContracts?: InterfaceContract[]
+  // Project-wide master interface definitions — the single source of truth
+  // every participant element's own ElementInterfaceDefinition copy is
+  // checked against. Undefined until Define Interfaces has been run at
+  // least once.
+  interfaceDefinitions?: InterfaceDefinition[]
 }
 
 // Phase tab gating (Area G, resolved, requirement 63) — whether later phase
@@ -237,13 +341,6 @@ export type UnitTestMode = 'llm' | 'scaffold' | 'disabled'
 export interface ProjectSettings {
   phaseTabGating: PhaseTabGating
   unitTestMode?: UnitTestMode
-  // Simple-project escape hatch (Area C/D) — undefined defaults to false,
-  // same "undefined is the baseline behaviour" convention as the other
-  // settings above. Only meaningful for 'new'-mode projects; import-mode
-  // projects always require the migration plan regardless of this value.
-  // When true, the Coding tab offers a quick inline story-creation form
-  // instead of requiring a trip through Planning first.
-  allowCodingWithoutPlan?: boolean
 }
 
 // One conflicting pair from the most recent Check Conflicts run, kept at
@@ -381,80 +478,6 @@ export interface GapCheckRecord {
   checkedAt: string
 }
 
-// Planning (Area C, resolved): decomposed units are "stories" (task-decompos-
-// ition scoped at architecture-element level, req 10a). Reuses the same
-// 4-state Kanban concept the UI's Status type already renders everywhere
-// (phase tabs, sidebar, rows) — duplicated as its own named type here rather
-// than imported, per the same core-must-not-depend-on-the-reference-UI rule
-// ArchitectureTypeId already follows. NOT RequirementStatus's 6-stage
-// pipeline progression — a story is Planning's own work item, a different
-// axis from a requirement's position in the whole VIC pipeline.
-export type StoryStatus = 'not-started' | 'in-progress' | 'blocked' | 'complete'
-
-// One option considered during the research-before-planning step (resolved),
-// attached to the story it informs so it's visible to the human at sign-off,
-// not just consumed silently by the LLM.
-export interface ResearchOption {
-  name: string
-  tradeoffs: string
-}
-
-export interface Research {
-  options: ResearchOption[]
-  recommendation: string
-  rationale: string
-  researchedAt: string
-}
-
-export interface Story {
-  id: string
-  title: string
-  description: string
-  // Single-element decomposition (req 10a). Null/absent for an interface
-  // story, which uses interfaceElementIds instead.
-  architectureElementId: string | null
-  // Set only for a story covering a 2-element interface requirement (Area B/D
-  // "code-change isolation" two-element case) — mirrors how
-  // ArchitectureConflict.elementIds and InterfaceContract.fromId/toId already
-  // model pairs.
-  interfaceElementIds?: [string, string]
-  // Requirements this story covers (req 10c traceability) — a story can
-  // cover more than one requirement allocated to the same element.
-  requirementIds: string[]
-  status: StoryStatus
-  // Story ids this story depends on (req 10b sequencing), an adjacency list
-  // walked the same way ArchitectureElement.interfaces already is for
-  // circular-dependency detection.
-  dependsOn: string[]
-  // Computed sprint-equivalent ordering position; null until Sequencing has
-  // run.
-  sequence: number | null
-  // Present only where research-before-planning found multiple viable
-  // approaches (see Research above) — undefined means either research
-  // hasn't run yet or found a single obvious approach (reply "NONE").
-  research?: Research
-  createdAt: string
-  // Set when the story has been soft-deleted (moved to the Bin), mirroring
-  // Requirement.deletedAt.
-  deletedAt?: string
-}
-
-export type StorySequencingConflictKind = 'circular-dependency'
-
-export interface StorySequencingConflict {
-  id: string
-  kind: StorySequencingConflictKind
-  storyIds: string[]
-  rationale: string
-}
-
-// Mirrors Architecture's { elements, nextElementSeq, conflicts? } shape.
-export interface Backlog {
-  stories: Story[]
-  nextStorySeq: number
-  conflicts?: StorySequencingConflict[]
-}
-
 // Coding & Review-Rework (Area D, resolved). One CLI invocation ("Run
 // Coding") against a single architecture element.
 // 'rejected-multi-element' is kept in the union even though the current
@@ -489,21 +512,40 @@ export interface CodingRun {
   // allowedSubfolder that were reverted.
   rejectedFiles?: string[]
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number }
+  // Which concrete agent client actually ran this (e.g. 'claude-code' vs
+  // 'opencode') and which model was requested — recorded so a slow/fast
+  // run can be attributed to a specific provider/model after the fact,
+  // not just inferred in the moment from whatever's currently configured.
+  // Undefined only for runs that never reached the point of invoking an
+  // agent client at all (rejected-not-eligible).
+  providerId?: string
+  model?: string
+  // Provider-agnostic timing breakdown — see AgentRunTiming in
+  // vic-llm-claude-code for the full rationale. Populated whenever an
+  // agent client actually ran (success, cli-error), regardless of which
+  // provider — this is what let a real ~320s stall-before-first-tool-call
+  // on one GLM run get diagnosed as provider-side latency rather than
+  // VIC's own code, and is what would let the same comparison be made
+  // against Claude or any other provider on a later run.
+  timing?: {
+    msToFirstOutput?: number
+    msTotal: number
+  }
 }
 
 // Test Creation & Execution (Areas E/F, resolved). Integration tests are a
 // distinct type from functional (not folded in) — see Area E's resolved
 // "Integration tests" section: a functional test derives from one or more
 // requirements allocated to one element; an integration test derives from
-// an InterfaceContract's operations between two elements.
+// an InterfaceDefinition's operations between two elements.
 export type TestType = 'functional' | 'integration'
 
 export type TestCaseStatus = 'not-run' | 'passing' | 'failing'
 
-// Mirrors Story's architectureElementId | interfaceElementIds split
-// exactly (single-element vs. 2-element interface case) — a TestCase is
-// scoped the same way a Story is, since Test Execution's module-scoped run
-// (Area F, resolved) restricts a run's cwd to this same subfolder.
+// architectureElementId | interfaceElementIds is single-element vs.
+// 2-element interface case — a TestCase is scoped by whichever one is set,
+// since Test Execution's module-scoped run (Area F, resolved) restricts a
+// run's cwd to this same subfolder.
 export interface TestCase {
   id: string
   type: TestType
@@ -513,10 +555,9 @@ export interface TestCase {
   // traceability gate at creation time (testCreation.ts), never merely
   // requested via prompt. Empty for an integration test.
   requirementIds: string[]
-  // Integration only — identifies which InterfaceContract (by the same
-  // fromId/toId pair key architecture.ts already uses) this test derives
-  // from. Undefined for a functional test.
-  interfaceContractRef?: { fromId: string; toId: string }
+  // Integration only — identifies which InterfaceDefinition this test
+  // derives from. Undefined for a functional test.
+  interfaceDefinitionId?: string
   architectureElementId: string | null
   interfaceElementIds?: [string, string]
   // Path of the generated test source file, relative to the project's
@@ -535,7 +576,6 @@ export interface TestCase {
   deletedAt?: string
 }
 
-// Mirrors Backlog's { stories, nextStorySeq, conflicts? } shape.
 export interface TestSuite {
   tests: TestCase[]
   nextTestSeq: number
@@ -582,7 +622,7 @@ export interface ImportedTestCaseSet {
 // One test's outcome within a TestRun (below) — kept per-test rather than
 // only a pass/fail count, since the triage step (Area F, resolved) and the
 // UI's per-row failing-test display both need per-test detail.
-export type TestOutcomeTriage = 'code-failure' | 'test-case-failure' | 'unattributed'
+export type TestOutcomeTriage = 'code-failure' | 'test-case-failure' | 'requirement-issue' | 'unattributed'
 
 export interface TestCaseOutcome {
   testCaseId: string
@@ -611,6 +651,18 @@ export interface TestCaseOutcome {
   testCaseFailureConfirmedAt?: string
 }
 
+// One test result from a scope's test command that could not be matched to
+// any known (requirement-traced) TestCase title — i.e. a test the coding
+// agent wrote inline while implementing the element, never registered via
+// Test Creation. Kept separate from TestCaseOutcome (which is always keyed
+// to a real TestCase id) since these have no TestCase record to attach
+// status/lastRunAt to; name is whatever title the test runner itself
+// reported for that individual test.
+export interface SwTestOutcome {
+  name: string
+  passed: boolean
+}
+
 export type TestRunKind = 'element-scoped' | 'full-regression'
 
 // One test command invocation, scoped to exactly one element's (or
@@ -635,6 +687,13 @@ export interface TestRun {
   exitCode: number | null
   rawLog: string
   outcomes: TestCaseOutcome[]
+  // Test results from this scope's test command that didn't match any known
+  // TestCase title — the coding agent's own inline tests (Area F "SW-based
+  // tests"). Always present (possibly empty) once individual test titles
+  // could be parsed out of the command's output at all; undefined only when
+  // the run predates this field or the output couldn't be parsed per-test
+  // (see attributeSwOutcomes in runExecution.ts).
+  swOutcomes?: SwTestOutcome[]
   // Optional mutation-testing score for this run (Area F top-level bullet:
   // "Mutation testing (mechanical, non-LLM)") — deferred, no real
   // Stryker/mutmut/PIT integration exists yet (confirmed acceptable by
@@ -709,10 +768,6 @@ export interface Project {
   // rather than resetting to fully-expanded every reload. Undefined/absent
   // means nothing is collapsed (the pre-existing, always-expanded default).
   collapsedRequirementGroups?: string[]
-  // Planning (Area C) backlog — undefined means Planning hasn't been used
-  // yet for this project (same "undefined is the correct never-used state"
-  // convention as architecture?).
-  backlog?: Backlog
   // Coding (Area D) run history — append-only, one entry per "Run Coding"
   // invocation, kept at the project level so it survives navigation (same
   // rationale as ConflictCheckRecord).
@@ -728,6 +783,17 @@ export interface Project {
   // prompt construction (Area D, resolved). Undefined until the user sets
   // one via the Coding screen's settings panel.
   codingConventions?: string
+  // Free-text project overview — what the app is and what tech it's built
+  // with — set via the Architecture tab's Project Overview panel (not
+  // Settings: it's read alongside the architecture, and Test Full App reads
+  // it too). Undefined until the user sets one. Included in every Coding
+  // prompt (buildCodingPrompt) as context, same "undefined until set"
+  // convention as codingConventions.
+  description?: string
+  // Free-text build/run instructions (e.g. "npm install && npm run dev") —
+  // companion to description, same panel, same undefined-until-set
+  // convention. Included in Coding prompts and available to Test Full App.
+  runInstructions?: string
   // Project-wide default test-run command (Area F, resolved: "tests should
   // be location-agnostic when created, declare their own run command, and
   // share one project-level manifest rather than redeciding per test").

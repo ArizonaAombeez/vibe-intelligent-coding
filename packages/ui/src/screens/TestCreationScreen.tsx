@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type {
   Architecture,
   ArchitectureElement,
@@ -32,10 +32,6 @@ interface TestCreationChatEntry {
   role: 'user' | 'qa'
   text: string
 }
-
-const DEFAULT_CHAT_HEIGHT = 260
-const MIN_CHAT_HEIGHT = 120
-const MAX_CHAT_HEIGHT = 640
 
 // TestCaseStatus ('not-run'/'passing'/'failing') isn't literally the same
 // type as Status, unlike StoryStatus — small local mapping onto the shared
@@ -166,32 +162,6 @@ export function TestCreationScreen({
   const [chatBusy, setChatBusy] = useState(false)
   const [chatError, setChatError] = useState<string | null>(null)
   const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
-  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT)
-  const resizingRef = useRef(false)
-
-  const handleResizeStart = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      resizingRef.current = true
-      const startY = e.clientY
-      const startHeight = chatHeight
-
-      function onMove(moveEvent: MouseEvent) {
-        if (!resizingRef.current) return
-        const delta = startY - moveEvent.clientY
-        const next = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, startHeight + delta))
-        setChatHeight(next)
-      }
-      function onUp() {
-        resizingRef.current = false
-        window.removeEventListener('mousemove', onMove)
-        window.removeEventListener('mouseup', onUp)
-      }
-      window.addEventListener('mousemove', onMove)
-      window.addEventListener('mouseup', onUp)
-    },
-    [chatHeight],
-  )
 
   async function reload() {
     try {
@@ -497,8 +467,8 @@ export function TestCreationScreen({
   }
 
   const importSection = (
-    <div className="test-creation-import-panel">
-      <h2>Import legacy test cases</h2>
+    <details className="test-creation-import-panel">
+      <summary>Import legacy test cases from previous project</summary>
       <p className="test-creation-hint">
         Point at a folder of existing test files (*.test.ts, *.spec.ts, and similar) from an
         earlier or external project. Each file is analyzed and copied as-is into this project's
@@ -540,7 +510,7 @@ export function TestCreationScreen({
           ))}
         </ul>
       )}
-    </div>
+    </details>
   )
 
   if (loadError) {
@@ -571,26 +541,37 @@ export function TestCreationScreen({
 
   return (
     <div className="test-creation-screen">
-      <h1>Test Creation</h1>
-
-      {importSection}
-
-      <div className="test-creation-settings-panel">
-        <label className="test-creation-mode-label">
-          Unit test generation mode
-          <select
-            value={settings.unitTestMode}
-            onChange={(e) => handleUnitTestModeChange(e.target.value as ProjectSettings['unitTestMode'])}
-          >
-            <option value="llm">LLM</option>
-            <option value="scaffold">Scaffold</option>
-            <option value="disabled">Disabled</option>
-          </select>
-        </label>
-        <p className="test-creation-hint">{UNIT_TEST_MODE_RATIONALE[settings.unitTestMode]}</p>
+      <div className="test-creation-scope-note">
+        <h1 className="test-creation-scope-note-title">Requirement-based test cases</h1>
+        <p className="test-creation-hint">
+          This tab creates test cases against the <strong>Requirement text only</strong> — every test case here
+          must trace back to a requirement (functional tests) or an interface contract (integration tests). It
+          does not run or generate the coding agent's own tests.
+        </p>
       </div>
 
-      <div className="test-creation-action-bar">
+      <div className="test-creation-main-layout">
+      <div className="test-creation-main-column">
+
+      <div className="test-creation-section">
+        {importSection}
+
+        <div className="test-creation-settings-panel">
+          <label className="test-creation-mode-label">
+            Unit test generation mode
+            <select
+              value={settings.unitTestMode}
+              onChange={(e) => handleUnitTestModeChange(e.target.value as ProjectSettings['unitTestMode'])}
+            >
+              <option value="llm">LLM</option>
+              <option value="scaffold">Scaffold</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </label>
+          <p className="test-creation-hint">{UNIT_TEST_MODE_RATIONALE[settings.unitTestMode]}</p>
+        </div>
+
+        <div className="test-creation-action-bar">
         <select value={selectedElementId} onChange={(e) => setSelectedElementId(e.target.value)}>
           <option value="">Select an element...</option>
           {architecture.elements.map((e: ArchitectureElement) => (
@@ -855,7 +836,7 @@ export function TestCreationScreen({
               <p className="test-creation-hint">
                 {selectedTest.type === 'functional'
                   ? `Verifies: ${selectedTest.requirementIds.join(', ') || '(none)'}`
-                  : `Verifies interface: ${selectedTest.interfaceContractRef?.fromId} <-> ${selectedTest.interfaceContractRef?.toId}`}
+                  : `Verifies interface: ${selectedTest.interfaceElementIds?.[0]} <-> ${selectedTest.interfaceElementIds?.[1]}`}
               </p>
               {selectedTest.filePath ? (
                 <p className="test-creation-filepath">{selectedTest.filePath}</p>
@@ -892,14 +873,17 @@ export function TestCreationScreen({
           )}
         </div>
       </div>
+      </div>
 
-      <div className="analyst-chat-dock" style={{ height: chatHeight }}>
-        <div className="analyst-chat-resize-handle" onMouseDown={handleResizeStart} />
+      </div>
+
+      <div className="test-creation-llm-panel">
         <div className="analyst-chat-panel">
           <div className="analyst-chat-heading-row">
-            <h2>QA chat</h2>
+            <h2>LLM output</h2>
             <span className="analyst-chat-hint">
-              Ask QA to help think through what tests the selected element needs.
+              Ask QA to help think through what tests the selected element needs — every reply, proposal, and
+              in-progress file update from this tab appears here.
             </span>
           </div>
           <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>
@@ -913,6 +897,33 @@ export function TestCreationScreen({
               </div>
             ))}
             {chatBusy && <p className="analyst-chat-empty">QA is thinking...</p>}
+
+            {lastGenerateResult && (
+              <div className="analyst-chat-entry analyst-chat-entry-qa">
+                <strong>File generation</strong>
+                {lastGenerateResult.status !== 'success' && (
+                  <div className="test-creation-run-banner">
+                    {lastGenerateResult.status === 'rejected-scope' && (
+                      <>
+                        The CLI wrote outside its allowed scope — those changes were reverted.
+                        {lastGenerateResult.rejectedFiles && lastGenerateResult.rejectedFiles.length > 0 && (
+                          <ul>
+                            {lastGenerateResult.rejectedFiles.map((f) => (
+                              <li key={f}>{f}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    )}
+                    {lastGenerateResult.status === 'cli-error' && 'The Claude Code CLI run failed. See the raw log below.'}
+                  </div>
+                )}
+                <details className="test-creation-raw-log" open>
+                  <summary>Raw output</summary>
+                  <pre>{lastGenerateResult.rawLog}</pre>
+                </details>
+              </div>
+            )}
           </div>
 
           {chatError && (
@@ -969,6 +980,8 @@ export function TestCreationScreen({
             </button>
           </div>
         </div>
+      </div>
+
       </div>
     </div>
   )

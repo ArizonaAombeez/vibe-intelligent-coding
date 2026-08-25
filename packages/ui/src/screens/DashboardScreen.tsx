@@ -11,19 +11,6 @@ interface DashboardScreenProps {
   onRenameProject: (name: string) => void
 }
 
-// defaultPhases() (httpApi.ts) deliberately omits a 'planning' PhaseInfo
-// entry — that's (one of) the mechanisms that hides Planning from the top
-// nav. The Dashboard's Planning stat tile is kept working regardless (per
-// the hide-not-delete migration: "there's no reason to remove a working,
-// correct stat tile just because its source phase is hidden from nav"), so
-// its card is rendered directly below rather than derived from the phases
-// prop. Unlike the other cards it's rendered non-clickable (no
-// onSelectPhase call) — decision 1 of the migration is explicit that
-// Planning must have "no way to get to it by clicking around the app," so
-// the stat NUMBERS stay visible but this card can't be used as a
-// navigation path into PlanningScreen the way the other cards navigate
-// into their phase.
-
 // Tone drives the color a stat renders in. It's derived only from the
 // number itself (e.g. "2 failing" -> critical, "5 of 5 passing" -> good) —
 // never fabricated, and distinct from PhaseInfo.status (the hardcoded
@@ -67,11 +54,10 @@ export function DashboardScreen({
     let cancelled = false
 
     async function load() {
-      const [requirements, architecture, backlog, testSuite, codingRuns, testRuns, regressionRuns] =
+      const [requirements, architecture, testSuite, codingRuns, testRuns, regressionRuns] =
         await Promise.all([
           api.listRequirements(projectId),
           api.getArchitecture(projectId),
-          api.getBacklog(projectId),
           api.getTestSuite(projectId),
           api.listCodingRuns(projectId),
           api.listTestRuns(projectId),
@@ -109,9 +95,9 @@ export function DashboardScreen({
       if (architecture) {
         const elementCount = architecture.elements.length
         const allocated = requirements.filter((r) => r.architectureElements.length > 0).length
-        const contractTotal = architecture.interfaceContracts?.length ?? 0
-        const staleContracts = (architecture.interfaceContracts ?? []).filter(
-          (c) => c.status === 'stale',
+        const contractTotal = architecture.interfaceDefinitions?.length ?? 0
+        const staleContracts = (architecture.interfaceDefinitions ?? []).filter(
+          (d) => d.status === 'stale',
         ).length
         const conflicts = architecture.conflicts?.length ?? 0
         const stats: Stat[] = [{ label: 'elements', value: `${elementCount}`, tone: 'neutral' }]
@@ -136,28 +122,6 @@ export function DashboardScreen({
         next.architecture = stats
       } else {
         next.architecture = [{ label: 'status', value: 'Not started', tone: 'neutral' }]
-      }
-
-      // Planning
-      if (backlog) {
-        const stories = backlog.stories.filter((s) => !s.deletedAt)
-        const total = stories.length
-        const done = stories.filter((s) => s.status === 'complete').length
-        const inProgress = stories.filter((s) => s.status === 'in-progress').length
-        const conflicts = backlog.conflicts?.length ?? 0
-        const stats: Stat[] = [{ label: 'stories', value: `${total}`, tone: 'neutral' }]
-        if (total > 0) {
-          stats.push({ label: 'complete', value: `${done} / ${total}`, tone: ratioTone(done, total) })
-          if (inProgress > 0) {
-            stats.push({ label: 'in progress', value: `${inProgress}`, tone: 'warning' })
-          }
-        }
-        if (conflicts > 0) {
-          stats.push({ label: 'sequencing conflicts', value: `${conflicts}`, tone: 'critical' })
-        }
-        next.planning = stats
-      } else {
-        next.planning = [{ label: 'status', value: 'Not started', tone: 'neutral' }]
       }
 
       // Coding
@@ -300,30 +264,6 @@ export function DashboardScreen({
       <p className="dashboard-subtitle">Project overview</p>
 
       <div className="dashboard-grid">
-        {(() => {
-          const phaseStats = stats.planning
-          return (
-            <div
-              key="planning"
-              className="dashboard-card dashboard-card-static"
-              title="Planning is hidden from navigation, but its data and stats still exist."
-            >
-              <div className="dashboard-card-header">
-                <span className="dashboard-card-title">Planning</span>
-              </div>
-              {phaseStats && phaseStats.length > 0 && (
-                <dl className="dashboard-card-stats">
-                  {phaseStats.map((stat, i) => (
-                    <div className={`dashboard-stat tone-${stat.tone}`} key={i}>
-                      <dt className="dashboard-stat-label">{stat.label}</dt>
-                      <dd className="dashboard-stat-value">{stat.value}</dd>
-                    </div>
-                  ))}
-                </dl>
-              )}
-            </div>
-          )
-        })()}
         {pipelinePhases.map((phase) => {
           const phaseStats = stats[phase.id]
           return (

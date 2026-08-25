@@ -3,8 +3,12 @@ import type {
   Architecture,
   CurrentOperation,
   Requirement,
+  ScopeReadiness,
+  ScopeReadinessEntry,
+  SwTestOutcome,
   TestCase,
   TestCommandScope,
+  TestExecutionChatDispatch,
   TestRegressionRun,
   TestRun,
   TestSuite,
@@ -15,6 +19,7 @@ import { STATUS_COLOR } from '../statusColor'
 import { highlightRequirementIds } from './requirementIdHighlight'
 import './RequirementsScreen.css'
 import './TestExecutionScreen.css'
+import '../components/Tooltip.css'
 
 interface TestExecutionScreenProps {
   api: VicCoreApi
@@ -35,7 +40,54 @@ const MAX_CHAT_HEIGHT = 640
 const TRIAGE_LABEL: Record<NonNullable<TestRun['outcomes'][number]['triage']>, string> = {
   'code-failure': 'Code failure',
   'test-case-failure': 'Test case failure — needs review',
-  unattributed: 'Unattributed',
+  'requirement-issue': 'Requirement issue',
+  unattributed: 'Not yet triaged',
+}
+
+// Shown as a follow-up QA chat entry when the dispatch classification
+// finds an issue report (Area F "User-reported issue triage", resolved) —
+// code-failure/requirement-issue have already been auto-dispatched by the
+// time this renders (see classifyAndDispatchUserReportedIssue), so these
+// say what happened, not what to do next; test-case-failure is a
+// proposal only, so its line tells the user what to do manually.
+const DISPATCH_SUMMARY: Record<TestExecutionChatDispatch['verdict'], (d: TestExecutionChatDispatch) => string> = {
+  'code-failure': (d) =>
+    `Dispatched as a code failure — flagged for re-coding on ${d.dispatchedTo ?? 'the affected element(s)'}. ${d.rationale}`,
+  'requirement-issue': (d) =>
+    `Dispatched as a requirement issue — ${d.dispatchedTo ?? 'the requirement'} has been amended. ${d.rationale}`,
+  'test-case-failure': (d) =>
+    `Triaged as a test case failure — this needs manual review; the test itself likely needs updating. ${d.rationale}`,
+}
+
+const NOT_READY_REASON_LABEL: Record<Extract<ScopeReadiness, { ready: false }>['reason'], string> = {
+  'element-not-coded': 'This element has not been coded yet — run Step 5 Coding for it before running its tests.',
+  'interface-element-not-coded': 'One or both elements on this interface have not been coded yet — run Step 5 Coding for them before running this test.',
+}
+
+// Explains what a requirement-based test case needs next, for the row's
+// hover tooltip — mirrors the same states the triage panel below the list
+// already surfaces, so hovering tells the reader the same thing opening the
+// test would.
+function testRowTooltip(outcome: TestRun['outcomes'][number] | undefined): string {
+  if (!outcome) return 'Not run yet — click to select, then Run Tests to execute it.'
+  if (outcome.passed) return 'Passed on its last run — click to view details, or re-run to verify again.'
+  if (!outcome.triage || outcome.triage === 'unattributed') {
+    return 'Failed and not yet triaged — open this test and run Triage to find out whether the code or the test case is at fault.'
+  }
+  if (outcome.triage === 'test-case-failure' && !outcome.testCaseFailureConfirmedAt) {
+    return 'Triaged as a test-case failure — open this test and confirm to proceed.'
+  }
+  if (outcome.triage === 'test-case-failure') {
+    return 'Confirmed test-case failure — the test case itself needs to be fixed.'
+  }
+  if (outcome.triage === 'requirement-issue') {
+    return 'Triaged as a requirement issue — the requirement has been amended; the code needs to be re-coded and this test re-run.'
+  }
+  return 'Triaged as a code failure — the code needs to be fixed and this test re-run.'
+}
+
+function swOutcomeTooltip(outcome: SwTestOutcome): string {
+  return outcome.passed ? 'Passed on its last run.' : 'Failed on its last run — open this element to view the raw output.'
 }
 
 function scopeForTest(test: TestCase): TestCommandScope {
@@ -71,6 +123,23 @@ function latestRunForTest(runs: TestRun[], testId: string): { run: TestRun; outc
   return { run, outcome }
 }
 
+// Most recent element-scoped TestRun for a given scope, regardless of
+// whether it carried any requirement-traced outcomes — used to surface
+// SW-based (coding-agent) test results, which have no TestCase id and so
+// can't be found via latestRunForTest above.
+function latestRunForScope(runs: TestRun[], scope: TestCommandScope): TestRun | null {
+  const candidates = runs
+    .filter((r) => {
+      if ('interfaceElementIds' in scope) {
+        const key = [...scope.interfaceElementIds].sort().join('|')
+        return r.interfaceElementIds && [...r.interfaceElementIds].sort().join('|') === key
+      }
+      return r.architectureElementId === scope.architectureElementId
+    })
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+  return candidates[0] ?? null
+}
+
 interface TestGroup {
   scopeKey: string
   label: string
@@ -78,8 +147,43 @@ interface TestGroup {
   tests: TestCase[]
 }
 
-function groupTestsByScope(tests: TestCase[], architecture: Architecture): TestGroup[] {
+function seedScopeGroups(architecture: Architecture): Map<string, TestGroup> {
   const groups = new Map<string, TestGroup>()
+
+  // Seed one group per architecture element (and connected pair) up front —
+  // an element with no requirement-based TestCases yet still needs its own
+  // group so its SW-based (coding-agent) test results have somewhere to
+  // show and a Run Group button of their own.
+  for (const element of architecture.elements) {
+    const scopeKey = `el:${element.id}`
+    groups.set(scopeKey, {
+      scopeKey,
+      label: element.name,
+      scope: { architectureElementId: element.id },
+      tests: [],
+    })
+  }
+  for (const element of architecture.elements) {
+    for (const toId of element.interfaces) {
+      const key = [...[element.id, toId]].sort().join('|')
+      const scopeKey = `if:${key}`
+      if (groups.has(scopeKey)) continue
+      const fromName = architecture.elements.find((e) => e.id === element.id)?.name ?? element.id
+      const toName = architecture.elements.find((e) => e.id === toId)?.name ?? toId
+      groups.set(scopeKey, {
+        scopeKey,
+        label: `${fromName} ↔ ${toName}`,
+        scope: { interfaceElementIds: [element.id, toId] },
+        tests: [],
+      })
+    }
+  }
+  return groups
+}
+
+function groupTestsByScope(tests: TestCase[], architecture: Architecture): TestGroup[] {
+  const groups = seedScopeGroups(architecture)
+
   for (const test of tests) {
     const scopeKey = scopeKeyForTest(test)
     let group = groups.get(scopeKey)
@@ -92,20 +196,50 @@ function groupTestsByScope(tests: TestCase[], architecture: Architecture): TestG
   return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label))
 }
 
+interface SwTestGroup {
+  scopeKey: string
+  label: string
+  scope: TestCommandScope
+  outcomes: SwTestOutcome[]
+  run: TestRun | null
+}
+
+// Mirrors groupTestsByScope but for SW-based (coding-agent) tests — these
+// have no TestCase id, so grouping/lookup is purely by scope + the most
+// recent TestRun's swOutcomes for that scope.
+function groupSwTestsByScope(runs: TestRun[], architecture: Architecture): SwTestGroup[] {
+  const scopeGroups = seedScopeGroups(architecture)
+  const result: SwTestGroup[] = []
+  for (const group of scopeGroups.values()) {
+    const run = latestRunForScope(runs, group.scope)
+    result.push({
+      scopeKey: group.scopeKey,
+      label: group.label,
+      scope: group.scope,
+      outcomes: run?.swOutcomes ?? [],
+      run,
+    })
+  }
+  return result.sort((a, b) => a.label.localeCompare(b.label))
+}
+
 export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenSettings }: TestExecutionScreenProps) {
   const [testSuite, setTestSuite] = useState<TestSuite | null>(null)
   const [architecture, setArchitecture] = useState<Architecture | null>(null)
   const [runs, setRuns] = useState<TestRun[]>([])
   const [regressionRuns, setRegressionRuns] = useState<TestRegressionRun[]>([])
   const [requirements, setRequirements] = useState<Requirement[]>([])
+  const [readinessEntries, setReadinessEntries] = useState<ScopeReadinessEntry[]>([])
   const [selectedTestId, setSelectedTestId] = useState<string | null>(null)
+  const [selectedSwScopeKey, setSelectedSwScopeKey] = useState<string | null>(null)
   const [checkedTestIds, setCheckedTestIds] = useState<Set<string>>(new Set())
+  const [checkedSwScopeKeys, setCheckedSwScopeKeys] = useState<Set<string>>(new Set())
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
+  const [collapsedSwGroups, setCollapsedSwGroups] = useState<Set<string>>(new Set())
   const collapsedGroupsInitialized = useRef(false)
   const [busy, setBusy] = useState(false)
-  const [runStatusText, setRunStatusText] = useState<string | null>(null)
-  const [commandDraft, setCommandDraft] = useState('')
-  const [argsDraft, setArgsDraft] = useState('')
+  const [, setRunStatusText] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
 
   const [chatHistory, setChatHistory] = useState<TestExecutionChatEntry[]>([])
   const [chatInput, setChatInput] = useState('')
@@ -140,18 +274,20 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
   )
 
   async function reload() {
-    const [suite, arch, allRuns, allRegressionRuns, allRequirements] = await Promise.all([
+    const [suite, arch, allRuns, allRegressionRuns, allRequirements, readiness] = await Promise.all([
       api.getTestSuite(projectId),
       api.getArchitecture(projectId),
       api.listTestRuns(projectId),
       api.listTestRegressionRuns(projectId),
       api.listRequirements(projectId),
+      api.getTestScopeReadiness(projectId),
     ])
     setTestSuite(suite)
     setArchitecture(arch)
     setRuns(allRuns)
     setRegressionRuns(allRegressionRuns)
     setRequirements(allRequirements)
+    setReadinessEntries(readiness)
   }
 
   useEffect(() => {
@@ -163,7 +299,15 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
   const selectedTest = tests.find((t) => t.id === selectedTestId) ?? null
   const latest = selectedTest ? latestRunForTest(runs, selectedTest.id) : null
   const groups = architecture ? groupTestsByScope(tests, architecture) : []
+  const swGroups = architecture ? groupSwTestsByScope(runs, architecture) : []
+  const selectedSwGroup = swGroups.find((g) => g.scopeKey === selectedSwScopeKey) ?? null
   const checkedCount = checkedTestIds.size
+  const readinessByScopeKey = new Map(readinessEntries.map((e) => [e.scopeKey, e.readiness]))
+  const isScopeReady = (scopeKey: string) => readinessByScopeKey.get(scopeKey)?.ready !== false
+  const readyGroups = groups.filter((g) => isScopeReady(g.scopeKey))
+  const notReadyGroups = groups.filter((g) => !isScopeReady(g.scopeKey))
+  const notReadyTestCount = notReadyGroups.reduce((sum, g) => sum + g.tests.length, 0)
+  const checkedSwCount = checkedSwScopeKeys.size
 
   const latestRegression = [...regressionRuns].sort((a, b) => b.finishedAt.localeCompare(a.finishedAt))[0] ?? null
   const awaitingRegressionCount = requirements.filter((r) => !r.deletedAt && r.status === 'tested').length
@@ -191,12 +335,12 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [groups.length])
 
-  function expandAllGroups() {
-    setCollapsedGroups(new Set())
+  function selectAllTests() {
+    setCheckedTestIds(new Set(tests.map((t) => t.id)))
   }
 
-  function collapseAllGroups() {
-    setCollapsedGroups(new Set(groups.map((g) => g.scopeKey)))
+  function unselectAllTests() {
+    setCheckedTestIds(new Set())
   }
 
   function toggleTest(testId: string) {
@@ -229,14 +373,57 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     })
   }
 
-  useEffect(() => {
-    if (!selectedTest) return
-    api.getTestCommand(projectId, scopeForTest(selectedTest)).then((cmd) => {
-      setCommandDraft(cmd.command)
-      setArgsDraft(cmd.args.join(' '))
+  function expandAllGroups() {
+    setCollapsedGroups(new Set())
+  }
+
+  function collapseAllGroups() {
+    setCollapsedGroups(new Set(groups.map((g) => g.scopeKey)))
+  }
+
+  function selectAllSwGroups() {
+    setCheckedSwScopeKeys(new Set(swGroups.map((g) => g.scopeKey)))
+  }
+
+  function unselectAllSwGroups() {
+    setCheckedSwScopeKeys(new Set())
+  }
+
+  function toggleSwGroupChecked(scopeKey: string) {
+    setCheckedSwScopeKeys((prev) => {
+      const next = new Set(prev)
+      if (next.has(scopeKey)) next.delete(scopeKey)
+      else next.add(scopeKey)
+      return next
     })
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedTest?.id])
+  }
+
+  function expandAllSwGroups() {
+    setCollapsedSwGroups(new Set())
+  }
+
+  function collapseAllSwGroups() {
+    setCollapsedSwGroups(new Set(swGroups.map((g) => g.scopeKey)))
+  }
+
+  function toggleSwGroupCollapsed(scopeKey: string) {
+    setCollapsedSwGroups((prev) => {
+      const next = new Set(prev)
+      if (next.has(scopeKey)) next.delete(scopeKey)
+      else next.add(scopeKey)
+      return next
+    })
+  }
+
+  function selectTest(testId: string) {
+    setSelectedSwScopeKey(null)
+    setSelectedTestId(testId)
+  }
+
+  function selectSwGroup(scopeKey: string) {
+    setSelectedTestId(null)
+    setSelectedSwScopeKey(scopeKey)
+  }
 
   async function withBusyAction(text: string, action: () => Promise<void>) {
     if (busy) return
@@ -283,9 +470,54 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     })
   }
 
+  async function handleRunAllTests() {
+    if (!architecture || groups.length === 0) return
+    const runnableGroups = readyGroups.filter((g) => g.tests.length > 0)
+    await withBusyAction(`Running all requirement-based tests across ${runnableGroups.length} element(s)...`, async () => {
+      for (let i = 0; i < runnableGroups.length; i++) {
+        setRunStatusText(`Running ${runnableGroups[i].label} (${i + 1}/${runnableGroups.length})...`)
+        onOperationChange({ text: `Running ${runnableGroups[i].label} (${i + 1}/${runnableGroups.length})...` })
+        await api.runElementTests(projectId, runnableGroups[i].scope)
+      }
+      await reload()
+    })
+  }
+
   async function handleRunRegression() {
     await withBusyAction('Running full regression...', async () => {
       await api.runFullRegression(projectId)
+      await reload()
+    })
+  }
+
+  async function handleRunSwGroup(group: SwTestGroup) {
+    await withBusyAction(`Running coding-agent tests for ${group.label}...`, async () => {
+      await api.runElementTests(projectId, group.scope)
+      await reload()
+    })
+  }
+
+  async function handleRunAllSwGroups() {
+    if (!architecture || swGroups.length === 0) return
+    await withBusyAction(`Running coding-agent tests across ${swGroups.length} element(s)...`, async () => {
+      for (let i = 0; i < swGroups.length; i++) {
+        setRunStatusText(`Running ${swGroups[i].label} (${i + 1}/${swGroups.length})...`)
+        onOperationChange({ text: `Running ${swGroups[i].label} (${i + 1}/${swGroups.length})...` })
+        await api.runElementTests(projectId, swGroups[i].scope)
+      }
+      await reload()
+    })
+  }
+
+  async function handleRunSelectedSwGroups() {
+    const selectedGroups = swGroups.filter((g) => checkedSwScopeKeys.has(g.scopeKey))
+    if (selectedGroups.length === 0) return
+    await withBusyAction(`Running coding-agent tests for ${selectedGroups.length} selected element(s)...`, async () => {
+      for (let i = 0; i < selectedGroups.length; i++) {
+        setRunStatusText(`Running ${selectedGroups[i].label} (${i + 1}/${selectedGroups.length})...`)
+        onOperationChange({ text: `Running ${selectedGroups[i].label} (${i + 1}/${selectedGroups.length})...` })
+        await api.runElementTests(projectId, selectedGroups[i].scope)
+      }
       await reload()
     })
   }
@@ -306,11 +538,6 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     })
   }
 
-  async function handleSaveCommand() {
-    if (!selectedTest) return
-    await api.setTestCommand(projectId, scopeForTest(selectedTest), commandDraft, argsDraft.split(' ').filter(Boolean))
-  }
-
   async function handleChatSend() {
     if (!chatInput.trim() || chatBusy) return
     const message = chatInput.trim()
@@ -323,6 +550,13 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     try {
       const result = await api.testExecutionChat(projectId, selectedTest?.id ?? null, latest?.run.id ?? null, message)
       setChatHistory((prev) => [...prev, { role: 'qa', text: result.reply }])
+      if (result.dispatch) {
+        setChatHistory((prev) => [...prev, { role: 'qa', text: DISPATCH_SUMMARY[result.dispatch!.verdict](result.dispatch!) }])
+        // The dispatch mutated project state (element.pendingRecodeReason /
+        // a requirement's text) — reload so the rest of this screen (and
+        // any element/requirement status it derives) reflects it.
+        await reload()
+      }
       onOperationChange({ text: null })
     } catch (err) {
       const operationError = toOperationError(err)
@@ -334,39 +568,155 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     }
   }
 
-  if (!architecture || tests.length === 0) {
+  function renderTestGroup(group: TestGroup, ready: boolean) {
+    const groupOutcomes = group.tests.map((t) => latestRunForTest(runs, t.id)?.outcome)
+    const anyRun = groupOutcomes.some(Boolean)
+    const allPassed = anyRun && groupOutcomes.every((o) => o && o.passed)
+    const anyFailed = groupOutcomes.some((o) => o && !o.passed)
+    const groupDotColor = !anyRun
+      ? STATUS_COLOR['not-started']
+      : anyFailed
+        ? STATUS_COLOR.blocked
+        : allPassed
+          ? STATUS_COLOR.complete
+          : STATUS_COLOR['in-progress']
+    const allChecked = group.tests.length > 0 && group.tests.every((t) => checkedTestIds.has(t.id))
+    const someChecked = !allChecked && group.tests.some((t) => checkedTestIds.has(t.id))
+    const passedCount = groupOutcomes.filter((o) => o && o.passed).length
+    const ranCount = groupOutcomes.filter(Boolean).length
+    const collapsed = collapsedGroups.has(group.scopeKey)
+    const readiness = readinessByScopeKey.get(group.scopeKey)
+    const notReadyReason = readiness && !readiness.ready ? NOT_READY_REASON_LABEL[readiness.reason] : null
+    const failingOutcomes = groupOutcomes.filter((o): o is NonNullable<typeof o> => !!o && !o.passed)
+    const untriaged = failingOutcomes.filter((o) => !o.triage || o.triage === 'unattributed').length
+    const needsConfirm = failingOutcomes.filter((o) => o.triage === 'test-case-failure' && !o.testCaseFailureConfirmedAt).length
+    const codeFailures = failingOutcomes.filter((o) => o.triage === 'code-failure').length
+    const confirmedTestCaseFailures = failingOutcomes.filter((o) => o.triage === 'test-case-failure' && o.testCaseFailureConfirmedAt).length
+    const failureBreakdown = [
+      untriaged > 0 ? `${untriaged} not yet triaged` : null,
+      needsConfirm > 0 ? `${needsConfirm} awaiting confirmation` : null,
+      codeFailures > 0 ? `${codeFailures} code failure(s)` : null,
+      confirmedTestCaseFailures > 0 ? `${confirmedTestCaseFailures} confirmed test-case failure(s)` : null,
+    ]
+      .filter(Boolean)
+      .join(', ')
+    const groupTooltip =
+      notReadyReason ??
+      (ranCount === 0
+        ? `${group.tests.length} test(s) ready to run — click Run Group, or select individual tests to run.`
+        : anyFailed
+          ? `${passedCount}/${ranCount} passed — click a test below to open it (${failureBreakdown}).`
+          : `${passedCount}/${ranCount} passed — all tests for ${group.label} are green.`)
+
+    if (group.tests.length === 0) return null
+
+    return (
+      <div
+        key={group.scopeKey}
+        className={ready ? 'test-execution-group' : 'test-execution-group test-execution-group-not-ready'}
+      >
+        <div
+          className="test-execution-group-header has-tooltip"
+          data-tooltip={groupTooltip}
+          onClick={() => toggleGroupCollapsed(group.scopeKey)}
+          role="button"
+          tabIndex={0}
+          aria-label={collapsed ? `Expand ${group.label}` : `Collapse ${group.label}`}
+          aria-expanded={!collapsed}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault()
+              toggleGroupCollapsed(group.scopeKey)
+            }
+          }}
+        >
+          <span className="test-execution-group-toggle" aria-hidden="true">
+            {collapsed ? '▸' : '▾'}
+          </span>
+          <input
+            type="checkbox"
+            checked={allChecked}
+            disabled={group.tests.length === 0 || !ready}
+            ref={(el) => {
+              if (el) el.indeterminate = someChecked
+            }}
+            onChange={() => toggleGroup(group)}
+            onClick={(e) => e.stopPropagation()}
+            aria-label={`Select all tests for ${group.label}`}
+            title={notReadyReason ?? `Select all tests for ${group.label}`}
+          />
+          <span className="test-execution-status-dot" style={{ background: groupDotColor }} />
+          <span className="test-execution-group-title">{group.label}</span>
+          <span className="test-execution-group-summary">
+            {ranCount === 0 ? `${group.tests.length} not run` : `${passedCount}/${ranCount} passed, ${group.tests.length} total`}
+          </span>
+          <button
+            type="button"
+            className="test-execution-group-run has-tooltip"
+            onClick={(e) => {
+              e.stopPropagation()
+              handleRunGroup(group)
+            }}
+            disabled={busy || !ready}
+            data-tooltip={notReadyReason ?? `Run all ${group.tests.length} test(s) for ${group.label}.`}
+          >
+            Run Group
+          </button>
+        </div>
+        {!collapsed && (
+          <ul className="test-execution-group-list">
+            {group.tests.map((test) => {
+              const found = latestRunForTest(runs, test.id)
+              const outcome = found?.outcome
+              const dotColor = !outcome ? STATUS_COLOR['not-started'] : outcome.passed ? STATUS_COLOR.complete : STATUS_COLOR.blocked
+              return (
+                <li
+                  key={test.id}
+                  className={
+                    test.id === selectedTestId
+                      ? 'test-execution-row test-execution-row-selected has-tooltip'
+                      : 'test-execution-row has-tooltip'
+                  }
+                  data-tooltip={notReadyReason ?? testRowTooltip(outcome)}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checkedTestIds.has(test.id)}
+                    disabled={!ready}
+                    onChange={() => toggleTest(test.id)}
+                    onClick={(e) => e.stopPropagation()}
+                    aria-label={`Select ${test.title}`}
+                  />
+                  <span className="test-execution-row-body" onClick={() => selectTest(test.id)}>
+                    <span className="test-execution-status-dot" style={{ background: dotColor }} />
+                    <span className="test-execution-title">{test.title}</span>
+                    <span className="test-execution-run-state">{!outcome ? 'Not run' : outcome.passed ? 'Passed' : 'Failed'}</span>
+                    {outcome && !outcome.passed && (
+                      <span className="test-execution-triage-badge">{TRIAGE_LABEL[outcome.triage ?? 'unattributed']}</span>
+                    )}
+                  </span>
+                </li>
+              )
+            })}
+          </ul>
+        )}
+      </div>
+    )
+  }
+
+  if (!architecture || architecture.elements.length === 0) {
     return (
       <div className="test-execution-screen">
-        <h1>Test Execution</h1>
-        <p className="test-execution-hint">No tests yet — create tests on the Test Creation tab first.</p>
+        <p className="test-execution-hint">
+          No architecture elements yet — add elements on the Architecture tab, then create tests on the Test
+          Creation tab, before running tests here.
+        </p>
       </div>
     )
   }
 
   return (
     <div className="test-execution-screen">
-      <h1>Test Execution</h1>
-
-      <div className="test-execution-action-bar">
-        <button type="button" onClick={handleRunRegression} disabled={busy}>
-          Run Regression
-        </button>
-        <button type="button" onClick={handleRunSelected} disabled={busy || checkedCount === 0}>
-          Run Selected{checkedCount > 0 ? ` (${checkedCount})` : ''}
-        </button>
-        <button type="button" className="test-execution-secondary-button" onClick={expandAllGroups}>
-          Expand All
-        </button>
-        <button type="button" className="test-execution-secondary-button" onClick={collapseAllGroups}>
-          Collapse All
-        </button>
-        {(busy || runStatusText) && (
-          <span className="test-execution-status-text" aria-live="polite">
-            {runStatusText}
-          </span>
-        )}
-      </div>
-
       <div
         className={
           !latestRegression
@@ -384,6 +734,12 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
               ? `Last full regression passed — ${new Date(latestRegression.finishedAt).toLocaleString()} (${latestRegression.trigger})`
               : `Last full regression FAILED — ${new Date(latestRegression.finishedAt).toLocaleString()} (${latestRegression.trigger})`}
         </span>
+        {notReadyTestCount > 0 && (
+          <span className="test-execution-regression-awaiting">
+            {notReadyTestCount} test{notReadyTestCount === 1 ? '' : 's'} not ready to run — element{notReadyGroups.length === 1 ? '' : 's'}{' '}
+            not yet coded
+          </span>
+        )}
         {awaitingRegressionCount > 0 && (
           <span className="test-execution-regression-awaiting">
             {awaitingRegressionCount} requirement{awaitingRegressionCount === 1 ? '' : 's'} tested and awaiting regression to reach Complete
@@ -391,117 +747,221 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
         )}
       </div>
 
-      <div className="test-execution-layout">
-        <div className="test-execution-list">
-          {groups.map((group) => {
-            const groupOutcomes = group.tests.map((t) => latestRunForTest(runs, t.id)?.outcome)
-            const anyRun = groupOutcomes.some(Boolean)
-            const allPassed = anyRun && groupOutcomes.every((o) => o && o.passed)
-            const anyFailed = groupOutcomes.some((o) => o && !o.passed)
-            const groupDotColor = !anyRun
-              ? STATUS_COLOR['not-started']
-              : anyFailed
-                ? STATUS_COLOR.blocked
-                : allPassed
-                  ? STATUS_COLOR.complete
-                  : STATUS_COLOR['in-progress']
-            const allChecked = group.tests.every((t) => checkedTestIds.has(t.id))
-            const someChecked = !allChecked && group.tests.some((t) => checkedTestIds.has(t.id))
-            const passedCount = groupOutcomes.filter((o) => o && o.passed).length
-            const ranCount = groupOutcomes.filter(Boolean).length
-            const collapsed = collapsedGroups.has(group.scopeKey)
-
-            return (
-              <div key={group.scopeKey} className="test-execution-group">
-                <div className="test-execution-group-header">
-                  <button
-                    type="button"
-                    className="test-execution-group-toggle"
-                    onClick={() => toggleGroupCollapsed(group.scopeKey)}
-                    aria-label={collapsed ? `Expand ${group.label}` : `Collapse ${group.label}`}
-                    aria-expanded={!collapsed}
-                  >
-                    {collapsed ? '▸' : '▾'}
-                  </button>
-                  <input
-                    type="checkbox"
-                    checked={allChecked}
-                    ref={(el) => {
-                      if (el) el.indeterminate = someChecked
-                    }}
-                    onChange={() => toggleGroup(group)}
-                    aria-label={`Select all tests for ${group.label}`}
-                  />
-                  <span className="test-execution-status-dot" style={{ background: groupDotColor }} />
-                  <span className="test-execution-group-title">{group.label}</span>
-                  <span className="test-execution-group-summary">
-                    {ranCount === 0 ? `${group.tests.length} not run` : `${passedCount}/${ranCount} passed, ${group.tests.length} total`}
-                  </span>
-                  <button type="button" className="test-execution-group-run" onClick={() => handleRunGroup(group)} disabled={busy}>
-                    Run Group
-                  </button>
-                </div>
-                {!collapsed && (
-                  <ul className="test-execution-group-list">
-                    {group.tests.map((test) => {
-                      const found = latestRunForTest(runs, test.id)
-                      const outcome = found?.outcome
-                      const dotColor = !outcome ? STATUS_COLOR['not-started'] : outcome.passed ? STATUS_COLOR.complete : STATUS_COLOR.blocked
-                      return (
-                        <li
-                          key={test.id}
-                          className={test.id === selectedTestId ? 'test-execution-row test-execution-row-selected' : 'test-execution-row'}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={checkedTestIds.has(test.id)}
-                            onChange={() => toggleTest(test.id)}
-                            onClick={(e) => e.stopPropagation()}
-                            aria-label={`Select ${test.title}`}
-                          />
-                          <span className="test-execution-row-body" onClick={() => setSelectedTestId(test.id)}>
-                            <span className="test-execution-status-dot" style={{ background: dotColor }} />
-                            <span className="test-execution-title">{test.title}</span>
-                            <span className="test-execution-run-state">
-                              {!outcome ? 'Not run' : outcome.passed ? 'Passed' : 'Failed'}
-                            </span>
-                            {outcome && !outcome.passed && (
-                              <span className="test-execution-triage-badge">{TRIAGE_LABEL[outcome.triage ?? 'unattributed']}</span>
-                            )}
-                          </span>
-                        </li>
-                      )
-                    })}
-                  </ul>
-                )}
+      <div className="test-execution-panels-row">
+        <div className="test-execution-frame test-execution-frame-left">
+          <div className="test-execution-column-header">
+            <h2>Requirement based Test cases</h2>
+            <span className="test-execution-column-subtitle">Requirement-traced tests created in Step 4</span>
+          </div>
+          <div className="test-execution-panel-actions">
+            <button type="button" onClick={handleRunAllTests} disabled={busy || tests.length === 0}>
+              Run All
+            </button>
+            <button type="button" onClick={handleRunSelected} disabled={busy || checkedCount === 0}>
+              Run Selected{checkedCount > 0 ? ` (${checkedCount})` : ''}
+            </button>
+            <button type="button" className="test-execution-secondary-button" onClick={selectAllTests} disabled={tests.length === 0}>
+              Select All
+            </button>
+            <button type="button" className="test-execution-secondary-button" onClick={unselectAllTests} disabled={checkedCount === 0}>
+              Unselect All
+            </button>
+            <button type="button" className="test-execution-secondary-button" onClick={expandAllGroups} disabled={groups.length === 0}>
+              Expand
+            </button>
+            <button type="button" className="test-execution-secondary-button" onClick={collapseAllGroups} disabled={groups.length === 0}>
+              Collapse
+            </button>
+          </div>
+          <div className="test-execution-list">
+            {readyGroups.map((group) => renderTestGroup(group, true))}
+            {notReadyGroups.some((g) => g.tests.length > 0) && (
+              <div className="test-execution-subsection-heading">
+                Not ready to run ({notReadyTestCount})
               </div>
-            )
-          })}
+            )}
+            {notReadyGroups.map((group) => renderTestGroup(group, false))}
+            {groups.every((g) => g.tests.length === 0) && (
+              <p className="test-execution-hint">No requirement-based test cases yet — create them on the Test Creation tab.</p>
+            )}
+          </div>
         </div>
 
+        <div className="test-execution-frame test-execution-frame-right">
+          <div className="test-execution-column-header">
+            <h2>SW tests (Coding)</h2>
+            <span className="test-execution-column-subtitle">Test files the coding agent wrote in Step 5</span>
+          </div>
+          <div className="test-execution-panel-actions">
+            <button type="button" onClick={handleRunAllSwGroups} disabled={busy || swGroups.length === 0}>
+              Run All
+            </button>
+            <button type="button" onClick={handleRunSelectedSwGroups} disabled={busy || checkedSwCount === 0}>
+              Run Selected{checkedSwCount > 0 ? ` (${checkedSwCount})` : ''}
+            </button>
+            <button
+              type="button"
+              className="test-execution-secondary-button"
+              onClick={selectAllSwGroups}
+              disabled={swGroups.length === 0}
+            >
+              Select All
+            </button>
+            <button
+              type="button"
+              className="test-execution-secondary-button"
+              onClick={unselectAllSwGroups}
+              disabled={checkedSwCount === 0}
+            >
+              Unselect All
+            </button>
+            <button
+              type="button"
+              className="test-execution-secondary-button"
+              onClick={expandAllSwGroups}
+              disabled={swGroups.length === 0}
+            >
+              Expand
+            </button>
+            <button
+              type="button"
+              className="test-execution-secondary-button"
+              onClick={collapseAllSwGroups}
+              disabled={swGroups.length === 0}
+            >
+              Collapse
+            </button>
+          </div>
+          <div className="test-execution-list">
+            {swGroups.map((group) => {
+              const swPassedCount = group.outcomes.filter((o) => o.passed).length
+              const swDotColor = !group.run
+                ? STATUS_COLOR['not-started']
+                : group.outcomes.length === 0
+                  ? STATUS_COLOR['not-started']
+                  : swPassedCount === group.outcomes.length
+                    ? STATUS_COLOR.complete
+                    : STATUS_COLOR.blocked
+              const collapsed = collapsedSwGroups.has(group.scopeKey)
+              const swReadiness = readinessByScopeKey.get(group.scopeKey)
+              const swNotReadyReason = swReadiness && !swReadiness.ready ? NOT_READY_REASON_LABEL[swReadiness.reason] : null
+              const swGroupTooltip =
+                swNotReadyReason ??
+                (!group.run
+                  ? `Not run yet — click Run to discover and execute test files the coding agent wrote for ${group.label}.`
+                  : group.outcomes.length === 0
+                    ? 'No test files were found for this scope on the last run.'
+                    : `${swPassedCount}/${group.outcomes.length} passed — click ${group.label} to view raw output.`)
+
+              return (
+                <div key={group.scopeKey} className="test-execution-group">
+                  <div
+                    className="test-execution-group-header has-tooltip"
+                    data-tooltip={swGroupTooltip}
+                    onClick={() => toggleSwGroupCollapsed(group.scopeKey)}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={collapsed ? `Expand ${group.label}` : `Collapse ${group.label}`}
+                    aria-expanded={!collapsed}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault()
+                        toggleSwGroupCollapsed(group.scopeKey)
+                      }
+                    }}
+                  >
+                    <span className="test-execution-group-toggle" aria-hidden="true">
+                      {collapsed ? '▸' : '▾'}
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={checkedSwScopeKeys.has(group.scopeKey)}
+                      onChange={() => toggleSwGroupChecked(group.scopeKey)}
+                      onClick={(e) => e.stopPropagation()}
+                      aria-label={`Select ${group.label}`}
+                      title={`Select ${group.label}`}
+                    />
+                    <span className="test-execution-status-dot" style={{ background: swDotColor }} />
+                    <span
+                      className="test-execution-group-title test-execution-group-title-clickable"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        selectSwGroup(group.scopeKey)
+                      }}
+                    >
+                      {group.label}
+                    </span>
+                    <span className="test-execution-group-summary">
+                      {!group.run ? 'not run' : group.outcomes.length === 0 ? 'none found' : `${swPassedCount}/${group.outcomes.length} passed`}
+                    </span>
+                    <button
+                      type="button"
+                      className="test-execution-group-run has-tooltip"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleRunSwGroup(group)
+                      }}
+                      disabled={busy}
+                      data-tooltip={`Run coding-agent tests for ${group.label}.`}
+                    >
+                      Run
+                    </button>
+                  </div>
+                  {!collapsed && (
+                    <>
+                      {group.outcomes.length > 0 && (
+                        <ul className="test-execution-group-list">
+                          {group.outcomes.map((o) => (
+                            <li key={o.name} className="test-execution-row has-tooltip" data-tooltip={swOutcomeTooltip(o)}>
+                              <span className="test-execution-row-body">
+                                <span
+                                  className="test-execution-status-dot"
+                                  style={{ background: o.passed ? STATUS_COLOR.complete : STATUS_COLOR.blocked }}
+                                />
+                                <span className="test-execution-title">{o.name}</span>
+                                <span className="test-execution-run-state">{o.passed ? 'Passed' : 'Failed'}</span>
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {group.run && group.outcomes.length === 0 && (
+                        <div className="test-execution-sw-subsection-note">
+                          {group.run.exitCode === null
+                            ? group.run.rawLog
+                            : 'No test files were written by the Step 5 coding agent for this scope.'}
+                        </div>
+                      )}
+                      {!group.run && <p className="test-execution-hint">Not run yet.</p>}
+                    </>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+
+        <div
+          className={readyGroups.length === 0 ? 'test-execution-regression-frame has-tooltip' : 'test-execution-regression-frame'}
+          data-tooltip={readyGroups.length === 0 ? 'No element is coded yet — nothing to regress.' : undefined}
+        >
+          <button type="button" className="test-execution-regression-button" onClick={handleRunRegression} disabled={busy}>
+            Run Regression
+          </button>
+          <span className="test-execution-regression-frame-summary">
+            {readyGroups.length}/{groups.length} element{groups.length === 1 ? '' : 's'} ready
+          </span>
+        </div>
+      </div>
+
+      <div className="test-execution-bottom">
         <div className="test-execution-detail-pane">
-          {!selectedTest ? (
-            <p className="test-execution-hint">Select a test to view its detail.</p>
-          ) : (
+          {selectedTest ? (
             <>
               <div className="test-execution-detail-header">
                 <h2>{selectedTest.title}</h2>
                 <button type="button" onClick={() => handleRunTests(selectedTest)} disabled={busy}>
                   Run Tests
-                </button>
-              </div>
-
-              <div className="test-execution-command-row">
-                <label>
-                  Command
-                  <input value={commandDraft} onChange={(e) => setCommandDraft(e.target.value)} />
-                </label>
-                <label>
-                  Args
-                  <input value={argsDraft} onChange={(e) => setArgsDraft(e.target.value)} placeholder="space-separated" />
-                </label>
-                <button type="button" onClick={handleSaveCommand} disabled={busy}>
-                  Save
                 </button>
               </div>
 
@@ -542,35 +1002,83 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
                 </>
               )}
             </>
+          ) : selectedSwGroup ? (
+            <>
+              <div className="test-execution-detail-header">
+                <h2>{selectedSwGroup.label} — SW tests</h2>
+                <button type="button" onClick={() => handleRunSwGroup(selectedSwGroup)} disabled={busy}>
+                  Run Tests
+                </button>
+              </div>
+              {!selectedSwGroup.run ? (
+                <p className="test-execution-hint">No test run yet for this scope.</p>
+              ) : (
+                <>
+                  <p className="test-execution-hint">Last run: {selectedSwGroup.run.startedAt}</p>
+                  <details className="test-execution-raw-log" open>
+                    <summary>Raw output</summary>
+                    <pre>{selectedSwGroup.run.rawLog}</pre>
+                  </details>
+                </>
+              )}
+            </>
+          ) : (
+            <p className="test-execution-hint">Select a test to view its detail.</p>
           )}
         </div>
 
-        <div className="test-execution-history-pane">
-          <h2>Run History</h2>
-          {runHistory.length === 0 ? (
-            <p className="test-execution-hint">No runs yet.</p>
-          ) : (
-            <ul className="test-execution-history-list">
-              {runHistory.map((run) => {
-                const allPassed = run.total > 0 && run.passed === run.total
-                const tone = run.total === 0 ? 'neutral' : allPassed ? 'good' : 'critical'
-                return (
-                  <li key={run.id} className={`test-execution-history-row tone-${tone}`}>
-                    <span className="test-execution-status-dot" />
-                    <span className="test-execution-history-label">
-                      {run.kind === 'regression' ? 'Full regression' : run.label}
-                    </span>
-                    <span className="test-execution-history-count">
-                      {run.passed}/{run.total} passed
-                    </span>
-                    <span className="test-execution-history-time">{new Date(run.finishedAt).toLocaleTimeString()}</span>
-                  </li>
-                )
-              })}
-            </ul>
-          )}
-        </div>
       </div>
+
+      <button
+        type="button"
+        className={historyOpen ? 'test-execution-history-tab test-execution-history-tab-open' : 'test-execution-history-tab'}
+        onClick={() => setHistoryOpen((v) => !v)}
+        aria-expanded={historyOpen}
+      >
+        <span className="test-execution-history-tab-icon">{historyOpen ? '▸' : '◂'}</span>
+        <span className="test-execution-history-tab-label">Run History</span>
+      </button>
+
+      {historyOpen && (
+        <>
+          <div className="test-execution-history-scrim" onClick={() => setHistoryOpen(false)} />
+          <div className="test-execution-history-pane">
+            <div className="test-execution-history-pane-header">
+              <h2>Run History</h2>
+              <button
+                type="button"
+                className="test-execution-history-close"
+                onClick={() => setHistoryOpen(false)}
+                aria-label="Close run history"
+              >
+                ✕
+              </button>
+            </div>
+            {runHistory.length === 0 ? (
+              <p className="test-execution-hint">No runs yet.</p>
+            ) : (
+              <ul className="test-execution-history-list">
+                {runHistory.map((run) => {
+                  const allPassed = run.total > 0 && run.passed === run.total
+                  const tone = run.total === 0 ? 'neutral' : allPassed ? 'good' : 'critical'
+                  return (
+                    <li key={run.id} className={`test-execution-history-row tone-${tone}`}>
+                      <span className="test-execution-status-dot" />
+                      <span className="test-execution-history-label">
+                        {run.kind === 'regression' ? 'Full regression' : run.label}
+                      </span>
+                      <span className="test-execution-history-count">
+                        {run.passed}/{run.total} passed
+                      </span>
+                      <span className="test-execution-history-time">{new Date(run.finishedAt).toLocaleTimeString()}</span>
+                    </li>
+                  )
+                })}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
 
       <div className="analyst-chat-dock" style={{ height: chatHeight }}>
         <div className="analyst-chat-resize-handle" onMouseDown={handleResizeStart} />
@@ -578,7 +1086,8 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
           <div className="analyst-chat-heading-row">
             <h2>QA chat</h2>
             <span className="analyst-chat-hint">
-              Ask QA to help interpret a run's output or discuss why a test might be failing.
+              Ask QA to help interpret a run's output, or describe an issue you found — QA may dispatch it as a
+              requirement change, a test case fix, or a coding fix.
             </span>
           </div>
           <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>

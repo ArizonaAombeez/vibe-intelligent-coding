@@ -124,6 +124,16 @@ export function updateRequirementText(
   requirement.qualityScore = computeQualityScore(text, requirement.conflicts?.length ?? 0)
   if (STATUSES_IMPLYING_PRIOR_WORK.includes(requirement.status)) {
     requirement.status = 'allocated'
+    // Tags every element this requirement is allocated to with why it now
+    // has pending work, so the next Coding run's prompt can say "you're
+    // updating existing code because a requirement changed" instead of a
+    // generic re-code framing (buildCodingPrompt in vic-coding consumes and
+    // clears this).
+    for (const element of project.architecture?.elements ?? []) {
+      if (requirement.architectureElements.includes(element.id)) {
+        element.pendingRecodeReason = 'requirement-update'
+      }
+    }
   }
   return requirement
 }
@@ -554,11 +564,9 @@ export async function splitRequirement(
 // stable machine-readable tag the UI groups by; `label` is what to show.
 export type RequirementReferenceKind =
   | 'conflict'
-  | 'story'
   | 'test-case'
   | 'analyst-note-mention'
   | 'conflict-rationale-mention'
-  | 'story-text-mention'
   | 'test-case-title-mention'
 
 export interface RequirementReference {
@@ -574,10 +582,10 @@ function mentionPattern(requirementId: string): RegExp {
   return new RegExp(`\\b${requirementId}\\b`)
 }
 
-// Structured-field references (Story.requirementIds, TestCase.requirementIds,
+// Structured-field references (TestCase.requirementIds,
 // RequirementConflict.requirementId) are exact — walking the arrays those
 // fields already are. Free-text mentions (analyst notes, conflict
-// rationales, story/test titles/descriptions) are a best-effort regex scan
+// rationales, test titles/descriptions) are a best-effort regex scan
 // over the same "REQ-NNN" convention requirementIdHighlight.tsx already
 // renders clickable in the UI — a prose reference an LLM wrote, not a
 // structural link, so it can't be corrected automatically and is only ever
@@ -598,15 +606,6 @@ export function findRequirementReferences(project: Project, requirementId: strin
     }
     if (r.analystNote && mentions.test(r.analystNote)) {
       references.push({ kind: 'analyst-note-mention', label: `${r.id}'s Analyst note` })
-    }
-  }
-
-  for (const story of project.backlog?.stories ?? []) {
-    if (story.deletedAt) continue
-    if (story.requirementIds.includes(requirementId)) {
-      references.push({ kind: 'story', label: `${story.id}: ${story.title}` })
-    } else if (mentions.test(story.title) || mentions.test(story.description)) {
-      references.push({ kind: 'story-text-mention', label: `${story.id}: ${story.title} (text mention)` })
     }
   }
 
@@ -632,19 +631,18 @@ export interface SplitPieceInput {
 
 export interface ApplySplitRequirementResult {
   createdRequirements: Requirement[]
-  // Ids of stories/tests whose requirementIds were rewritten (old id
-  // removed, every new id added) — reported back so the caller can surface
-  // "N structured references were updated" alongside the reference-check
+  // Ids of tests whose requirementIds were rewritten (old id removed,
+  // every new id added) — reported back so the caller can surface "N
+  // structured references were updated" alongside the reference-check
   // report's free-text mentions, which are never auto-rewritten.
-  updatedStoryIds: string[]
   updatedTestCaseIds: string[]
 }
 
 // Applies a reviewed Split: creates one new requirement per piece (new
 // permanent ids from seqStart, same reserve-a-block convention as
 // importRequirementsFromText), rewrites every *structured* reference this
-// module can safely resolve (Story.requirementIds, TestCase.requirementIds)
-// to point at the new ids instead, then soft-deletes the original —
+// module can safely resolve (TestCase.requirementIds) to point at the new
+// ids instead, then soft-deletes the original —
 // deleteRequirement's existing Bin/restore path is the safety net if this
 // needs undoing, never a hard purge. Free-text mentions found by
 // findRequirementReferences are deliberately left untouched (see that
@@ -667,18 +665,12 @@ export function applySplitRequirement(
   const createdRequirements = pieces.map((piece, i) => {
     const requirement = createRequirementFromForm(project, { text: piece.text }, seqStart + i)
     requirement.architectureElements = piece.architectureElementId ? [piece.architectureElementId] : []
+    if (piece.architectureElementId) {
+      advanceStatusForward(requirement, 'allocated')
+    }
     return requirement
   })
   const newIds = createdRequirements.map((r) => r.id)
-
-  const updatedStoryIds: string[] = []
-  for (const story of project.backlog?.stories ?? []) {
-    if (story.deletedAt || !story.requirementIds.includes(requirementId)) continue
-    story.requirementIds = Array.from(
-      new Set(story.requirementIds.flatMap((id) => (id === requirementId ? newIds : [id]))),
-    )
-    updatedStoryIds.push(story.id)
-  }
 
   const updatedTestCaseIds: string[] = []
   for (const test of project.testSuite?.tests ?? []) {
@@ -691,5 +683,5 @@ export function applySplitRequirement(
 
   deleteRequirement(project, requirementId)
 
-  return { createdRequirements, updatedStoryIds, updatedTestCaseIds }
+  return { createdRequirements, updatedTestCaseIds }
 }

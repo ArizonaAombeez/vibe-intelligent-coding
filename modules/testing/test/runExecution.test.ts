@@ -1,21 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { scaffoldProjectSourceTree, sourceTreeRoot } from 'vic-coding'
 import type { Project, Requirement, TestCase } from 'vic-requirements-elicitation'
 import { createTestCase } from 'vic-requirements-elicitation'
 import {
   runElementTestSuite,
   runFullRegression,
-  writeElementTestCommand,
   evaluateRequirementStatus,
   evaluateRequirementStatusForRegression,
 } from '../src/index.js'
-
-const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'fake-test-runner.mjs')
 
 async function tempProjectDir(): Promise<string> {
   return mkdtemp(path.join(os.tmpdir(), 'vic-runexecution-test-'))
@@ -40,36 +36,50 @@ function baseProject(requirementStatus: Requirement['status'] = 'coded'): Projec
     ],
     architecture: {
       layers: ['Core'],
-      elements: [{ id: 'ARCH-001', kind: 'functional', name: 'Login UI', responsibility: 'Renders login', row: 0, col: 0, rowSpan: 1, colSpan: 1, interfaces: [] }],
+      elements: [{ id: 'ARCH-001', kind: 'functional', name: 'Login UI', responsibility: 'Renders login', row: 0, col: 0, rowSpan: 1, colSpan: 1, interfaces: [], elementInterfaces: [] }],
       nextElementSeq: 2,
+      nextInterfaceSeq: 1,
     },
   }
 }
 
-async function setUpProjectWithTest(mode: string): Promise<{ dir: string; project: Project; testCase: TestCase }> {
-  process.env.FAKE_TEST_MODE = mode
+// Writes a real, directly-runnable *.test.mjs file under an element's own
+// scaffolded subfolder — runElementTestSuite (runExecution.ts) discovers
+// and runs every such file individually by extension (no shared per-element
+// command, no output-line parsing), exactly mirroring what a real
+// LLM-written test file looks like (see Worm Game's actual generated
+// tests): plain script, `process.exitCode` decides pass/fail, nothing to
+// declare or configure beforehand.
+async function writeTestFile(srcRoot: string, relativeDir: string, fileName: string, passes: boolean): Promise<void> {
+  const dir = path.join(srcRoot, relativeDir)
+  await mkdir(dir, { recursive: true })
+  const body = passes
+    ? `console.log('Test passed: ${fileName}');\n`
+    : `console.log('Test failed: ${fileName}');\nprocess.exitCode = 1;\n`
+  await writeFile(path.join(dir, fileName), body, 'utf-8')
+}
+
+async function setUpProjectWithTest(passes: boolean): Promise<{ dir: string; project: Project; testCase: TestCase }> {
   const dir = await tempProjectDir()
   const project = baseProject()
   await scaffoldProjectSourceTree(project, dir)
-  await writeElementTestCommand(sourceTreeRoot(dir), 'login-ui', { command: 'node', args: [fixture] })
+  const srcRoot = sourceTreeRoot(dir)
+  await writeTestFile(srcRoot, 'login-ui', 'login.test.mjs', passes)
   const { testCase } = createTestCase(project, {
     type: 'functional',
     title: 'Renders login form',
     requirementIds: ['REQ-001'],
     architectureElementId: 'ARCH-001',
   })
-  // attributeOutcomes (runExecution.ts) only attributes an outcome to a
-  // TestCase with filePath set — a real test file already exists in the
-  // scaffolded source tree here (fake-test-runner.mjs stands in for it via
-  // writeElementTestCommand above), so this simulates that generation
-  // already happened, same as generateTestFileForTestCase would have set.
-  testCase!.filePath = 'login-ui/login.test.ts'
-  process.env.FAKE_TEST_TITLES = testCase!.title
+  // attributeResults (runExecution.ts) only attributes an outcome to a
+  // TestCase with filePath set — matching against the real file just
+  // written above, same convention generateTestFileForTestCase uses.
+  testCase!.filePath = 'login-ui/login.test.mjs'
   return { dir, project, testCase: testCase! }
 }
 
 test('runElementTestSuite: an all-pass run flips a coded requirement to tested', async () => {
-  const { dir, project } = await setUpProjectWithTest('all-pass')
+  const { dir, project } = await setUpProjectWithTest(true)
   try {
     const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
 
@@ -78,12 +88,11 @@ test('runElementTestSuite: an all-pass run flips a coded requirement to tested',
     assert.equal(project.requirements[0].status, 'tested')
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
 test('runFullRegression after tested flips the requirement to complete', async () => {
-  const { dir, project } = await setUpProjectWithTest('all-pass')
+  const { dir, project } = await setUpProjectWithTest(true)
   try {
     await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
     assert.equal(project.requirements[0].status, 'tested')
@@ -94,21 +103,20 @@ test('runFullRegression after tested flips the requirement to complete', async (
     assert.equal(project.requirements[0].status, 'complete')
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
 test('a regression run introducing a failure holds status until triaged, then re-evaluating the same run regresses it to tested-fail', async () => {
-  const { dir, project } = await setUpProjectWithTest('all-pass')
+  const { dir, project } = await setUpProjectWithTest(true)
   try {
     await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
     await runFullRegression(project, dir, 'manual')
     assert.equal(project.requirements[0].status, 'complete')
 
-    // The implementation regresses (mode flips to all-fail). The
+    // The implementation regresses — rewrite the same file to now fail. The
     // regression pass that first sees the new failure has no triage yet,
     // so status must be held at 'complete' even though a test just failed.
-    process.env.FAKE_TEST_MODE = 'all-fail'
+    await writeTestFile(sourceTreeRoot(dir), 'login-ui', 'login.test.mjs', false)
     const regression = await runFullRegression(project, dir, 'manual')
     assert.equal(regression.allPassed, false)
     assert.equal(project.requirements[0].status, 'complete', 'held until triage completes')
@@ -131,12 +139,11 @@ test('a regression run introducing a failure holds status until triaged, then re
     assert.equal(project.requirements[0].status, 'tested-fail')
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
 test('evaluateRequirementStatus re-evaluates a single element-scoped run after triage without re-running tests', async () => {
-  const { dir, project } = await setUpProjectWithTest('all-fail')
+  const { dir, project } = await setUpProjectWithTest(false)
   try {
     const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
     assert.equal(project.requirements[0].status, 'coded', 'held — untriaged failure')
@@ -148,12 +155,11 @@ test('evaluateRequirementStatus re-evaluates a single element-scoped run after t
     assert.equal(project.requirements[0].status, 'coded')
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
 test('a failing test with no triage yet leaves requirement status completely unchanged', async () => {
-  const { dir, project } = await setUpProjectWithTest('all-fail')
+  const { dir, project } = await setUpProjectWithTest(false)
   try {
     const before = project.requirements[0].status
     await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
@@ -161,23 +167,19 @@ test('a failing test with no triage yet leaves requirement status completely unc
     assert.equal(project.requirements[0].status, before, 'status must not change until triage completes')
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
-test('runElementTestSuite: a test case with no generated file is left untouched, not inheriting the aggregate outcome of a real test in the same scope', async () => {
-  // Deliberately does NOT reuse setUpProjectWithTest — needs two test cases
-  // in the same scope, only one of which has filePath set, to reproduce
-  // the exact real-world bug this guard fixes: running one generated
-  // test's command previously marked every OTHER (never-generated) test
-  // case in the same element as passing too, via attributeOutcomes' whole-
-  // scope aggregate fallback.
-  process.env.FAKE_TEST_MODE = 'nonzero-exit' // no parseable per-test lines -> forces the aggregate-fallback path
+test('runElementTestSuite: a test case with no generated file is left untouched by another test file\'s outcome in the same scope', async () => {
+  // Two TestCases in the same scope, only one of which has filePath (and a
+  // real backing file) set — reproduces the exact real-world bug this
+  // guard fixes: a never-generated test case must never inherit some other
+  // file's pass/fail just because it shares the element.
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
     await scaffoldProjectSourceTree(project, dir)
-    await writeElementTestCommand(sourceTreeRoot(dir), 'login-ui', { command: 'node', args: [fixture] })
+    await writeTestFile(sourceTreeRoot(dir), 'login-ui', 'login.test.mjs', false)
 
     const { testCase: generatedTest } = createTestCase(project, {
       type: 'functional',
@@ -185,7 +187,7 @@ test('runElementTestSuite: a test case with no generated file is left untouched,
       requirementIds: ['REQ-001'],
       architectureElementId: 'ARCH-001',
     })
-    generatedTest!.filePath = 'login-ui/login.test.ts'
+    generatedTest!.filePath = 'login-ui/login.test.mjs'
 
     const { testCase: ungeneratedTest } = createTestCase(project, {
       type: 'functional',
@@ -198,21 +200,19 @@ test('runElementTestSuite: a test case with no generated file is left untouched,
 
     const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
 
-    assert.equal(run.exitCode, 1)
     assert.deepEqual(
       run.outcomes.map((o) => o.testCaseId),
       [generatedTest!.id],
-      'only the test case with a generated file gets an outcome',
+      'only the test case with a generated (and matched) file gets an outcome',
     )
     assert.equal(generatedTest!.status, 'failing')
     assert.equal(
       ungeneratedTest!.status,
       ungeneratedStatusBefore,
-      'a never-generated test case must not inherit the aggregate outcome',
+      'a never-generated test case must not inherit another file\'s outcome',
     )
   } finally {
     await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_TEST_TITLES
   }
 })
 
@@ -225,6 +225,66 @@ test('runElementTestSuite rejects a scope that has never been scaffolded, withou
 
     assert.deepEqual(run.outcomes, [])
     assert.equal(run.exitCode, null)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runElementTestSuite reports a test file with no matching TestCase as an SW outcome, not a requirement-traced one', async () => {
+  const { dir, project, testCase } = await setUpProjectWithTest(true)
+  try {
+    // The coding agent's own inline test file, alongside the one real
+    // requirement-traced TestCase already set up by setUpProjectWithTest —
+    // never registered via Test Creation, so it has no TestCase/filePath
+    // link at all.
+    await writeTestFile(sourceTreeRoot(dir), 'login-ui', 'edge-cases.test.mjs', true)
+
+    const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
+
+    assert.deepEqual(
+      run.outcomes.map((o) => o.testCaseId),
+      [testCase.id],
+      'the known TestCase still gets its own requirement-traced outcome',
+    )
+    assert.deepEqual(
+      run.swOutcomes,
+      [{ name: 'edge-cases.test.mjs', passed: true }],
+      'the untraced file is reported separately as an SW outcome, not folded into outcomes',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runFullRegression sweeps an architecture element with no requirement-based TestCases at all, so its SW tests still run', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    // Second element with zero TestCases — only SW-based (coding-agent)
+    // tests live here.
+    project.architecture!.elements.push({
+      id: 'ARCH-002',
+      kind: 'functional',
+      name: 'Game Engine',
+      responsibility: 'Runs the game loop',
+      row: 0,
+      col: 1,
+      rowSpan: 1,
+      colSpan: 1,
+      interfaces: [],
+      elementInterfaces: [],
+    })
+    await scaffoldProjectSourceTree(project, dir)
+    await writeTestFile(sourceTreeRoot(dir), 'game-engine', 'tick.test.mjs', true)
+
+    const regression = await runFullRegression(project, dir, 'manual')
+
+    const swRun = regression.runIds
+      .map((id) => project.testRuns!.find((r) => r.id === id)!)
+      .find((r) => r.architectureElementId === 'ARCH-002')
+    assert.ok(swRun, 'the zero-TestCase element still got its own element-scoped run')
+    assert.deepEqual(swRun!.outcomes, [], 'no requirement-traced outcomes, since it has no TestCase')
+    assert.deepEqual(swRun!.swOutcomes, [{ name: 'tick.test.mjs', passed: true }])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

@@ -16,3 +16,5 @@ export {
   evaluateRequirementStatusForRegression,
 } from './runExecution.js'
 export type { RunElementTestSuiteScope } from './runExecution.js'
+export { scopeReadinessEntries } from './scopeReadiness.js'
+export type { ScopeReadiness, ScopeReadinessEntry } from './scopeReadiness.js'

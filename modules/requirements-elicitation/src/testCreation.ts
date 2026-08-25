@@ -22,7 +22,7 @@ export interface CreateTestCaseFields {
   type: TestType
   title: string
   requirementIds?: string[]
-  interfaceContractRef?: { fromId: string; toId: string }
+  interfaceDefinitionId?: string
   architectureElementId?: string | null
   interfaceElementIds?: [string, string]
 }
@@ -41,7 +41,7 @@ export interface CreateTestCaseResult {
 }
 
 // The requirement traceability gate (Area E, resolved) — mechanical,
-// checked here against project.requirements / architecture.interfaceContracts
+// checked here against project.requirements / architecture.interfaceDefinitions
 // directly, never trusting the caller's claim that a link is valid. Every
 // TestCase persisted into project.testSuite has gone through this
 // function; there is no other path that pushes onto suite.tests. On
@@ -66,18 +66,16 @@ export function createTestCase(project: Project, fields: CreateTestCaseFields): 
       return { testCase: null, rejected: 'requirement-not-allocated-to-element' }
     }
   } else {
-    if (!fields.interfaceContractRef) {
+    if (!fields.interfaceDefinitionId) {
       return { testCase: null, rejected: 'no-contract-ref' }
     }
-    const { fromId, toId } = fields.interfaceContractRef
-    const key = [fromId, toId].sort().join('|')
-    const contract = (project.architecture?.interfaceContracts ?? []).find(
-      (c) => [c.fromId, c.toId].sort().join('|') === key,
+    const definition = (project.architecture?.interfaceDefinitions ?? []).find(
+      (d) => d.id === fields.interfaceDefinitionId,
     )
-    if (!contract) {
+    if (!definition) {
       return { testCase: null, rejected: 'contract-not-found' }
     }
-    if (contract.status !== 'defined' || contract.operations.length === 0) {
+    if (definition.status !== 'defined' || definition.operations.length === 0) {
       return { testCase: null, rejected: 'contract-not-defined' }
     }
   }
@@ -88,7 +86,7 @@ export function createTestCase(project: Project, fields: CreateTestCaseFields): 
     type: fields.type,
     title: fields.title,
     requirementIds: fields.requirementIds ?? [],
-    interfaceContractRef: fields.interfaceContractRef,
+    interfaceDefinitionId: fields.interfaceDefinitionId,
     architectureElementId: fields.architectureElementId ?? null,
     interfaceElementIds: fields.interfaceElementIds,
     status: 'not-run',
@@ -251,22 +249,21 @@ export async function generateIntegrationTestsForContract(
   if (!fromElement || !toElement) {
     throw new Error('Both architecture elements must exist to generate integration tests')
   }
-  const key = [fromId, toId].sort().join('|')
-  const contract = (project.architecture.interfaceContracts ?? []).find(
-    (c) => [c.fromId, c.toId].sort().join('|') === key,
+  const definition = (project.architecture.interfaceDefinitions ?? []).find(
+    (d) => d.participants.some((p) => p.elementId === fromId) && d.participants.some((p) => p.elementId === toId),
   )
-  if (!contract || contract.status !== 'defined' || contract.operations.length === 0) {
+  if (!definition || definition.status !== 'defined' || definition.operations.length === 0) {
     throw new Error('This interface connection has no defined contract with operations — run Define Interfaces first')
   }
 
-  const messages = buildIntegrationTestProposalMessages(fromElement, toElement, contract)
+  const messages = buildIntegrationTestProposalMessages(fromElement, toElement, definition)
   const result = await llmClient.chat(messages, llmOptions)
 
   if (result.content.trim() === 'NONE') {
     return { tests: [], rejected: [], usage: result.usage }
   }
 
-  const validOperationNames = new Set(contract.operations.map((op) => op.name))
+  const validOperationNames = new Set(definition.operations.map((op) => op.name))
   const tests: TestCase[] = []
   const rejected: RejectedProposal[] = []
   for (const m of result.content.matchAll(TEST_LINE)) {
@@ -276,7 +273,7 @@ export async function generateIntegrationTestsForContract(
     const { testCase, rejected: reason } = createTestCase(project, {
       type: 'integration',
       title,
-      interfaceContractRef: { fromId, toId },
+      interfaceDefinitionId: definition.id,
       interfaceElementIds: [fromId, toId],
     })
     if (testCase) {
@@ -317,10 +314,8 @@ export async function generateAllTestsForUnplannedElements(
   const testedRequirementIds = new Set(
     tested.filter((t) => t.type === 'functional').flatMap((t) => t.requirementIds),
   )
-  const testedContractKeys = new Set(
-    tested
-      .filter((t) => t.type === 'integration' && t.interfaceContractRef)
-      .map((t) => [t.interfaceContractRef!.fromId, t.interfaceContractRef!.toId].sort().join('|')),
+  const testedDefinitionIds = new Set(
+    tested.filter((t) => t.type === 'integration' && t.interfaceDefinitionId).map((t) => t.interfaceDefinitionId!),
   )
 
   const allTests: TestCase[] = []
@@ -337,14 +332,13 @@ export async function generateAllTestsForUnplannedElements(
     usage = addUsage(usage, result.usage)
   }
 
-  const definedContracts = new Set(
-    (project.architecture.interfaceContracts ?? [])
-      .filter((c) => c.status === 'defined' && c.operations.length > 0)
-      .map((c) => [c.fromId, c.toId].sort().join('|')),
-  )
+  const definitions = project.architecture.interfaceDefinitions ?? []
   for (const pair of connectedPairs(project.architecture.elements)) {
-    const key = [pair.fromId, pair.toId].sort().join('|')
-    if (!definedContracts.has(key) || testedContractKeys.has(key)) continue
+    const definition = definitions.find(
+      (d) => d.participants.some((p) => p.elementId === pair.fromId) && d.participants.some((p) => p.elementId === pair.toId),
+    )
+    if (!definition || definition.status !== 'defined' || definition.operations.length === 0) continue
+    if (testedDefinitionIds.has(definition.id)) continue
     const result = await generateIntegrationTestsForContract(project, llmClient, pair.fromId, pair.toId, llmOptions)
     allTests.push(...result.tests)
     allRejected.push(...result.rejected)

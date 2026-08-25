@@ -21,11 +21,6 @@ import { DashboardScreen } from './screens/DashboardScreen'
 import { PhasePlaceholder } from './screens/PhasePlaceholder'
 import { RequirementsScreen } from './screens/RequirementsScreen'
 import { ArchitectureScreen } from './screens/ArchitectureScreen'
-// PlanningScreen intentionally NOT imported here (hide-not-delete) — the
-// file itself is unmodified and fully functional, it's simply never
-// rendered by this component. 'planning' can never be the active phase
-// once it's out of defaultPhases() (see httpApi.ts), so this removed
-// import/branch is what actually makes Planning unreachable from the UI.
 import { CodingScreen } from './screens/CodingScreen'
 import { TestCreationScreen } from './screens/TestCreationScreen'
 import { TestExecutionScreen } from './screens/TestExecutionScreen'

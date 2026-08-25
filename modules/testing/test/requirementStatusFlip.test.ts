@@ -133,7 +133,7 @@ test('an integration test outcome counts toward every requirement on either side
     type: 'integration',
     title: 'Charges the card',
     requirementIds: [],
-    interfaceContractRef: { fromId: 'ARCH-001', toId: 'ARCH-002' },
+    interfaceDefinitionId: 'IFACE-001',
     architectureElementId: null,
     interfaceElementIds: ['ARCH-001', 'ARCH-002'],
     status: 'not-run',

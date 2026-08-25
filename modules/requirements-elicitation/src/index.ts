@@ -16,8 +16,11 @@ export type {
   ArchitectureElementKind,
   ArchitectureConflict,
   ArchitectureConflictKind,
-  InterfaceContract,
+  InterfaceRole,
+  InterfaceDefinition,
+  ElementInterfaceDefinition,
   InterfaceContractOperation,
+  IncompleteOperation,
   PhaseTabGating,
   ProjectSettings,
   ConflictCheckRecord,
@@ -38,13 +41,6 @@ export type {
   MigrationAction,
   MigrationStory,
   MigrationPlanRecord,
-  StoryStatus,
-  ResearchOption,
-  Research,
-  Story,
-  Backlog,
-  StorySequencingConflictKind,
-  StorySequencingConflict,
   CodingRunStatus,
   CodingRun,
   UnitTestMode,
@@ -56,6 +52,7 @@ export type {
   ImportedTestCaseSet,
   TestOutcomeTriage,
   TestCaseOutcome,
+  SwTestOutcome,
   TestRunKind,
   TestRun,
   TestRegressionRun,
@@ -71,14 +68,15 @@ export {
   removeLayer,
   checkArchitectureConflicts,
   autoConfigureAndAllocate,
-  autoAllocateHeuristic,
   autoAllocateLlm,
   chatWithArchitect,
   acceptProposedInterface,
   removeArchitectureInterface,
   checkInterfaceConflict,
-  defineInterfaceContract,
-  defineAllInterfaceContracts,
+  defineInterfaceDefinition,
+  defineAllInterfaceDefinitions,
+  setInterfaceDefinition,
+  reconcileElementInterface,
   checkInterfaces,
   nextFreeColumn,
   EXTERNAL_CONTEXT_ROW,
@@ -94,8 +92,8 @@ export type {
   ProposedArchitectureElement,
   ProposedInterface,
   CheckInterfaceConflictResult,
-  DefineInterfaceContractResult,
-  DefineAllInterfaceContractsResult,
+  DefineInterfaceDefinitionResult,
+  DefineAllInterfaceDefinitionsResult,
   CheckInterfacesResult,
 } from './architecture.js'
 export {
@@ -103,6 +101,8 @@ export {
   getProjectSettings,
   updateProjectSettings,
 } from './projectSettings.js'
+export { generateProjectOverview } from './projectOverview.js'
+export type { GenerateProjectOverviewResult } from './projectOverview.js'
 export { ProjectStore } from './store.js'
 export type { ProjectStoreOptions } from './store.js'
 export type { LlmRole, LlmMessage, LlmClient, LlmCallOptions, LlmUsage, LlmChatResult } from './LlmClient.js'
@@ -116,36 +116,6 @@ export {
   buildSplitPrompt,
 } from './analystPersona.js'
 export { DEFAULT_ARCHITECT_SYSTEM_PROMPT, buildArchitectChatMessages } from './architecturePersona.js'
-export {
-  createStory,
-  updateStory,
-  deleteStory,
-  addStoryDependency,
-  removeStoryDependency,
-  detectCircularStoryDependencies,
-  sequenceStories,
-  generateStoriesForElement,
-  generateStoriesForAllUnplannedElements,
-  researchStory,
-  chatWithPM,
-} from './planning.js'
-export type {
-  CreateStoryFields,
-  UpdateStoryFields,
-  GenerateStoriesResult,
-  GenerateAllStoriesResult,
-  ResearchStoryResult,
-  ProposedStory,
-  ChatWithPMResult,
-} from './planning.js'
-export {
-  STORY_DECOMPOSITION_SYSTEM_PROMPT,
-  buildPlanningStoryMessages,
-  RESEARCH_STORY_SYSTEM_PROMPT,
-  buildResearchMessages,
-  DEFAULT_PM_SYSTEM_PROMPT,
-  buildPlanningChatMessages,
-} from './planningPersona.js'
 export {
   createTestCase,
   updateTestCase,
@@ -184,11 +154,13 @@ export {
 export {
   TEST_FAILURE_TRIAGE_SYSTEM_PROMPT,
   buildTriageMessages,
+  buildUserReportedIssueTriageMessages,
   DEFAULT_QA_TEST_EXECUTION_SYSTEM_PROMPT,
   buildTestExecutionChatMessages,
+  formatCodeContextForTriage,
 } from './testExecutionPersona.js'
-export { triageTestFailure, confirmTestCaseFailure, chatWithQATestExecution } from './testExecution.js'
-export type { TriageTestFailureResult, ChatWithQATestExecutionResult } from './testExecution.js'
+export { triageTestFailure, confirmTestCaseFailure, chatWithQATestExecution, classifyAndDispatchUserReportedIssue } from './testExecution.js'
+export type { TriageTestFailureResult, ChatWithQATestExecutionResult, UserReportedIssueDispatch, ClassifyUserReportedIssueResult } from './testExecution.js'
 export {
   CODE_GAP_SCAN_SYSTEM_PROMPT,
   DOCUMENT_IMPORT_SYSTEM_PROMPT,

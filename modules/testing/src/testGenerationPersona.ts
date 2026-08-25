@@ -20,13 +20,11 @@ function formatRequirements(project: Project, requirementIds: string[]): string 
 }
 
 function formatContractOperation(project: Project, testCase: TestCase): string {
-  const ref = testCase.interfaceContractRef
-  if (!ref) return '(no contract reference)'
-  const contract = (project.architecture?.interfaceContracts ?? []).find(
-    (c) => [c.fromId, c.toId].sort().join('|') === [ref.fromId, ref.toId].sort().join('|'),
-  )
-  if (!contract) return '(contract not found)'
-  return contract.operations
+  const definitionId = testCase.interfaceDefinitionId
+  if (!definitionId) return '(no contract reference)'
+  const definition = (project.architecture?.interfaceDefinitions ?? []).find((d) => d.id === definitionId)
+  if (!definition) return '(contract not found)'
+  return definition.operations
     .map((op) => `- ${op.name}: ${op.description} (request: ${op.request}; response: ${op.response}; errors: ${op.errors || 'none'})`)
     .join('\n')
 }
@@ -66,7 +64,7 @@ export function buildTestGenerationPrompt(
     )
   }
   parts.push(
-    `On the LAST line of your final response, output exactly one line starting with "${RUN_COMMAND_MARKER}" followed by the command and args needed to run this test from ${allowedRelativePrefix}/ as the working directory (e.g. "${RUN_COMMAND_MARKER} node test.mjs ./index.html", or "${RUN_COMMAND_MARKER} npx vitest run" if that convention already fits). This must be a plain, directly-runnable command — no shell operators, no package.json script indirection. Include it every time, even when reusing the existing convention.`,
+    `On the LAST line of your final response TEXT (never inside the test file itself, and never as a comment in any file) output exactly one line starting with "${RUN_COMMAND_MARKER}" followed by the command and args needed to run THIS test file on its own from ${allowedRelativePrefix}/ as the working directory (e.g. "${RUN_COMMAND_MARKER} node test.mjs ./index.html", or "${RUN_COMMAND_MARKER} npx vitest run wall-collision.test.ts" if that convention already fits). This must be a plain, directly-runnable command — no shell operators, no package.json script indirection. Include it every time, even when reusing the existing convention. The test file you write must be valid, directly-runnable source code on its own and must NOT contain this "${RUN_COMMAND_MARKER}" line or any other non-code text appended to it — the file has to execute cleanly by itself.`,
   )
   if (testCase.type === 'functional') {
     parts.push('This is a functional test verifying the following requirement(s):')

@@ -35,6 +35,30 @@ function applyLegacyDefaults(project: Project): Project {
       requirement.provenance = 'human'
     }
   }
+  // Architecture elements saved before elementInterfaces existed (the
+  // per-element interface-contract feature) have no such field at all —
+  // default to [] rather than leaving it undefined, since every call site
+  // (seedElementInterface, markParticipantsMisaligned, etc.) assumes it's
+  // always an array and calls .find/.push on it directly.
+  if (project.architecture) {
+    for (const element of project.architecture.elements) {
+      if (!element.elementInterfaces) {
+        element.elementInterfaces = []
+      }
+    }
+    // Same gap for nextInterfaceSeq (added alongside interfaceDefinitions,
+    // after some architectures were already created) — left undefined,
+    // nextInterfaceId's `seq + 1` silently produces NaN, yielding ids like
+    // "IFACE-NaN" instead of throwing. Seed it from the highest numeric
+    // IFACE-NNN id already present (0 if none), so newly generated ids
+    // continue the existing sequence instead of colliding/misordering.
+    if (typeof project.architecture.nextInterfaceSeq !== 'number') {
+      const existingSeqs = (project.architecture.interfaceDefinitions ?? [])
+        .map((d) => Number(d.id.replace('IFACE-', '')))
+        .filter((n) => Number.isFinite(n))
+      project.architecture.nextInterfaceSeq = existingSeqs.length > 0 ? Math.max(...existingSeqs) + 1 : 1
+    }
+  }
   return project
 }
 

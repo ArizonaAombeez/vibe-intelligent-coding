@@ -9,8 +9,11 @@ import type {
   ArchitectureElement,
   ArchitectureElementKind,
   ArchitectureTypeId,
-  InterfaceContract,
+  ElementInterfaceDefinition,
+  IncompleteOperation,
+  InterfaceDefinition,
   InterfaceContractOperation,
+  InterfaceRole,
   Project,
   Requirement,
 } from './types.js'
@@ -39,6 +42,7 @@ export function setArchitectureType(project: Project, typeId: ArchitectureTypeId
     layers: [...(preset?.defaultLayers ?? [])],
     elements: [],
     nextElementSeq: 1,
+    nextInterfaceSeq: 1,
   }
 }
 
@@ -80,6 +84,7 @@ export function createArchitectureElement(
     rowSpan: fields.rowSpan ?? 1,
     colSpan: fields.colSpan ?? 1,
     interfaces: fields.interfaces ?? [],
+    elementInterfaces: [],
   }
   architecture.nextElementSeq = seq + 1
   architecture.elements.push(element)
@@ -300,10 +305,14 @@ an "external" module — these represent context, not something to be built.
 
 Reply using exactly these line formats, one per line, nothing else:
 
-MODULE: <kind>|<layer>|<name>|<short responsibility>
+MODULE: <kind>|<layer>|<name>|<responsibility>
   kind is one of: functional, service, interface-spine, runtime, external
   layer is one of the layers listed above, or the word NONE for an
   external module (external modules are not placed on a layer).
+  responsibility should be one or two sentences, concrete enough to later
+  infer what data/calls cross this module's interfaces from it alone (what
+  it owns, what it reads or receives, what it produces or reports) — not
+  just a category label.
 
 ALLOCATE: <requirement id>|<module name>
   One line per requirement passed to you. <module name> must exactly match
@@ -460,93 +469,6 @@ export interface AutoAllocateResult {
   usage?: LlmUsage
 }
 
-// Small English stopword set for the heuristic allocator's keyword-overlap
-// scoring — just enough to stop "the"/"a"/"shall" etc. from dominating the
-// match score, not a full NLP stack (this is a first-pass local fallback,
-// not a replacement for the LLM mode).
-const STOPWORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'of', 'to', 'in', 'on', 'for', 'with', 'is',
-  'are', 'be', 'shall', 'must', 'should', 'will', 'this', 'that', 'it', 'as',
-  'by', 'at', 'from', 'when', 'if', 'then', 'not', 'so', 'can', 'may',
-])
-
-function significantWords(text: string): Set<string> {
-  return new Set(
-    text
-      .toLowerCase()
-      .split(/[^a-z0-9]+/)
-      .filter((word) => word.length > 2 && !STOPWORDS.has(word)),
-  )
-}
-
-// Lightweight cues nudging the heuristic allocator toward interface/runtime
-// -flavoured elements for requirements whose text implies that kind of
-// behaviour — not a real classifier, just enough signal to break ties
-// between otherwise similarly-scored candidate elements.
-const INTERFACE_CUES = ['interface', 'protocol', 'api', 'sends', 'receives', 'message', 'endpoint']
-const RUNTIME_CUES = ['scheduling', 'real-time', 'realtime', 'deadline', 'latency', 'concurrent', 'timing']
-
-function kindBias(requirementWords: Set<string>, kind: ArchitectureElementKind): number {
-  if (kind === 'interface-spine' && INTERFACE_CUES.some((cue) => requirementWords.has(cue))) return 1
-  if (kind === 'runtime' && RUNTIME_CUES.some((cue) => requirementWords.has(cue))) return 1
-  return 0
-}
-
-function scoreRequirementAgainstElement(
-  requirementWords: Set<string>,
-  element: ArchitectureElement,
-): number {
-  const elementWords = significantWords(`${element.name} ${element.responsibility}`)
-  let overlap = 0
-  for (const word of requirementWords) {
-    if (elementWords.has(word)) overlap++
-  }
-  return overlap + kindBias(requirementWords, element.kind)
-}
-
-// "Auto Allocate" (Area B, heuristic mode) — local, non-LLM keyword-overlap
-// matching of unallocated requirements onto the *existing* architecture.
-// Never creates elements (unlike autoConfigureAndAllocate above); requires
-// at least one element to allocate onto. Requirements that don't score
-// above the minimum threshold against any element are left unallocated
-// rather than guessed at.
-export function autoAllocateHeuristic(project: Project): AutoAllocateResult {
-  const architecture = requireArchitecture(project)
-  if (architecture.elements.length === 0) {
-    throw new Error('Add at least one architecture element before running Auto Allocate')
-  }
-  const unallocated = project.requirements.filter((r) => !r.deletedAt && r.architectureElements.length === 0)
-
-  const allocatedRequirementIds: string[] = []
-  const unallocatedRequirementIds: string[] = []
-  const MIN_SCORE = 1
-
-  for (const requirement of unallocated) {
-    const requirementWords = significantWords(
-      requirement.allocationRationale
-        ? `${requirement.text} ${requirement.allocationRationale}`
-        : requirement.text,
-    )
-    let best: ArchitectureElement | null = null
-    let bestScore = 0
-    for (const element of architecture.elements) {
-      const score = scoreRequirementAgainstElement(requirementWords, element)
-      if (score > bestScore) {
-        best = element
-        bestScore = score
-      }
-    }
-    if (best && bestScore >= MIN_SCORE) {
-      addRequirementToElement(project, requirement.id, best.id)
-      allocatedRequirementIds.push(requirement.id)
-    } else {
-      unallocatedRequirementIds.push(requirement.id)
-    }
-  }
-
-  return { allocatedRequirementIds, unallocatedRequirementIds }
-}
-
 const AUTO_ALLOCATE_SYSTEM_PROMPT = `You are the Architect. Allocate each given requirement to the existing
 architecture module that satisfies it. Do not propose any new modules — only
 choose among the modules listed below.
@@ -568,8 +490,9 @@ single word: NONE.`
 // chunking rationale in codeImport.ts's proposeCodeGapRequirementsPerFile.
 const AUTO_ALLOCATE_BATCH_SIZE = 20
 
-// "Auto Allocate" (Area B, LLM mode) — same allocation-only scope as
-// autoAllocateHeuristic, but via one or more LLM calls (batched, see
+// "Auto Allocate" (Area B, LLM mode) — allocates unallocated requirements
+// onto the *existing* architecture (never creates elements, unlike
+// autoConfigureAndAllocate above) via one or more LLM calls (batched, see
 // AUTO_ALLOCATE_BATCH_SIZE) for higher-confidence matching. Reuses the
 // existing ALLOCATE_LINE format/regex so both this and
 // autoConfigureAndAllocate parse replies identically. The server route is a
@@ -682,7 +605,9 @@ export async function chatWithArchitect(
 // Accepts a single proposed interface connection by element id (the UI
 // resolves proposal module names to real element ids once both ends
 // exist) — same push-if-absent semantics as autoConfigureAndAllocate's
-// INTERFACE_LINE handling above.
+// INTERFACE_LINE handling above. Only touches the raw connectivity graph
+// (element.interfaces) — a covering InterfaceDefinition is created/edited
+// separately via defineInterfaceDefinition/setInterfaceDefinition.
 export function acceptProposedInterface(
   project: Project,
   fromId: string,
@@ -785,34 +710,184 @@ export function connectedPairs(elements: ArchitectureElement[]): Array<{ fromId:
   return pairs
 }
 
-const OPERATION_LINE = /^OPERATION:\s*([^|]+)\|\s*([^|]*)\|\s*([^|]*)\|\s*([^|]*)\|\s*(.*)$/gm
+// The trailing range/resolution/unit/update-frequency fields (Area B,
+// interface data-contract requirement) are optional on the line itself —
+// captured only when the Architect's reply includes them — so a reply still
+// using the older 5-field OPERATION format (name|description|request|
+// response|errors) parses exactly as it always did, just with the new
+// fields left undefined rather than failing to match.
+const OPERATION_LINE =
+  /^OPERATION:\s*([^|\n]+)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)(?:\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*))?$/gm
 
-function parseOperations(reply: string): InterfaceContractOperation[] {
-  return Array.from(reply.matchAll(OPERATION_LINE), (m) => ({
-    name: m[1].trim(),
-    description: m[2].trim(),
-    request: m[3].trim(),
-    response: m[4].trim(),
-    errors: m[5].trim() === 'NONE' ? '' : m[5].trim(),
-  }))
+// Distinguishes "the Architect considered this field and it doesn't apply"
+// (the reply literally said NONE, e.g. a login RPC has no physical unit)
+// from "this field was never answered at all" (undefined — only possible
+// via the older 5-field OPERATION line, which has no trailing group to
+// capture at all). checkInterfaces' completeness check treats an explicit
+// 'N/A' as satisfied, since the Architect made a real judgement call on it;
+// only true undefined counts as an incomplete gap.
+function noneToNA(value: string | undefined): string | undefined {
+  const trimmed = value?.trim()
+  if (value === undefined) return undefined
+  return !trimmed || trimmed === 'NONE' ? 'N/A' : trimmed
 }
 
-export interface DefineInterfaceContractResult {
-  contract: InterfaceContract
+function parseOperations(reply: string): InterfaceContractOperation[] {
+  return Array.from(reply.matchAll(OPERATION_LINE), (m) => {
+    const updateFrequencyField = m[9]?.trim()
+    const drivenDirectly = updateFrequencyField === 'DRIVEN' ? true : undefined
+    return {
+      name: m[1].trim(),
+      description: m[2].trim(),
+      request: m[3].trim(),
+      response: m[4].trim(),
+      errors: m[5].trim() === 'NONE' ? '' : m[5].trim(),
+      range: noneToNA(m[6]),
+      resolution: noneToNA(m[7]),
+      unit: noneToNA(m[8]),
+      updateFrequency: drivenDirectly ? undefined : noneToNA(updateFrequencyField),
+      drivenDirectly,
+    }
+  })
+}
+
+// Finds the InterfaceDefinition (if any) whose participants cover both
+// ends of a pair — the coverage lookup every pairwise-facing function below
+// needs, now that a definition can have more than 2 participants.
+function findDefinitionForPair(architecture: Architecture, fromId: string, toId: string): InterfaceDefinition | undefined {
+  return (architecture.interfaceDefinitions ?? []).find(
+    (d) => d.participants.some((p) => p.elementId === fromId) && d.participants.some((p) => p.elementId === toId),
+  )
+}
+
+// Every participant element's own ElementInterfaceDefinition entry for a
+// given master definition, resolved to the live element records.
+function participantElements(architecture: Architecture, definition: InterfaceDefinition): ArchitectureElement[] {
+  const ids = new Set(definition.participants.map((p) => p.elementId))
+  return architecture.elements.filter((e) => ids.has(e.id))
+}
+
+// Seeds/updates one participant element's own local copy to mirror the
+// master definition it belongs to — called whenever a definition's
+// operations or participant set changes. Every OTHER participant is marked
+// misaligned in the same pass (markParticipantsMisaligned below); this one
+// (the element whose operations were just authored through
+// defineInterfaceDefinition/setInterfaceDefinition) is seeded aligned,
+// since its copy was just made to match by construction.
+function seedElementInterface(
+  element: ArchitectureElement,
+  definition: InterfaceDefinition,
+  role: InterfaceRole,
+): void {
+  const existing = element.elementInterfaces.find((ei) => ei.masterDefinitionId === definition.id)
+  const entry: ElementInterfaceDefinition = {
+    masterDefinitionId: definition.id,
+    role,
+    operations: definition.operations.map((op) => ({ ...op })),
+    aligned: true,
+    reqsCheckedAt: existing?.reqsCheckedAt,
+  }
+  if (existing) {
+    Object.assign(existing, entry)
+  } else {
+    element.elementInterfaces.push(entry)
+  }
+}
+
+// The hard-block trigger (Area B/D, resolved): the instant a master
+// definition's operations or participant set changes, every OTHER
+// participant's own copy is immediately flagged aligned:false — not
+// lazily recomputed later. Coding's interfaceGateReasonForElement refuses
+// to run for any element with an aligned:false entry until a human
+// reconciles it (updates its own operations copy via
+// reconcileElementInterface below).
+function markParticipantsMisaligned(architecture: Architecture, definition: InterfaceDefinition, exceptElementId?: string): void {
+  for (const element of participantElements(architecture, definition)) {
+    if (element.id === exceptElementId) continue
+    const entry = element.elementInterfaces.find((ei) => ei.masterDefinitionId === definition.id)
+    if (entry) {
+      entry.aligned = false
+    } else {
+      const participant = definition.participants.find((p) => p.elementId === element.id)
+      element.elementInterfaces.push({
+        masterDefinitionId: definition.id,
+        role: participant?.role ?? 'both',
+        operations: [],
+        aligned: false,
+      })
+    }
+  }
+}
+
+export interface DefineInterfaceDefinitionResult {
+  definition: InterfaceDefinition
   usage?: LlmUsage
 }
 
-// Defines (or redefines) the structured contract for a single interface
-// connection — one LLM call per pair, asking the Architect to spell out the
-// operations crossing it. Persists into architecture.interfaceContracts,
-// replacing any existing entry for the same pair (order-independent).
-export async function defineInterfaceContract(
+// Shared persistence for both the LLM-authored path
+// (defineInterfaceDefinition) and the manual path (setInterfaceDefinition
+// below) — replaces any existing definition with the same id, or appends a
+// new one. Stamps updatedAt and marks every other participant misaligned
+// (the author's own element, if it's a participant, is seeded aligned by
+// the caller via seedElementInterface).
+function persistInterfaceDefinition(
+  project: Project,
+  architecture: Architecture,
+  definition: InterfaceDefinition,
+  authoredByElementId?: string,
+): void {
+  definition.updatedAt = new Date().toISOString()
+  const existing = architecture.interfaceDefinitions ?? []
+  architecture.interfaceDefinitions = [...existing.filter((d) => d.id !== definition.id), definition]
+
+  if (authoredByElementId) {
+    const authorRole = definition.participants.find((p) => p.elementId === authoredByElementId)?.role ?? 'both'
+    const author = architecture.elements.find((e) => e.id === authoredByElementId)
+    if (author) seedElementInterface(author, definition, authorRole)
+  }
+  markParticipantsMisaligned(architecture, definition, authoredByElementId)
+  void project
+}
+
+function nextInterfaceId(architecture: Architecture): string {
+  // Defensive against nextInterfaceSeq being missing/non-numeric on this
+  // architecture object, regardless of why — store.ts's applyLegacyDefaults
+  // backfills it on load for projects saved before the field existed, but
+  // that guard only runs once per load; relying on every caller to have
+  // gone through it first is exactly the fragile invariant that produced a
+  // real "IFACE-undefined" id in an existing project (String(undefined)
+  // padStart'd), which then broke prompt rendering for any element
+  // participating in that interface (see buildCodingPrompt's
+  // otherParticipantNames, which can't find a definition by that id).
+  // Falling back to a "highest existing IFACE-NNN id + 1" scan mirrors
+  // applyLegacyDefaults's own repair logic, so a bad seq self-heals here
+  // too instead of only being fixed at load time.
+  const seq =
+    typeof architecture.nextInterfaceSeq === 'number' && Number.isFinite(architecture.nextInterfaceSeq)
+      ? architecture.nextInterfaceSeq
+      : (() => {
+          const existingSeqs = (architecture.interfaceDefinitions ?? [])
+            .map((d) => Number(d.id.replace('IFACE-', '')))
+            .filter((n) => Number.isFinite(n))
+          return existingSeqs.length > 0 ? Math.max(...existingSeqs) + 1 : 1
+        })()
+  architecture.nextInterfaceSeq = seq + 1
+  return `IFACE-${String(seq).padStart(3, '0')}`
+}
+
+// Defines (or redefines) the structured master definition for a single
+// interface connection — one LLM call per pair, asking the Architect to
+// spell out the operations crossing it. Persists into
+// architecture.interfaceDefinitions, replacing any existing definition
+// covering this pair (creating a new 2-participant, both/both-role
+// definition if none exists yet).
+export async function defineInterfaceDefinition(
   project: Project,
   llmClient: LlmClient,
   fromId: string,
   toId: string,
   llmOptions?: LlmCallOptions,
-): Promise<DefineInterfaceContractResult> {
+): Promise<DefineInterfaceDefinitionResult> {
   const architecture = requireArchitecture(project)
   const from = architecture.elements.find((e) => e.id === fromId)
   const to = architecture.elements.find((e) => e.id === toId)
@@ -827,82 +902,255 @@ export async function defineInterfaceContract(
   const result = await llmClient.chat(messages, llmOptions)
   const operations = result.content.trim() === 'NONE' ? [] : parseOperations(result.content)
 
-  const contract: InterfaceContract = { fromId, toId, operations, status: 'defined' }
-  const existing = architecture.interfaceContracts ?? []
-  const key = [fromId, toId].sort().join('|')
-  architecture.interfaceContracts = [
-    ...existing.filter((c) => [c.fromId, c.toId].sort().join('|') !== key),
-    contract,
-  ]
-  return { contract, usage: result.usage }
+  const existing = findDefinitionForPair(architecture, fromId, toId)
+  const definition: InterfaceDefinition = existing
+    ? { ...existing, operations, status: 'defined' }
+    : {
+        id: nextInterfaceId(architecture),
+        name: `${from.name} ↔ ${to.name}`,
+        participants: [
+          { elementId: fromId, role: 'both' },
+          { elementId: toId, role: 'both' },
+        ],
+        operations,
+        status: 'defined',
+        updatedAt: '',
+      }
+  persistInterfaceDefinition(project, architecture, definition)
+  // Both sides are seeded aligned here (unlike the single-author case in
+  // setInterfaceDefinition) since the Architect authored both sides at once
+  // — there is no single "other participant" to leave misaligned.
+  for (const p of definition.participants) {
+    const element = architecture.elements.find((e) => e.id === p.elementId)
+    if (element) seedElementInterface(element, definition, p.role)
+  }
+  return { definition, usage: result.usage }
 }
 
-export interface DefineAllInterfaceContractsResult {
-  contracts: InterfaceContract[]
+// Manual counterpart to defineInterfaceDefinition — the human (Architect
+// persona's user) directly authors the participant list and operations for
+// one interface rather than asking the LLM, for the "list and edit all
+// interfaces" requirement (global + per-element manual CRUD). Same
+// persistence behaviour: replaces any existing definition with this id, or
+// creates a new one. Every participant must already exist AND already be
+// graph-connected (element.interfaces) to at least one other participant —
+// this only edits/creates the definition, it never creates the connection
+// itself (use acceptProposedInterface/manual element edit for that).
+export function setInterfaceDefinition(
+  project: Project,
+  definitionId: string | undefined,
+  name: string,
+  participants: Array<{ elementId: string; role: InterfaceRole }>,
+  operations: InterfaceContractOperation[],
+): InterfaceDefinition {
+  const architecture = requireArchitecture(project)
+  if (participants.length < 2) {
+    throw new Error('An interface definition needs at least 2 participants')
+  }
+  for (const p of participants) {
+    if (!architecture.elements.some((e) => e.id === p.elementId)) {
+      throw new Error(`Architecture element ${p.elementId} not found`)
+    }
+  }
+  const participantIds = new Set(participants.map((p) => p.elementId))
+  const anyConnected = participants.some((p) => {
+    const element = architecture.elements.find((e) => e.id === p.elementId)!
+    return element.interfaces.some((id) => participantIds.has(id))
+  })
+  if (!anyConnected) {
+    throw new Error('These elements are not connected — add the interface connection first')
+  }
+
+  const definition: InterfaceDefinition = {
+    id: definitionId ?? nextInterfaceId(architecture),
+    name,
+    participants,
+    operations,
+    status: 'defined',
+    updatedAt: '',
+  }
+  persistInterfaceDefinition(project, architecture, definition)
+  // The human authoring this form is editing every participant's shared
+  // understanding at once (unlike reconcileElementInterface, which edits
+  // just one element's own copy) — seed every participant aligned, same as
+  // the LLM path above.
+  for (const p of participants) {
+    const element = architecture.elements.find((e) => e.id === p.elementId)
+    if (element) seedElementInterface(element, definition, p.role)
+  }
+  return definition
+}
+
+// Reconciles one element's own local interface copy against its current
+// master definition — the human review step required before Coding
+// unblocks for that element (Area B/D, resolved: a master change hard-
+// blocks every participant until reviewed against that element's own
+// requirements and updated to match). Flips aligned back to true and
+// stamps reqsCheckedAt. Does not touch the master definition itself or any
+// other participant's copy.
+export function reconcileElementInterface(
+  project: Project,
+  elementId: string,
+  masterDefinitionId: string,
+  operations: InterfaceContractOperation[],
+): ElementInterfaceDefinition {
+  const architecture = requireArchitecture(project)
+  const element = architecture.elements.find((e) => e.id === elementId)
+  if (!element) {
+    throw new Error(`Architecture element ${elementId} not found`)
+  }
+  const entry = element.elementInterfaces.find((ei) => ei.masterDefinitionId === masterDefinitionId)
+  if (!entry) {
+    throw new Error(`${elementId} does not participate in interface ${masterDefinitionId}`)
+  }
+  entry.operations = operations
+  entry.aligned = true
+  entry.reqsCheckedAt = new Date().toISOString()
+  return entry
+}
+
+export interface DefineAllInterfaceDefinitionsResult {
+  definitions: InterfaceDefinition[]
   usage?: LlmUsage
 }
 
-// "Define Interfaces" action bar button — runs defineInterfaceContract for
-// every connected pair that doesn't already have a 'defined' contract,
-// leaving already-defined contracts untouched (same non-destructive re-run
+// "Define Interfaces" action bar button — runs defineInterfaceDefinition for
+// every connected pair not already covered by a 'defined' definition,
+// leaving already-defined ones untouched (same non-destructive re-run
 // behaviour as autoConfigureAndAllocate: topping up gaps, not redoing
-// everything on every click).
-export async function defineAllInterfaceContracts(
+// everything on every click). Pass force:true (the "Redefine All
+// Interfaces" action bar button) to instead re-ask the Architect for every
+// connected pair regardless of existing status — the bulk equivalent of the
+// per-interface "Redefine" action, needed e.g. to backfill new contract
+// fields (range/resolution/unit/update-frequency) onto definitions that
+// were defined before those fields existed. Only ever produces/tops-up
+// 2-participant definitions — consolidating multiple pairwise definitions
+// into one N-ary shared definition is a manual UI action, not automated.
+export async function defineAllInterfaceDefinitions(
   project: Project,
   llmClient: LlmClient,
   llmOptions?: LlmCallOptions,
-): Promise<DefineAllInterfaceContractsResult> {
+  force = false,
+): Promise<DefineAllInterfaceDefinitionsResult> {
   const architecture = requireArchitecture(project)
   const pairs = connectedPairs(architecture.elements)
-  const defined = new Set(
-    (architecture.interfaceContracts ?? [])
-      .filter((c) => c.status === 'defined')
-      .map((c) => [c.fromId, c.toId].sort().join('|')),
-  )
-  const pending = pairs.filter((p) => !defined.has([p.fromId, p.toId].sort().join('|')))
+  const pending = force
+    ? pairs
+    : pairs.filter((p) => {
+        const definition = findDefinitionForPair(architecture, p.fromId, p.toId)
+        return !definition || definition.status !== 'defined'
+      })
 
   let usage: LlmUsage | undefined
   for (const pair of pending) {
-    const result = await defineInterfaceContract(project, llmClient, pair.fromId, pair.toId, llmOptions)
+    const result = await defineInterfaceDefinition(project, llmClient, pair.fromId, pair.toId, llmOptions)
     usage = addUsage(usage, result.usage)
   }
-  return { contracts: architecture.interfaceContracts ?? [], usage }
+  return { definitions: architecture.interfaceDefinitions ?? [], usage }
 }
 
 export interface CheckInterfacesResult {
-  // Connected pairs with no contract at all, or whose contract has no
-  // operations (the LLM found nothing to define, which usually means the
-  // responsibility text is too vague to specify a contract from).
+  // Connected pairs with no covering definition at all, or whose
+  // definition has no operations (the LLM found nothing to define, which
+  // usually means the responsibility text is too vague to specify a
+  // definition from).
   undefinedPairs: Array<{ fromId: string; toId: string }>
-  // Contracts whose status is 'stale' (endpoint responsibility text
-  // changed since the contract was last defined).
-  staleContracts: InterfaceContract[]
+  // Definitions whose status is 'stale' (a participant's responsibility
+  // text changed since this definition was last defined).
+  staleContracts: InterfaceDefinition[]
+  // Operations on an otherwise-'defined' definition that are missing
+  // range/resolution/unit, or missing both updateFrequency and
+  // drivenDirectly (Area B, interface data-contract requirement) — distinct
+  // from undefinedPairs, which has no definition/operations to inspect at
+  // all.
+  incompleteOperations: IncompleteOperation[]
+  // Elements with at least one aligned:false entry — flagged the instant a
+  // master definition they participate in changes, until a human
+  // reconciles that element's own copy (reconcileElementInterface). Hard
+  // blocks Coding for that element (see interfaceGateReasonForElement in
+  // modules/coding).
+  misalignedElements: Array<{ elementId: string; masterDefinitionId: string }>
+  // Elements with an elementInterfaces entry whose masterDefinitionId does
+  // not match any real definition in architecture.interfaceDefinitions — a
+  // dangling reference, distinct from misalignment (aligned can be true on
+  // a dangling entry, since alignment only tracks staleness against a
+  // master that DOES exist). This shape is reachable from historical data:
+  // nextInterfaceId used to silently generate "IFACE-undefined" if
+  // nextInterfaceSeq was ever missing/non-numeric on an older project (see
+  // its own comment and store.ts's applyLegacyDefaults migration, which
+  // only repairs the counter going forward, not any id already generated
+  // wrong and persisted). Surfaced with the same hard-block treatment as
+  // misalignment (see interfaceGateReasonForElement) since there is no
+  // "operations" content to fall back on for a definition that doesn't
+  // exist at all — a human must re-author or remove the connection.
+  danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }>
   complete: boolean
 }
 
+function missingDataContractFields(op: InterfaceContractOperation): string[] {
+  const missing: string[] = []
+  if (!op.range) missing.push('range')
+  if (!op.resolution) missing.push('resolution')
+  if (!op.unit) missing.push('unit')
+  if (!op.updateFrequency && !op.drivenDirectly) missing.push('update frequency (or driven-directly)')
+  return missing
+}
+
 // "Check Interfaces" action bar button — a local, non-LLM pass over the
-// current architecture verifying every connection has a real contract
-// defined. Advisory only: unlike Check Conflicts this never blocks moving
-// to a later phase, it just surfaces what Define Interfaces hasn't covered
-// yet so the user can decide whether that's acceptable.
+// current architecture verifying every connection is covered by a real
+// definition, that each defined operation's data-contract detail
+// (range/resolution/unit/update-frequency) is fully specified, and that
+// every participant's own local copy is still aligned with its master.
+// Detection only, mirroring the Architecture-level conflict-check pattern
+// for undefinedPairs/incompleteOperations (resolution is always human) —
+// but misalignedElements is also read directly by Coding's hard gate
+// (interfaceGateReasonForElement, Area D), not just advisory.
 export function checkInterfaces(project: Project): CheckInterfacesResult {
   const architecture = requireArchitecture(project)
   const pairs = connectedPairs(architecture.elements)
-  const contracts = architecture.interfaceContracts ?? []
-  const contractByKey = new Map(contracts.map((c) => [[c.fromId, c.toId].sort().join('|'), c]))
+  const definitions = architecture.interfaceDefinitions ?? []
 
   const undefinedPairs: Array<{ fromId: string; toId: string }> = []
+  const incompleteOperations: IncompleteOperation[] = []
   for (const pair of pairs) {
-    const contract = contractByKey.get([pair.fromId, pair.toId].sort().join('|'))
-    if (!contract || contract.status !== 'defined' || contract.operations.length === 0) {
+    const definition = findDefinitionForPair(architecture, pair.fromId, pair.toId)
+    if (!definition || definition.status !== 'defined' || definition.operations.length === 0) {
       undefinedPairs.push(pair)
+      continue
+    }
+    for (const op of definition.operations) {
+      const missingFields = missingDataContractFields(op)
+      if (missingFields.length > 0) {
+        incompleteOperations.push({ fromId: pair.fromId, toId: pair.toId, operationName: op.name, missingFields })
+      }
     }
   }
-  const staleContracts = contracts.filter((c) => c.status === 'stale')
+  const staleContracts = definitions.filter((d) => d.status === 'stale')
+
+  const definitionIds = new Set(definitions.map((d) => d.id))
+  const misalignedElements: Array<{ elementId: string; masterDefinitionId: string }> = []
+  const danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }> = []
+  for (const element of architecture.elements) {
+    for (const entry of element.elementInterfaces) {
+      if (!definitionIds.has(entry.masterDefinitionId)) {
+        danglingElementInterfaces.push({ elementId: element.id, masterDefinitionId: entry.masterDefinitionId })
+        continue
+      }
+      if (!entry.aligned) misalignedElements.push({ elementId: element.id, masterDefinitionId: entry.masterDefinitionId })
+    }
+  }
 
   return {
     undefinedPairs,
     staleContracts,
-    complete: undefinedPairs.length === 0 && staleContracts.length === 0,
+    incompleteOperations,
+    misalignedElements,
+    danglingElementInterfaces,
+    complete:
+      undefinedPairs.length === 0 &&
+      staleContracts.length === 0 &&
+      incompleteOperations.length === 0 &&
+      misalignedElements.length === 0 &&
+      danglingElementInterfaces.length === 0,
   }
 }

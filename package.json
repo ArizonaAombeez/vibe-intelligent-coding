@@ -5,6 +5,7 @@
   "description": "VibeIntelligent Coding (VIC) — root workspace tying together the standalone modules and packages. Each modules/* package remains independently installable and testable on its own; this workspace only lets packages/server depend on them without publishing.",
   "workspaces": [
     "modules/*",
+    "modules/llm/*",
     "packages/*"
   ]
 }

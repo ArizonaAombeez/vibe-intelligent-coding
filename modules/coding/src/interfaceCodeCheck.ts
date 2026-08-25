@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
-import type { Architecture, ArchitectureElement, InterfaceContract } from 'vic-requirements-elicitation'
+import type { Architecture, ArchitectureElement, InterfaceDefinition } from 'vic-requirements-elicitation'
 import { connectedPairs } from 'vic-requirements-elicitation'
 import { SHARED_INTERFACES_DIRNAME, SOURCE_TREE_DIRNAME, elementSubfolderName, sharedInterfaceSubfolderName } from './scaffold.js'
 
@@ -129,16 +129,16 @@ export async function checkInterfaceCodeAlignment(
   architecture: Architecture,
 ): Promise<CheckInterfaceCodeAlignmentResult> {
   const elementById = new Map<string, ArchitectureElement>(architecture.elements.map((e) => [e.id, e]))
-  const contractByKey = new Map<string, InterfaceContract>(
-    (architecture.interfaceContracts ?? []).map((c) => [[c.fromId, c.toId].sort().join('|'), c]),
-  )
+  const definitions: InterfaceDefinition[] = architecture.interfaceDefinitions ?? []
   const srcRoot = path.join(projectDir, SOURCE_TREE_DIRNAME)
 
   const unimplementedOperations: UnimplementedOperation[] = []
   const undocumentedIdentifiers: UndocumentedOperation[] = []
 
   for (const pair of connectedPairs(architecture.elements)) {
-    const contract = contractByKey.get([pair.fromId, pair.toId].sort().join('|'))
+    const contract = definitions.find(
+      (d) => d.participants.some((p) => p.elementId === pair.fromId) && d.participants.some((p) => p.elementId === pair.toId),
+    )
     if (!contract || contract.status !== 'defined' || contract.operations.length === 0) continue
 
     const from = elementById.get(pair.fromId)

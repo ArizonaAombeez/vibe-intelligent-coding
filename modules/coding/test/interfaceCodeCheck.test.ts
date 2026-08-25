@@ -23,7 +23,7 @@ function architectureWithContract(operations: Array<{ name: string }>): Architec
         col: 0,
         rowSpan: 1,
         colSpan: 1,
-        interfaces: ['ARCH-002'],
+        interfaces: ['ARCH-002'], elementInterfaces: [],
       },
       {
         id: 'ARCH-002',
@@ -34,15 +34,21 @@ function architectureWithContract(operations: Array<{ name: string }>): Architec
         col: 1,
         rowSpan: 1,
         colSpan: 1,
-        interfaces: [],
+        interfaces: [], elementInterfaces: [],
       },
     ],
     nextElementSeq: 3,
-    interfaceContracts: [
+    nextInterfaceSeq: 2,
+    interfaceDefinitions: [
       {
-        fromId: 'ARCH-001',
-        toId: 'ARCH-002',
+        id: 'IFACE-001',
+        name: 'Login UI <-> Auth Service',
+        participants: [
+          { elementId: 'ARCH-001', role: 'both' },
+          { elementId: 'ARCH-002', role: 'both' },
+        ],
         status: 'defined',
+        updatedAt: new Date().toISOString(),
         operations: operations.map((op) => ({
           name: op.name,
           description: '',
@@ -112,7 +118,7 @@ test('checkInterfaceCodeAlignment: skips a pair with no defined contract', async
   const projectDir = await tempProjectDir()
   try {
     const architecture = architectureWithContract([])
-    architecture.interfaceContracts = []
+    architecture.interfaceDefinitions = []
     const result = await checkInterfaceCodeAlignment(projectDir, architecture)
     assert.equal(result.unimplementedOperations.length, 0)
     assert.equal(result.undocumentedIdentifiers.length, 0)
