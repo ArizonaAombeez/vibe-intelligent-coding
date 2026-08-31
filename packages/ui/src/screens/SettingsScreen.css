@@ -158,6 +158,76 @@
   margin: 0 0 4px;
 }
 
+.settings-persona-list-actions {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 12px;
+}
+
+.settings-persona-list-actions button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-h);
+  cursor: pointer;
+}
+
+.settings-persona-card-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: var(--text-h);
+}
+
+.settings-persona-card-toggle {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.settings-persona-card-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.settings-persona-card-summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-persona-card-header + * {
+  margin-top: 12px;
+}
+
+.settings-persona-auto-adopt {
+  margin-left: auto;
+  border-color: var(--accent) !important;
+  color: var(--accent) !important;
+}
+
+.settings-persona-recommendation {
+  font-size: 12px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin: 0 0 12px;
+}
+
 .settings-plugin-setup {
   font-size: 12px;
   color: var(--text-muted);

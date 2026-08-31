@@ -51,12 +51,15 @@
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .architecture-focus-title h2 {
   margin: 0;
   font-size: 20px;
   color: var(--text-h);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .architecture-focus-kind {
@@ -74,8 +77,13 @@
 }
 
 .architecture-focus-stage {
-  flex: 1;
-  min-height: 0;
+  /* Size to content, don't flex-shrink. Previously `flex: 1; min-height: 0`
+     let this box shrink below its own content height; the grid's rows
+     (align-items: start) then spilled downward and rendered on top of the
+     bottom edge chips and the metadata section below — the overlapping text
+     that was reported. The whole focus view scrolls (overflow-y: auto), so
+     the stage just needs its natural height. */
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: minmax(140px, 1fr) minmax(280px, 2fr) minmax(140px, 1fr);
   gap: 20px;

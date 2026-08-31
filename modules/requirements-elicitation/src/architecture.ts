@@ -1,7 +1,15 @@
-import { findArchitectureType } from './architectureTypes.js'
-import { buildArchitectChatMessages, DEFINE_INTERFACE_CONTRACT_SYSTEM_PROMPT } from './architecturePersona.js'
-import { addRequirementToElement } from './elicitation.js'
-import type { LlmCallOptions, LlmClient, LlmUsage } from './LlmClient.js'
+import { findArchitectureType } from "./architectureTypes.js";
+import {
+  buildArchitectChatMessages,
+  buildHarnessSpecMessages,
+  DEFINE_INTERFACE_CONTRACT_SYSTEM_PROMPT,
+} from "./architecturePersona.js";
+import { addRequirementToElement } from "./elicitation.js";
+import type { LlmCallOptions, LlmClient, LlmUsage } from "./LlmClient.js";
+import {
+  buildHarnessResponsibility,
+  DEFAULT_HARNESS_CHECKLIST,
+} from "./platforms.js";
 import type {
   Architecture,
   ArchitectureConflict,
@@ -10,13 +18,19 @@ import type {
   ArchitectureElementKind,
   ArchitectureTypeId,
   ElementInterfaceDefinition,
+  HarnessChecklistItem,
+  HarnessChecklistStatus,
+  HarnessLinkRealisation,
+  HarnessSpec,
   IncompleteOperation,
   InterfaceDefinition,
+  InterfaceElementDeclaration,
   InterfaceContractOperation,
   InterfaceRole,
+  PlatformDescriptor,
   Project,
   Requirement,
-} from './types.js'
+} from "./types.js";
 
 // Reserved row for external/context elements (Area B, "external modules
 // shown outside the main architecture, as context") — negative so it can
@@ -24,44 +38,117 @@ import type {
 // both of which only ever touch rows >= 0. The grid renderer draws this row
 // above row 0, visually separated by a gap, and always grey regardless of
 // kind-specific styling.
-export const EXTERNAL_CONTEXT_ROW = -1
+export const EXTERNAL_CONTEXT_ROW = -1;
+
+// Reserved row for the single project-harness element (project harness
+// feature) — one row further up than EXTERNAL_CONTEXT_ROW so the grid can
+// draw it in its own band above both the external-context band and row 0.
+// Same negative-index rationale: never collides with a real layer, survives
+// addLayer/removeLayer.
+export const HARNESS_ROW = -2;
+
+// The single harness element's id is a fixed sentinel, not a sequential
+// ARCH-NNN — it is unique per project and auto-created, so it never needs a
+// counter slot, and a stable id keeps every other element's numbering
+// exactly as it was before this feature (project harness feature).
+export const HARNESS_ELEMENT_ID = "ARCH-HARNESS";
+
+// Ensures the project has exactly one kind:'harness' element (project
+// harness feature). Idempotent — returns the existing one if present, never
+// creates a second. The harness is the composition root + platform entry
+// point: it instantiates every other element, wires the declared
+// inter-element connections, and drives the run lifecycle, carrying no
+// functional logic of its own. Auto-created here (rather than left to the
+// user) because a project with no defined place for composition is exactly
+// the undefined-behaviour gap this feature closes. Called from
+// setArchitectureType and defensively wherever the element set is mutated.
+export function ensureHarnessElement(project: Project): ArchitectureElement {
+  const architecture = requireArchitecture(project);
+  const harnesses = architecture.elements.filter((e) => e.kind === "harness");
+  if (harnesses.length > 1) {
+    // Self-heal a project that ended up with more than one harness (a
+    // pre-fix architecture import could add an IMP_ARCH-HARNESS alongside
+    // the auto-created ARCH-HARNESS). Keep the canonical-id one if present,
+    // otherwise the first; drop the rest and repoint any interface
+    // references at the survivor.
+    const keep =
+      harnesses.find((e) => e.id === HARNESS_ELEMENT_ID) ?? harnesses[0];
+    const removedIds = new Set(
+      harnesses.filter((e) => e.id !== keep.id).map((e) => e.id),
+    );
+    architecture.elements = architecture.elements.filter(
+      (e) => !removedIds.has(e.id),
+    );
+    for (const el of architecture.elements) {
+      el.interfaces = el.interfaces.map((id) =>
+        removedIds.has(id) ? keep.id : id,
+      );
+    }
+    return keep;
+  }
+  const existing = harnesses[0];
+  if (existing) return existing;
+  const element: ArchitectureElement = {
+    id: HARNESS_ELEMENT_ID,
+    kind: "harness",
+    name: "Harness",
+    responsibility: buildHarnessResponsibility(),
+    row: HARNESS_ROW,
+    col: 0,
+    rowSpan: 1,
+    colSpan: 1,
+    interfaces: [],
+    elementInterfaces: [],
+  };
+  architecture.elements.push(element);
+  return element;
+}
 
 // Selecting a type only seeds the grid the first time (Area B, "Architecture
 // type selection") — re-selecting after elements exist must not silently
 // wipe the Architect's work, so this only (re)initialises architecture when
 // it doesn't exist yet.
-export function setArchitectureType(project: Project, typeId: ArchitectureTypeId): void {
-  project.architectureType = typeId
-  if (project.architecture) return
-
-  const preset = findArchitectureType(typeId)
-  project.architecture = {
-    // Copy, not a reference — otherwise addLayer/removeLayer on this
-    // project's grid would mutate the shared ARCHITECTURE_TYPES preset
-    // array, corrupting it for every other project using the same type.
-    layers: [...(preset?.defaultLayers ?? [])],
-    elements: [],
-    nextElementSeq: 1,
-    nextInterfaceSeq: 1,
+export function setArchitectureType(
+  project: Project,
+  typeId: ArchitectureTypeId,
+): void {
+  project.architectureType = typeId;
+  if (!project.architecture) {
+    const preset = findArchitectureType(typeId);
+    project.architecture = {
+      // Copy, not a reference — otherwise addLayer/removeLayer on this
+      // project's grid would mutate the shared ARCHITECTURE_TYPES preset
+      // array, corrupting it for every other project using the same type.
+      layers: [...(preset?.defaultLayers ?? [])],
+      elements: [],
+      nextElementSeq: 1,
+      nextInterfaceSeq: 1,
+    };
   }
+  // Always — a project that already had an architecture from before this
+  // feature existed still needs its harness element the first time the type
+  // is (re)selected. ensureHarnessElement is idempotent.
+  ensureHarnessElement(project);
 }
 
 export interface CreateElementFields {
-  kind: ArchitectureElementKind
-  name: string
-  responsibility: string
-  row: number
-  col: number
-  rowSpan?: number
-  colSpan?: number
-  interfaces?: string[]
+  kind: ArchitectureElementKind;
+  name: string;
+  responsibility: string;
+  row: number;
+  col: number;
+  rowSpan?: number;
+  colSpan?: number;
+  interfaces?: string[];
 }
 
 function requireArchitecture(project: Project): Architecture {
   if (!project.architecture) {
-    throw new Error('Project has no architecture — select an Architecture type first')
+    throw new Error(
+      "Project has no architecture — select an Architecture type first",
+    );
   }
-  return project.architecture
+  return project.architecture;
 }
 
 // Ids are permanent and sequential (ARCH-NNN), same rationale as REQ-NNN —
@@ -72,10 +159,10 @@ export function createArchitectureElement(
   project: Project,
   fields: CreateElementFields,
 ): ArchitectureElement {
-  const architecture = requireArchitecture(project)
-  const seq = architecture.nextElementSeq
+  const architecture = requireArchitecture(project);
+  const seq = architecture.nextElementSeq;
   const element: ArchitectureElement = {
-    id: `ARCH-${String(seq).padStart(3, '0')}`,
+    id: `ARCH-${String(seq).padStart(3, "0")}`,
     kind: fields.kind,
     name: fields.name,
     responsibility: fields.responsibility,
@@ -85,21 +172,21 @@ export function createArchitectureElement(
     colSpan: fields.colSpan ?? 1,
     interfaces: fields.interfaces ?? [],
     elementInterfaces: [],
-  }
-  architecture.nextElementSeq = seq + 1
-  architecture.elements.push(element)
-  return element
+  };
+  architecture.nextElementSeq = seq + 1;
+  architecture.elements.push(element);
+  return element;
 }
 
 export interface UpdateElementFields {
-  name?: string
-  responsibility?: string
-  row?: number
-  col?: number
-  rowSpan?: number
-  colSpan?: number
-  interfaces?: string[]
-  dynamicDesignEnabled?: boolean
+  name?: string;
+  responsibility?: string;
+  row?: number;
+  col?: number;
+  rowSpan?: number;
+  colSpan?: number;
+  interfaces?: string[];
+  dynamicDesignEnabled?: boolean;
 }
 
 export function updateArchitectureElement(
@@ -107,99 +194,186 @@ export function updateArchitectureElement(
   elementId: string,
   fields: UpdateElementFields,
 ): ArchitectureElement {
-  const architecture = requireArchitecture(project)
-  const element = architecture.elements.find((e) => e.id === elementId)
+  const architecture = requireArchitecture(project);
+  const element = architecture.elements.find((e) => e.id === elementId);
   if (!element) {
-    throw new Error(`Architecture element ${elementId} not found`)
+    throw new Error(`Architecture element ${elementId} not found`);
   }
-  Object.assign(element, fields)
-  return element
+  Object.assign(element, fields);
+  return element;
+}
+
+// Removes every interface reference that points at an element id no longer
+// in the architecture — the repair half of the exact condition
+// checkInterfaces DETECTS as danglingElementInterfaces (there was a detector
+// with no repairer, which is how Worm 2 ended up with interfaceDefinitions
+// naming ARCH-002/006/007 after those elements were deleted). Two levels:
+//   1. interfaceDefinitions whose participant list references a missing id.
+//      A 2-participant contract that loses one participant is meaningless —
+//      drop the whole definition rather than leave a half-contract.
+//   2. every element's own elementInterfaces copy of a definition that just
+//      went away (the Tier-2 denormalised mirror — see
+//      relevantInterfaceDefinitions in vic-coding).
+// Also prunes element.interfaces graph edges to missing ids. Idempotent.
+// Returns what it removed so callers can log it. Safe to run any time —
+// it only ever removes references to ids that provably don't exist.
+export function pruneOrphanedInterfaceReferences(architecture: Architecture): {
+  removedDefinitionIds: string[];
+  clearedElementInterfaceRefs: Array<{
+    elementId: string;
+    masterDefinitionId: string;
+  }>;
+  removedGraphEdges: Array<{ elementId: string; toId: string }>;
+} {
+  const liveIds = new Set(architecture.elements.map((e) => e.id));
+
+  const removedDefinitionIds: string[] = [];
+  architecture.interfaceDefinitions = (
+    architecture.interfaceDefinitions ?? []
+  ).filter((d) => {
+    const keep = d.participants.every((p) => liveIds.has(p.elementId));
+    if (!keep) removedDefinitionIds.push(d.id);
+    return keep;
+  });
+  const liveDefinitionIds = new Set(
+    architecture.interfaceDefinitions.map((d) => d.id),
+  );
+
+  const clearedElementInterfaceRefs: Array<{
+    elementId: string;
+    masterDefinitionId: string;
+  }> = [];
+  const removedGraphEdges: Array<{ elementId: string; toId: string }> = [];
+  for (const element of architecture.elements) {
+    element.elementInterfaces = (element.elementInterfaces ?? []).filter(
+      (ei) => {
+        const keep = liveDefinitionIds.has(ei.masterDefinitionId);
+        if (!keep)
+          clearedElementInterfaceRefs.push({
+            elementId: element.id,
+            masterDefinitionId: ei.masterDefinitionId,
+          });
+        return keep;
+      },
+    );
+    element.interfaces = element.interfaces.filter((id) => {
+      const keep = liveIds.has(id);
+      if (!keep) removedGraphEdges.push({ elementId: element.id, toId: id });
+      return keep;
+    });
+  }
+
+  return {
+    removedDefinitionIds,
+    clearedElementInterfaceRefs,
+    removedGraphEdges,
+  };
 }
 
 // Deleting an element also clears it from any other element's interfaces
-// list and from any requirement allocated to it (falls back to
-// unallocated), so nothing is left pointing at a dangling id.
-export function deleteArchitectureElement(project: Project, elementId: string): void {
-  const architecture = requireArchitecture(project)
-  const index = architecture.elements.findIndex((e) => e.id === elementId)
+// list, from any interface definition it participated in (and every other
+// element's local copy of those), and from any requirement allocated to it
+// (falls back to unallocated), so nothing is left pointing at a dangling id.
+export function deleteArchitectureElement(
+  project: Project,
+  elementId: string,
+): void {
+  const architecture = requireArchitecture(project);
+  const index = architecture.elements.findIndex((e) => e.id === elementId);
   if (index === -1) {
-    throw new Error(`Architecture element ${elementId} not found`)
+    throw new Error(`Architecture element ${elementId} not found`);
   }
-  architecture.elements.splice(index, 1)
-  for (const element of architecture.elements) {
-    element.interfaces = element.interfaces.filter((id) => id !== elementId)
+  if (architecture.elements[index].kind === "harness") {
+    throw new Error("The Harness element is mandatory and cannot be deleted");
   }
+  architecture.elements.splice(index, 1);
+  // Graph edges, interface definitions, and every element's denormalised
+  // copy — the piece the old implementation's own comment claimed it did
+  // but never actually did.
+  pruneOrphanedInterfaceReferences(architecture);
   for (const requirement of project.requirements) {
-    requirement.architectureElements = requirement.architectureElements.filter((id) => id !== elementId)
+    requirement.architectureElements = requirement.architectureElements.filter(
+      (id) => id !== elementId,
+    );
   }
-  architecture.conflicts = architecture.conflicts?.filter((c) => !c.elementIds.includes(elementId))
+  architecture.conflicts = architecture.conflicts?.filter(
+    (c) => !c.elementIds.includes(elementId),
+  );
 }
 
 export function addLayer(project: Project, label: string): void {
-  const architecture = requireArchitecture(project)
-  architecture.layers.push(label)
+  const architecture = requireArchitecture(project);
+  architecture.layers.push(label);
 }
 
 export function removeLayer(project: Project, rowIndex: number): void {
-  const architecture = requireArchitecture(project)
+  const architecture = requireArchitecture(project);
   if (rowIndex < 0 || rowIndex >= architecture.layers.length) {
-    throw new Error(`Layer row ${rowIndex} does not exist`)
+    throw new Error(`Layer row ${rowIndex} does not exist`);
   }
-  architecture.layers.splice(rowIndex, 1)
+  architecture.layers.splice(rowIndex, 1);
   // Elements anchored on the removed row collapse onto the row that takes
   // its place; elements below shift up by one to stay contiguous — this
   // mirrors a normal spreadsheet row-delete rather than leaving a gap.
   for (const element of architecture.elements) {
     if (element.row >= architecture.layers.length) {
-      element.row = Math.max(0, architecture.layers.length - 1)
+      element.row = Math.max(0, architecture.layers.length - 1);
     } else if (element.row > rowIndex) {
-      element.row -= 1
+      element.row -= 1;
     }
   }
 }
 
-const CIRCULAR_DEP_KIND: ArchitectureConflictKind = 'circular-dependency'
+const CIRCULAR_DEP_KIND: ArchitectureConflictKind = "circular-dependency";
 
 // Mechanical (non-LLM) circular-dependency detection over the
 // element-to-element interface graph — a pure graph-cycle check, unlike the
 // LLM-assisted mismatch/overlap checks below, since "does this graph have a
 // cycle" doesn't need judgement.
-function detectCircularDependencies(elements: ArchitectureElement[]): ArchitectureConflict[] {
-  const byId = new Map(elements.map((e) => [e.id, e]))
-  const conflicts: ArchitectureConflict[] = []
-  const seenCycles = new Set<string>()
+function detectCircularDependencies(
+  elements: ArchitectureElement[],
+): ArchitectureConflict[] {
+  const byId = new Map(elements.map((e) => [e.id, e]));
+  const conflicts: ArchitectureConflict[] = [];
+  const seenCycles = new Set<string>();
 
-  function dfs(startId: string, currentId: string, visited: Set<string>, path: string[]): void {
-    const current = byId.get(currentId)
-    if (!current) return
+  function dfs(
+    startId: string,
+    currentId: string,
+    visited: Set<string>,
+    path: string[],
+  ): void {
+    const current = byId.get(currentId);
+    if (!current) return;
     for (const nextId of current.interfaces) {
       if (nextId === startId && path.length > 0) {
-        const cycle = [...path, currentId, startId]
-        const key = Array.from(new Set(cycle)).sort().join(',')
+        const cycle = [...path, currentId, startId];
+        const key = Array.from(new Set(cycle)).sort().join(",");
         if (!seenCycles.has(key)) {
-          seenCycles.add(key)
+          seenCycles.add(key);
           conflicts.push({
-            id: '',
+            id: "",
             kind: CIRCULAR_DEP_KIND,
             elementIds: Array.from(new Set(cycle)),
-            rationale: `Circular dependency: ${cycle.join(' -> ')}`,
-          })
+            rationale: `Circular dependency: ${cycle.join(" -> ")}`,
+          });
         }
-        continue
+        continue;
       }
-      if (visited.has(nextId)) continue
-      dfs(startId, nextId, new Set(visited).add(nextId), [...path, currentId])
+      if (visited.has(nextId)) continue;
+      dfs(startId, nextId, new Set(visited).add(nextId), [...path, currentId]);
     }
   }
 
   for (const element of elements) {
-    dfs(element.id, element.id, new Set([element.id]), [])
+    dfs(element.id, element.id, new Set([element.id]), []);
   }
-  return conflicts
+  return conflicts;
 }
 
-const INTERFACE_MISMATCH_LINE = /^MISMATCH:\s*(ARCH-\d{3}),\s*(ARCH-\d{3}):\s*(.+)$/gm
-const OVERLAP_LINE = /^OVERLAP:\s*(ARCH-\d{3}),\s*(ARCH-\d{3}):\s*(.+)$/gm
+const INTERFACE_MISMATCH_LINE =
+  /^MISMATCH:\s*(ARCH-\d{3}),\s*(ARCH-\d{3}):\s*(.+)$/gm;
+const OVERLAP_LINE = /^OVERLAP:\s*(ARCH-\d{3}),\s*(ARCH-\d{3}):\s*(.+)$/gm;
 
 const ARCHITECTURE_CONFLICT_SYSTEM_PROMPT = `You are the Architect, checking a system architecture for two kinds of
 problems: interface/contract mismatches, and overlapping/duplicate block
@@ -222,17 +396,17 @@ For each overlap you find, reply on its own line using exactly this format:
 OVERLAP: ARCH-NNN, ARCH-MMM: <short rationale>
 
 Only flag pairs you are confident about. If you find neither, reply with
-the single word: NONE.`
+the single word: NONE.`;
 
 function formatElementList(elements: ArchitectureElement[]): string {
   return elements
     .map((e) => `- ${e.id} (${e.kind}): ${e.name} — ${e.responsibility}`)
-    .join('\n')
+    .join("\n");
 }
 
 export interface CheckArchitectureConflictsResult {
-  conflicts: ArchitectureConflict[]
-  usage?: LlmUsage
+  conflicts: ArchitectureConflict[];
+  usage?: LlmUsage;
 }
 
 // Mirrors checkConflicts' pattern (Requirements, Area A): mechanical checks
@@ -244,47 +418,57 @@ export async function checkArchitectureConflicts(
   llmClient: LlmClient,
   llmOptions?: LlmCallOptions,
 ): Promise<CheckArchitectureConflictsResult> {
-  const architecture = requireArchitecture(project)
-  const circular = detectCircularDependencies(architecture.elements)
+  const architecture = requireArchitecture(project);
+  // The harness element carries no functional logic and no interface
+  // contracts of its own, so it can't be a party to a responsibility
+  // overlap or an interface mismatch — exclude it from conflict detection
+  // entirely (project harness feature).
+  const inScopeElements = architecture.elements.filter(
+    (e) => e.kind !== "harness",
+  );
+  const circular = detectCircularDependencies(inScopeElements);
 
-  if (architecture.elements.length === 0) {
-    architecture.conflicts = circular.map((c, i) => ({ ...c, id: `CONF-${i + 1}` }))
-    return { conflicts: architecture.conflicts }
+  if (inScopeElements.length === 0) {
+    architecture.conflicts = circular.map((c, i) => ({
+      ...c,
+      id: `CONF-${i + 1}`,
+    }));
+    return { conflicts: architecture.conflicts };
   }
 
   const messages = [
-    { role: 'system' as const, content: ARCHITECTURE_CONFLICT_SYSTEM_PROMPT },
-    { role: 'user' as const, content: formatElementList(architecture.elements) },
-  ]
-  const result = await llmClient.chat(messages, llmOptions)
-  const knownIds = new Set(architecture.elements.map((e) => e.id))
+    { role: "system" as const, content: ARCHITECTURE_CONFLICT_SYSTEM_PROMPT },
+    { role: "user" as const, content: formatElementList(inScopeElements) },
+  ];
+  const result = await llmClient.chat(messages, llmOptions);
+  const knownIds = new Set(inScopeElements.map((e) => e.id));
 
   const mismatches: ArchitectureConflict[] = Array.from(
     result.content.matchAll(INTERFACE_MISMATCH_LINE),
     (m) => ({
-      id: '',
-      kind: 'interface-mismatch' as ArchitectureConflictKind,
+      id: "",
+      kind: "interface-mismatch" as ArchitectureConflictKind,
       elementIds: [m[1], m[2]],
       rationale: m[3].trim(),
     }),
-  ).filter((c) => c.elementIds.every((id) => knownIds.has(id)))
+  ).filter((c) => c.elementIds.every((id) => knownIds.has(id)));
 
   const overlaps: ArchitectureConflict[] = Array.from(
     result.content.matchAll(OVERLAP_LINE),
     (m) => ({
-      id: '',
-      kind: 'overlapping-responsibility' as ArchitectureConflictKind,
+      id: "",
+      kind: "overlapping-responsibility" as ArchitectureConflictKind,
       elementIds: [m[1], m[2]],
       rationale: m[3].trim(),
     }),
-  ).filter((c) => c.elementIds.every((id) => knownIds.has(id)))
+  ).filter((c) => c.elementIds.every((id) => knownIds.has(id)));
 
   const all = [...circular, ...mismatches, ...overlaps].map((c, i) => ({
     ...c,
     id: `CONF-${i + 1}`,
-  }))
-  architecture.conflicts = all
-  return { conflicts: all, usage: result.usage }
+  }));
+  architecture.conflicts = all;
+  return { conflicts: all, usage: result.usage };
 }
 
 const AUTO_CONFIGURE_SYSTEM_PROMPT = `You are the Architect. Group the given requirements into cohesive
@@ -324,39 +508,64 @@ INTERFACE: <module name>|<module name>
   Omit if a module has no dependencies.
 
 Use each module name consistently across MODULE/ALLOCATE/INTERFACE lines.
-If nothing can be confidently grouped, reply with the single word: NONE.`
+If nothing can be confidently grouped, reply with the single word: NONE.`;
 
-export const MODULE_LINE = /^MODULE:\s*([a-z-]+)\s*\|\s*([^|]*)\|\s*([^|]+)\|\s*(.+)$/gm
-const ALLOCATE_LINE = /^ALLOCATE:\s*(REQ-\d+)\s*\|\s*(.+)$/gm
-export const INTERFACE_LINE = /^INTERFACE:\s*([^|]+)\|\s*(.+)$/gm
+export const MODULE_LINE =
+  /^MODULE:\s*([a-z-]+)\s*\|\s*([^|]*)\|\s*([^|]+)\|\s*(.+)$/gm;
+// The requirement id can be a bare REQ-NNN or an import-prefixed one
+// (IMP_REQ-NNN, IMP_IMP_REQ-NNN after re-import — see projectParts.ts's
+// IMPORTED_ID_PREFIX). The old `REQ-\d+`-only capture silently matched
+// nothing for an imported-requirements project, so Auto Allocate / Auto
+// Configure allocated zero requirements with no error. Capture the whole
+// id token up to the `|` and let the caller validate it against the real
+// unallocated set.
+const ALLOCATE_LINE = /^ALLOCATE:\s*((?:IMP_)*REQ-\d+)\s*\|\s*(.+)$/gm;
+export const INTERFACE_LINE = /^INTERFACE:\s*([^|]+)\|\s*(.+)$/gm;
 
 const VALID_MODULE_KINDS = new Set<ArchitectureElementKind>([
-  'functional',
-  'service',
-  'interface-spine',
-  'runtime',
-  'external',
-])
+  "functional",
+  "service",
+  "interface-spine",
+  "runtime",
+  "external",
+]);
 
 function formatExistingModules(elements: ArchitectureElement[]): string {
-  if (elements.length === 0) return '(none yet)'
-  return elements.map((e) => `- ${e.name} (${e.kind}): ${e.responsibility}`).join('\n')
+  if (elements.length === 0) return "(none yet)";
+  return elements
+    .map((e) => `- ${e.name} (${e.kind}): ${e.responsibility}`)
+    .join("\n");
+}
+
+// Elements a requirement can legitimately be allocated to — i.e. everything
+// except the project harness, which owns composition/entry-point/lifecycle
+// and never carries a requirement of its own (project harness feature).
+function allocatableElements(
+  architecture: Architecture,
+): ArchitectureElement[] {
+  return architecture.elements.filter((e) => e.kind !== "harness");
 }
 
 function formatUnallocatedRequirements(requirements: Requirement[]): string {
   return requirements
-    .map((r) => `${r.id}: ${r.text}${r.allocationRationale ? ` (rationale: ${r.allocationRationale})` : ''}`)
-    .join('\n')
+    .map(
+      (r) =>
+        `${r.id}: ${r.text}${r.allocationRationale ? ` (rationale: ${r.allocationRationale})` : ""}`,
+    )
+    .join("\n");
 }
 
-function addUsage(a: LlmUsage | undefined, b: LlmUsage | undefined): LlmUsage | undefined {
-  if (!a) return b
-  if (!b) return a
+function addUsage(
+  a: LlmUsage | undefined,
+  b: LlmUsage | undefined,
+): LlmUsage | undefined {
+  if (!a) return b;
+  if (!b) return a;
   return {
     promptTokens: a.promptTokens + b.promptTokens,
     completionTokens: a.completionTokens + b.completionTokens,
     totalTokens: a.totalTokens + b.totalTokens,
-  }
+  };
 }
 
 // Deterministic placement for newly-created modules: internal (non-external)
@@ -365,17 +574,20 @@ function addUsage(a: LlmUsage | undefined, b: LlmUsage | undefined): LlmUsage | 
 // the reserved EXTERNAL_CONTEXT_ROW, packed the same way — kept out of the
 // main layer grid entirely, per the "external shown outside, as context"
 // layout rule.
-export function nextFreeColumn(elements: ArchitectureElement[], row: number): number {
-  const occupied = elements.filter((e) => e.row === row)
-  if (occupied.length === 0) return 0
-  return Math.max(...occupied.map((e) => e.col + e.colSpan))
+export function nextFreeColumn(
+  elements: ArchitectureElement[],
+  row: number,
+): number {
+  const occupied = elements.filter((e) => e.row === row);
+  if (occupied.length === 0) return 0;
+  return Math.max(...occupied.map((e) => e.col + e.colSpan));
 }
 
 export interface AutoConfigureAndAllocateResult {
-  createdElements: ArchitectureElement[]
-  allocatedRequirementIds: string[]
-  unallocatedRequirementIds: string[]
-  usage?: LlmUsage
+  createdElements: ArchitectureElement[];
+  allocatedRequirementIds: string[];
+  unallocatedRequirementIds: string[];
+  usage?: LlmUsage;
 }
 
 // "Auto Configure & Allocate" (Area B) — one LLM call groups the project's
@@ -395,36 +607,52 @@ export async function autoConfigureAndAllocate(
   llmClient: LlmClient,
   llmOptions?: LlmCallOptions,
 ): Promise<AutoConfigureAndAllocateResult> {
-  const architecture = requireArchitecture(project)
-  const unallocated = project.requirements.filter((r) => !r.deletedAt && r.architectureElements.length === 0)
+  const architecture = requireArchitecture(project);
+  const unallocated = project.requirements.filter(
+    (r) => !r.deletedAt && r.architectureElements.length === 0,
+  );
 
   if (unallocated.length === 0) {
-    return { createdElements: [], allocatedRequirementIds: [], unallocatedRequirementIds: [] }
+    return {
+      createdElements: [],
+      allocatedRequirementIds: [],
+      unallocatedRequirementIds: [],
+    };
   }
 
-  const layersText = architecture.layers.length > 0 ? architecture.layers.join(', ') : '(no layers defined)'
-  const systemPrompt = AUTO_CONFIGURE_SYSTEM_PROMPT.replace('{{LAYERS}}', layersText)
-  const userPrompt = `Existing modules:\n${formatExistingModules(architecture.elements)}\n\nRequirements to allocate:\n${formatUnallocatedRequirements(unallocated)}`
+  const layersText =
+    architecture.layers.length > 0
+      ? architecture.layers.join(", ")
+      : "(no layers defined)";
+  const systemPrompt = AUTO_CONFIGURE_SYSTEM_PROMPT.replace(
+    "{{LAYERS}}",
+    layersText,
+  );
+  const userPrompt = `Existing modules:\n${formatExistingModules(allocatableElements(architecture))}\n\nRequirements to allocate:\n${formatUnallocatedRequirements(unallocated)}`;
 
   const messages = [
-    { role: 'system' as const, content: systemPrompt },
-    { role: 'user' as const, content: userPrompt },
-  ]
-  const result = await llmClient.chat(messages, llmOptions)
+    { role: "system" as const, content: systemPrompt },
+    { role: "user" as const, content: userPrompt },
+  ];
+  const result = await llmClient.chat(messages, llmOptions);
 
-  const byName = new Map<string, ArchitectureElement>(architecture.elements.map((e) => [e.name, e]))
-  const createdElements: ArchitectureElement[] = []
+  const byName = new Map<string, ArchitectureElement>(
+    allocatableElements(architecture).map((e) => [e.name, e]),
+  );
+  const createdElements: ArchitectureElement[] = [];
 
   for (const m of result.content.matchAll(MODULE_LINE)) {
-    const kind = m[1].trim() as ArchitectureElementKind
-    const layerLabel = m[2].trim()
-    const name = m[3].trim()
-    const responsibility = m[4].trim()
-    if (!VALID_MODULE_KINDS.has(kind) || byName.has(name)) continue
+    const kind = m[1].trim() as ArchitectureElementKind;
+    const layerLabel = m[2].trim();
+    const name = m[3].trim();
+    const responsibility = m[4].trim();
+    if (!VALID_MODULE_KINDS.has(kind) || byName.has(name)) continue;
 
-    const isExternal = kind === 'external'
-    const row = isExternal ? EXTERNAL_CONTEXT_ROW : architecture.layers.indexOf(layerLabel)
-    if (!isExternal && row === -1) continue // layer name didn't match any real layer — skip rather than guess
+    const isExternal = kind === "external";
+    const row = isExternal
+      ? EXTERNAL_CONTEXT_ROW
+      : architecture.layers.indexOf(layerLabel);
+    if (!isExternal && row === -1) continue; // layer name didn't match any real layer — skip rather than guess
 
     const element = createArchitectureElement(project, {
       kind,
@@ -432,27 +660,35 @@ export async function autoConfigureAndAllocate(
       responsibility,
       row,
       col: nextFreeColumn(architecture.elements, row),
-    })
-    byName.set(name, element)
-    createdElements.push(element)
+    });
+    byName.set(name, element);
+    createdElements.push(element);
   }
 
   for (const m of result.content.matchAll(INTERFACE_LINE)) {
-    const from = byName.get(m[1].trim())
-    const to = byName.get(m[2].trim())
-    if (!from || !to || from.id === to.id) continue
-    if (!from.interfaces.includes(to.id)) from.interfaces.push(to.id)
+    const from = byName.get(m[1].trim());
+    const to = byName.get(m[2].trim());
+    if (!from || !to || from.id === to.id) continue;
+    if (!from.interfaces.includes(to.id)) from.interfaces.push(to.id);
   }
 
-  const allocatedRequirementIds: string[] = []
-  const unallocatedIds = new Set(unallocated.map((r) => r.id))
+  const byNameLoose = new Map(
+    [...byName.entries()].map(([k, v]) => [k.trim().toLowerCase(), v]),
+  );
+  const resolveModule = (raw: string) => {
+    const name = raw.trim().replace(/[.,;:]+$/, "");
+    return byName.get(name) ?? byNameLoose.get(name.toLowerCase());
+  };
+
+  const allocatedRequirementIds: string[] = [];
+  const unallocatedIds = new Set(unallocated.map((r) => r.id));
   for (const m of result.content.matchAll(ALLOCATE_LINE)) {
-    const requirementId = m[1].trim()
-    const target = byName.get(m[2].trim())
-    if (!target || !unallocatedIds.has(requirementId)) continue
-    addRequirementToElement(project, requirementId, target.id)
-    allocatedRequirementIds.push(requirementId)
-    unallocatedIds.delete(requirementId)
+    const requirementId = m[1].trim();
+    const target = resolveModule(m[2]);
+    if (!target || !unallocatedIds.has(requirementId)) continue;
+    addRequirementToElement(project, requirementId, target.id);
+    allocatedRequirementIds.push(requirementId);
+    unallocatedIds.delete(requirementId);
   }
 
   return {
@@ -460,13 +696,13 @@ export async function autoConfigureAndAllocate(
     allocatedRequirementIds,
     unallocatedRequirementIds: Array.from(unallocatedIds),
     usage: result.usage,
-  }
+  };
 }
 
 export interface AutoAllocateResult {
-  allocatedRequirementIds: string[]
-  unallocatedRequirementIds: string[]
-  usage?: LlmUsage
+  allocatedRequirementIds: string[];
+  unallocatedRequirementIds: string[];
+  usage?: LlmUsage;
 }
 
 const AUTO_ALLOCATE_SYSTEM_PROMPT = `You are the Architect. Allocate each given requirement to the existing
@@ -481,14 +717,14 @@ ALLOCATE: <requirement id>|<module name>
   covers it — omit its line entirely rather than guessing.
 
 If none of the requirements can be confidently allocated, reply with the
-single word: NONE.`
+single word: NONE.`;
 
 // Batch size for autoAllocateLlm's LLM calls — a large unallocated set (50+)
 // sent to the model in one call risks it declining everything at once
 // (output-length/attention pressure), so requirements are chunked and
 // allocated across multiple smaller calls instead. Mirrors the per-file
 // chunking rationale in codeImport.ts's proposeCodeGapRequirementsPerFile.
-const AUTO_ALLOCATE_BATCH_SIZE = 20
+const AUTO_ALLOCATE_BATCH_SIZE = 20;
 
 // "Auto Allocate" (Area B, LLM mode) — allocates unallocated requirements
 // onto the *existing* architecture (never creates elements, unlike
@@ -504,40 +740,59 @@ export async function autoAllocateLlm(
   llmClient: LlmClient,
   llmOptions?: LlmCallOptions,
 ): Promise<AutoAllocateResult> {
-  const architecture = requireArchitecture(project)
-  if (architecture.elements.length === 0) {
-    throw new Error('Add at least one architecture element before running Auto Allocate')
+  const architecture = requireArchitecture(project);
+  const allocatable = allocatableElements(architecture);
+  if (allocatable.length === 0) {
+    throw new Error(
+      "Add at least one architecture element before running Auto Allocate",
+    );
   }
-  const unallocated = project.requirements.filter((r) => !r.deletedAt && r.architectureElements.length === 0)
+  const unallocated = project.requirements.filter(
+    (r) => !r.deletedAt && r.architectureElements.length === 0,
+  );
 
   if (unallocated.length === 0) {
-    return { allocatedRequirementIds: [], unallocatedRequirementIds: [] }
+    return { allocatedRequirementIds: [], unallocatedRequirementIds: [] };
   }
 
-  const byName = new Map(architecture.elements.map((e) => [e.name, e]))
-  const allocatedRequirementIds: string[] = []
-  const unallocatedIds = new Set(unallocated.map((r) => r.id))
-  let usage: LlmUsage | undefined
+  const byName = new Map(allocatable.map((e) => [e.name, e]));
+  // Case-insensitive / trimmed fallback lookup, so a module name the LLM
+  // returns with different casing or surrounding punctuation ("game engine",
+  // "Game Engine.") still resolves instead of being silently dropped.
+  const byNameLoose = new Map(
+    allocatable.map((e) => [e.name.trim().toLowerCase(), e]),
+  );
+  const resolveModule = (raw: string) => {
+    const name = raw.trim().replace(/[.,;:]+$/, "");
+    return byName.get(name) ?? byNameLoose.get(name.toLowerCase());
+  };
 
-  const totalBatches = Math.ceil(unallocated.length / AUTO_ALLOCATE_BATCH_SIZE)
+  const allocatedRequirementIds: string[] = [];
+  const unallocatedIds = new Set(unallocated.map((r) => r.id));
+  let usage: LlmUsage | undefined;
+
+  const totalBatches = Math.ceil(unallocated.length / AUTO_ALLOCATE_BATCH_SIZE);
   for (let i = 0; i < totalBatches; i++) {
-    const batch = unallocated.slice(i * AUTO_ALLOCATE_BATCH_SIZE, (i + 1) * AUTO_ALLOCATE_BATCH_SIZE)
+    const batch = unallocated.slice(
+      i * AUTO_ALLOCATE_BATCH_SIZE,
+      (i + 1) * AUTO_ALLOCATE_BATCH_SIZE,
+    );
 
-    const userPrompt = `Existing modules:\n${formatExistingModules(architecture.elements)}\n\nRequirements to allocate:\n${formatUnallocatedRequirements(batch)}`
+    const userPrompt = `Existing modules:\n${formatExistingModules(allocatable)}\n\nRequirements to allocate:\n${formatUnallocatedRequirements(batch)}`;
     const messages = [
-      { role: 'system' as const, content: AUTO_ALLOCATE_SYSTEM_PROMPT },
-      { role: 'user' as const, content: userPrompt },
-    ]
-    const result = await llmClient.chat(messages, llmOptions)
-    usage = addUsage(usage, result.usage)
+      { role: "system" as const, content: AUTO_ALLOCATE_SYSTEM_PROMPT },
+      { role: "user" as const, content: userPrompt },
+    ];
+    const result = await llmClient.chat(messages, llmOptions);
+    usage = addUsage(usage, result.usage);
 
     for (const m of result.content.matchAll(ALLOCATE_LINE)) {
-      const requirementId = m[1].trim()
-      const target = byName.get(m[2].trim())
-      if (!target || !unallocatedIds.has(requirementId)) continue
-      addRequirementToElement(project, requirementId, target.id)
-      allocatedRequirementIds.push(requirementId)
-      unallocatedIds.delete(requirementId)
+      const requirementId = m[1].trim();
+      const target = resolveModule(m[2]);
+      if (!target || !unallocatedIds.has(requirementId)) continue;
+      addRequirementToElement(project, requirementId, target.id);
+      allocatedRequirementIds.push(requirementId);
+      unallocatedIds.delete(requirementId);
     }
   }
 
@@ -545,40 +800,48 @@ export async function autoAllocateLlm(
     allocatedRequirementIds,
     unallocatedRequirementIds: Array.from(unallocatedIds),
     usage,
-  }
+  };
 }
 
 export interface ProposedArchitectureElement {
-  kind: ArchitectureElementKind
-  name: string
-  layer: string
-  responsibility: string
+  kind: ArchitectureElementKind;
+  name: string;
+  layer: string;
+  responsibility: string;
 }
 
 export interface ProposedInterface {
-  from: string
-  to: string
+  from: string;
+  to: string;
 }
 
 export interface ChatWithArchitectResult {
-  reply: string
-  proposedElements: ProposedArchitectureElement[]
-  proposedInterfaces: ProposedInterface[]
-  usage?: LlmUsage
+  reply: string;
+  proposedElements: ProposedArchitectureElement[];
+  proposedInterfaces: ProposedInterface[];
+  usage?: LlmUsage;
 }
 
 function extractProposedElements(reply: string): ProposedArchitectureElement[] {
-  const proposals: ProposedArchitectureElement[] = []
+  const proposals: ProposedArchitectureElement[] = [];
   for (const m of reply.matchAll(MODULE_LINE)) {
-    const kind = m[1].trim() as ArchitectureElementKind
-    if (!VALID_MODULE_KINDS.has(kind)) continue
-    proposals.push({ kind, layer: m[2].trim(), name: m[3].trim(), responsibility: m[4].trim() })
+    const kind = m[1].trim() as ArchitectureElementKind;
+    if (!VALID_MODULE_KINDS.has(kind)) continue;
+    proposals.push({
+      kind,
+      layer: m[2].trim(),
+      name: m[3].trim(),
+      responsibility: m[4].trim(),
+    });
   }
-  return proposals
+  return proposals;
 }
 
 function extractProposedInterfaces(reply: string): ProposedInterface[] {
-  return Array.from(reply.matchAll(INTERFACE_LINE), (m) => ({ from: m[1].trim(), to: m[2].trim() }))
+  return Array.from(reply.matchAll(INTERFACE_LINE), (m) => ({
+    from: m[1].trim(),
+    to: m[2].trim(),
+  }));
 }
 
 // Architect-chat path (mirrors chatWithAnalyst) — does not save anything.
@@ -591,15 +854,15 @@ export async function chatWithArchitect(
   userMessage: string,
   llmOptions?: LlmCallOptions,
 ): Promise<ChatWithArchitectResult> {
-  const architecture = requireArchitecture(project)
-  const messages = buildArchitectChatMessages(architecture, userMessage)
-  const result = await llmClient.chat(messages, llmOptions)
+  const architecture = requireArchitecture(project);
+  const messages = buildArchitectChatMessages(architecture, userMessage);
+  const result = await llmClient.chat(messages, llmOptions);
   return {
     reply: result.content,
     proposedElements: extractProposedElements(result.content),
     proposedInterfaces: extractProposedInterfaces(result.content),
     usage: result.usage,
-  }
+  };
 }
 
 // Accepts a single proposed interface connection by element id (the UI
@@ -613,16 +876,16 @@ export function acceptProposedInterface(
   fromId: string,
   toId: string,
 ): ArchitectureElement {
-  const architecture = requireArchitecture(project)
-  const from = architecture.elements.find((e) => e.id === fromId)
+  const architecture = requireArchitecture(project);
+  const from = architecture.elements.find((e) => e.id === fromId);
   if (!from) {
-    throw new Error(`Architecture element ${fromId} not found`)
+    throw new Error(`Architecture element ${fromId} not found`);
   }
   if (!architecture.elements.some((e) => e.id === toId)) {
-    throw new Error(`Architecture element ${toId} not found`)
+    throw new Error(`Architecture element ${toId} not found`);
   }
-  if (!from.interfaces.includes(toId)) from.interfaces.push(toId)
-  return from
+  if (!from.interfaces.includes(toId)) from.interfaces.push(toId);
+  return from;
 }
 
 // Inverse of acceptProposedInterface — removes a single interface
@@ -632,18 +895,18 @@ export function removeArchitectureInterface(
   fromId: string,
   toId: string,
 ): ArchitectureElement {
-  const architecture = requireArchitecture(project)
-  const from = architecture.elements.find((e) => e.id === fromId)
+  const architecture = requireArchitecture(project);
+  const from = architecture.elements.find((e) => e.id === fromId);
   if (!from) {
-    throw new Error(`Architecture element ${fromId} not found`)
+    throw new Error(`Architecture element ${fromId} not found`);
   }
-  from.interfaces = from.interfaces.filter((id) => id !== toId)
-  return from
+  from.interfaces = from.interfaces.filter((id) => id !== toId);
+  return from;
 }
 
 export interface CheckInterfaceConflictResult {
-  conflict: ArchitectureConflict | null
-  usage?: LlmUsage
+  conflict: ArchitectureConflict | null;
+  usage?: LlmUsage;
 }
 
 // Scoped, non-persistent version of checkArchitectureConflicts for exactly
@@ -657,37 +920,42 @@ export async function checkInterfaceConflict(
   toId: string,
   llmOptions?: LlmCallOptions,
 ): Promise<CheckInterfaceConflictResult> {
-  const architecture = requireArchitecture(project)
-  const from = architecture.elements.find((e) => e.id === fromId)
-  const to = architecture.elements.find((e) => e.id === toId)
+  const architecture = requireArchitecture(project);
+  const from = architecture.elements.find((e) => e.id === fromId);
+  const to = architecture.elements.find((e) => e.id === toId);
   if (!from || !to) {
-    throw new Error('Both architecture elements must exist to check their interface')
+    throw new Error(
+      "Both architecture elements must exist to check their interface",
+    );
   }
 
   const messages = [
-    { role: 'system' as const, content: ARCHITECTURE_CONFLICT_SYSTEM_PROMPT },
-    { role: 'user' as const, content: formatElementList([from, to]) },
-  ]
-  const result = await llmClient.chat(messages, llmOptions)
+    { role: "system" as const, content: ARCHITECTURE_CONFLICT_SYSTEM_PROMPT },
+    { role: "user" as const, content: formatElementList([from, to]) },
+  ];
+  const result = await llmClient.chat(messages, llmOptions);
 
-  const mismatch = Array.from(result.content.matchAll(INTERFACE_MISMATCH_LINE)).find(
+  const mismatch = Array.from(
+    result.content.matchAll(INTERFACE_MISMATCH_LINE),
+  ).find(
     (m) =>
       (m[1] === fromId && m[2] === toId) || (m[1] === toId && m[2] === fromId),
-  )
+  );
   const overlap = Array.from(result.content.matchAll(OVERLAP_LINE)).find(
-    (m) => (m[1] === fromId && m[2] === toId) || (m[1] === toId && m[2] === fromId),
-  )
+    (m) =>
+      (m[1] === fromId && m[2] === toId) || (m[1] === toId && m[2] === fromId),
+  );
 
-  const found = mismatch ?? overlap
-  if (!found) return { conflict: null, usage: result.usage }
+  const found = mismatch ?? overlap;
+  if (!found) return { conflict: null, usage: result.usage };
 
   const conflict: ArchitectureConflict = {
-    id: 'CONF-scoped',
-    kind: mismatch ? 'interface-mismatch' : 'overlapping-responsibility',
+    id: "CONF-scoped",
+    kind: mismatch ? "interface-mismatch" : "overlapping-responsibility",
     elementIds: [found[1], found[2]],
     rationale: found[3].trim(),
-  }
-  return { conflict, usage: result.usage }
+  };
+  return { conflict, usage: result.usage };
 }
 
 // Every connected element pair, deduplicated regardless of which side's
@@ -696,18 +964,31 @@ export async function checkInterfaceConflict(
 // Exported so the Coding module (Area D) can scaffold a shared-interface
 // subfolder for every connected pair, the same set Define Interfaces
 // already iterates.
-export function connectedPairs(elements: ArchitectureElement[]): Array<{ fromId: string; toId: string }> {
-  const seen = new Set<string>()
-  const pairs: Array<{ fromId: string; toId: string }> = []
+export function connectedPairs(
+  elements: ArchitectureElement[],
+): Array<{ fromId: string; toId: string }> {
+  // The harness connects to every other element (so the grid draws it wired
+  // to all), but those edges are NOT interface contracts — the harness's
+  // "contract" is its HarnessSpec artifact, not an InterfaceDefinition per
+  // edge. Skip any pair touching the harness so Define Interfaces / Check
+  // Interfaces / the shared-interface scaffold never demand a definition for
+  // a harness edge (project harness feature).
+  const harnessIds = new Set(
+    elements.filter((e) => e.kind === "harness").map((e) => e.id),
+  );
+  const seen = new Set<string>();
+  const pairs: Array<{ fromId: string; toId: string }> = [];
   for (const element of elements) {
+    if (harnessIds.has(element.id)) continue;
     for (const toId of element.interfaces) {
-      const key = [element.id, toId].sort().join('|')
-      if (seen.has(key)) continue
-      seen.add(key)
-      pairs.push({ fromId: element.id, toId })
+      if (harnessIds.has(toId)) continue;
+      const key = [element.id, toId].sort().join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pairs.push({ fromId: element.id, toId });
     }
   }
-  return pairs
+  return pairs;
 }
 
 // The trailing range/resolution/unit/update-frequency fields (Area B,
@@ -717,7 +998,7 @@ export function connectedPairs(elements: ArchitectureElement[]): Array<{ fromId:
 // response|errors) parses exactly as it always did, just with the new
 // fields left undefined rather than failing to match.
 const OPERATION_LINE =
-  /^OPERATION:\s*([^|\n]+)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)(?:\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*))?$/gm
+  /^OPERATION:\s*([^|\n]+)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)(?:\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*))?$/gm;
 
 // Distinguishes "the Architect considered this field and it doesn't apply"
 // (the reply literally said NONE, e.g. a login RPC has no physical unit)
@@ -727,44 +1008,123 @@ const OPERATION_LINE =
 // 'N/A' as satisfied, since the Architect made a real judgement call on it;
 // only true undefined counts as an incomplete gap.
 function noneToNA(value: string | undefined): string | undefined {
-  const trimmed = value?.trim()
-  if (value === undefined) return undefined
-  return !trimmed || trimmed === 'NONE' ? 'N/A' : trimmed
+  const trimmed = value?.trim();
+  if (value === undefined) return undefined;
+  return !trimmed || trimmed === "NONE" ? "N/A" : trimmed;
+}
+
+// DECLARE: <elementId>|<does>|<exposes ; list / NONE>|<owns ; list / NONE>|<visibleTo ids ; list / ALL / NONE>
+// Emitted by the Define Interfaces call alongside OPERATION lines (project
+// harness feature). Order-independent of OPERATION lines; either grammar
+// may appear in any order in the reply.
+const DECLARE_LINE =
+  /^DECLARE:\s*([^|\n]+)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)\|\s*([^|\n]*)$/gm;
+
+function splitList(value: string | undefined): string[] {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed.toUpperCase() === "NONE") return [];
+  if (trimmed.toUpperCase() === "ALL") return ["all"];
+  return trimmed
+    .split(";")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function parseDeclarations(reply: string): InterfaceElementDeclaration[] {
+  return Array.from(reply.matchAll(DECLARE_LINE), (m) => {
+    const visibleRaw = m[5]?.trim() ?? "";
+    const visibleTo =
+      visibleRaw.toUpperCase() === "ALL"
+        ? ["all"]
+        : visibleRaw.toUpperCase() === "NONE" || !visibleRaw
+          ? ["none"]
+          : splitList(visibleRaw);
+    return {
+      elementId: m[1].trim(),
+      does: m[2].trim(),
+      exposes: splitList(m[3]),
+      owns: splitList(m[4]),
+      visibleTo: visibleTo.length > 0 ? visibleTo : ["none"],
+    };
+  });
+}
+
+// Union-merge a batch of freshly-parsed declarations onto whatever the
+// definition already holds, keyed by elementId: union exposes/owns,
+// last-writer-wins for does/visibleTo (a non-empty new value replaces the
+// old). Used both by defineInterfaceDefinition (one pair) and, at the
+// project level, so an element appearing in several definitions accumulates
+// a consistent picture.
+function mergeDeclarations(
+  existing: InterfaceElementDeclaration[] | undefined,
+  incoming: InterfaceElementDeclaration[],
+): InterfaceElementDeclaration[] {
+  const byId = new Map<string, InterfaceElementDeclaration>();
+  for (const d of existing ?? []) byId.set(d.elementId, { ...d });
+  for (const d of incoming) {
+    const prev = byId.get(d.elementId);
+    if (!prev) {
+      byId.set(d.elementId, { ...d });
+      continue;
+    }
+    byId.set(d.elementId, {
+      elementId: d.elementId,
+      does: d.does || prev.does,
+      exposes: Array.from(new Set([...prev.exposes, ...d.exposes])),
+      owns: Array.from(new Set([...prev.owns, ...d.owns])),
+      visibleTo:
+        d.visibleTo.length > 0 && d.visibleTo[0] !== "none"
+          ? d.visibleTo
+          : prev.visibleTo,
+    });
+  }
+  return Array.from(byId.values());
 }
 
 function parseOperations(reply: string): InterfaceContractOperation[] {
   return Array.from(reply.matchAll(OPERATION_LINE), (m) => {
-    const updateFrequencyField = m[9]?.trim()
-    const drivenDirectly = updateFrequencyField === 'DRIVEN' ? true : undefined
+    const updateFrequencyField = m[9]?.trim();
+    const drivenDirectly = updateFrequencyField === "DRIVEN" ? true : undefined;
     return {
       name: m[1].trim(),
       description: m[2].trim(),
       request: m[3].trim(),
       response: m[4].trim(),
-      errors: m[5].trim() === 'NONE' ? '' : m[5].trim(),
+      errors: m[5].trim() === "NONE" ? "" : m[5].trim(),
       range: noneToNA(m[6]),
       resolution: noneToNA(m[7]),
       unit: noneToNA(m[8]),
-      updateFrequency: drivenDirectly ? undefined : noneToNA(updateFrequencyField),
+      updateFrequency: drivenDirectly
+        ? undefined
+        : noneToNA(updateFrequencyField),
       drivenDirectly,
-    }
-  })
+    };
+  });
 }
 
 // Finds the InterfaceDefinition (if any) whose participants cover both
 // ends of a pair — the coverage lookup every pairwise-facing function below
 // needs, now that a definition can have more than 2 participants.
-function findDefinitionForPair(architecture: Architecture, fromId: string, toId: string): InterfaceDefinition | undefined {
+function findDefinitionForPair(
+  architecture: Architecture,
+  fromId: string,
+  toId: string,
+): InterfaceDefinition | undefined {
   return (architecture.interfaceDefinitions ?? []).find(
-    (d) => d.participants.some((p) => p.elementId === fromId) && d.participants.some((p) => p.elementId === toId),
-  )
+    (d) =>
+      d.participants.some((p) => p.elementId === fromId) &&
+      d.participants.some((p) => p.elementId === toId),
+  );
 }
 
 // Every participant element's own ElementInterfaceDefinition entry for a
 // given master definition, resolved to the live element records.
-function participantElements(architecture: Architecture, definition: InterfaceDefinition): ArchitectureElement[] {
-  const ids = new Set(definition.participants.map((p) => p.elementId))
-  return architecture.elements.filter((e) => ids.has(e.id))
+function participantElements(
+  architecture: Architecture,
+  definition: InterfaceDefinition,
+): ArchitectureElement[] {
+  const ids = new Set(definition.participants.map((p) => p.elementId));
+  return architecture.elements.filter((e) => ids.has(e.id));
 }
 
 // Seeds/updates one participant element's own local copy to mirror the
@@ -779,18 +1139,20 @@ function seedElementInterface(
   definition: InterfaceDefinition,
   role: InterfaceRole,
 ): void {
-  const existing = element.elementInterfaces.find((ei) => ei.masterDefinitionId === definition.id)
+  const existing = element.elementInterfaces.find(
+    (ei) => ei.masterDefinitionId === definition.id,
+  );
   const entry: ElementInterfaceDefinition = {
     masterDefinitionId: definition.id,
     role,
     operations: definition.operations.map((op) => ({ ...op })),
     aligned: true,
     reqsCheckedAt: existing?.reqsCheckedAt,
-  }
+  };
   if (existing) {
-    Object.assign(existing, entry)
+    Object.assign(existing, entry);
   } else {
-    element.elementInterfaces.push(entry)
+    element.elementInterfaces.push(entry);
   }
 }
 
@@ -801,27 +1163,35 @@ function seedElementInterface(
 // to run for any element with an aligned:false entry until a human
 // reconciles it (updates its own operations copy via
 // reconcileElementInterface below).
-function markParticipantsMisaligned(architecture: Architecture, definition: InterfaceDefinition, exceptElementId?: string): void {
+function markParticipantsMisaligned(
+  architecture: Architecture,
+  definition: InterfaceDefinition,
+  exceptElementId?: string,
+): void {
   for (const element of participantElements(architecture, definition)) {
-    if (element.id === exceptElementId) continue
-    const entry = element.elementInterfaces.find((ei) => ei.masterDefinitionId === definition.id)
+    if (element.id === exceptElementId) continue;
+    const entry = element.elementInterfaces.find(
+      (ei) => ei.masterDefinitionId === definition.id,
+    );
     if (entry) {
-      entry.aligned = false
+      entry.aligned = false;
     } else {
-      const participant = definition.participants.find((p) => p.elementId === element.id)
+      const participant = definition.participants.find(
+        (p) => p.elementId === element.id,
+      );
       element.elementInterfaces.push({
         masterDefinitionId: definition.id,
-        role: participant?.role ?? 'both',
+        role: participant?.role ?? "both",
         operations: [],
         aligned: false,
-      })
+      });
     }
   }
 }
 
 export interface DefineInterfaceDefinitionResult {
-  definition: InterfaceDefinition
-  usage?: LlmUsage
+  definition: InterfaceDefinition;
+  usage?: LlmUsage;
 }
 
 // Shared persistence for both the LLM-authored path
@@ -836,17 +1206,24 @@ function persistInterfaceDefinition(
   definition: InterfaceDefinition,
   authoredByElementId?: string,
 ): void {
-  definition.updatedAt = new Date().toISOString()
-  const existing = architecture.interfaceDefinitions ?? []
-  architecture.interfaceDefinitions = [...existing.filter((d) => d.id !== definition.id), definition]
+  definition.updatedAt = new Date().toISOString();
+  const existing = architecture.interfaceDefinitions ?? [];
+  architecture.interfaceDefinitions = [
+    ...existing.filter((d) => d.id !== definition.id),
+    definition,
+  ];
 
   if (authoredByElementId) {
-    const authorRole = definition.participants.find((p) => p.elementId === authoredByElementId)?.role ?? 'both'
-    const author = architecture.elements.find((e) => e.id === authoredByElementId)
-    if (author) seedElementInterface(author, definition, authorRole)
+    const authorRole =
+      definition.participants.find((p) => p.elementId === authoredByElementId)
+        ?.role ?? "both";
+    const author = architecture.elements.find(
+      (e) => e.id === authoredByElementId,
+    );
+    if (author) seedElementInterface(author, definition, authorRole);
   }
-  markParticipantsMisaligned(architecture, definition, authoredByElementId)
-  void project
+  markParticipantsMisaligned(architecture, definition, authoredByElementId);
+  void project;
 }
 
 function nextInterfaceId(architecture: Architecture): string {
@@ -863,16 +1240,17 @@ function nextInterfaceId(architecture: Architecture): string {
   // applyLegacyDefaults's own repair logic, so a bad seq self-heals here
   // too instead of only being fixed at load time.
   const seq =
-    typeof architecture.nextInterfaceSeq === 'number' && Number.isFinite(architecture.nextInterfaceSeq)
+    typeof architecture.nextInterfaceSeq === "number" &&
+    Number.isFinite(architecture.nextInterfaceSeq)
       ? architecture.nextInterfaceSeq
       : (() => {
           const existingSeqs = (architecture.interfaceDefinitions ?? [])
-            .map((d) => Number(d.id.replace('IFACE-', '')))
-            .filter((n) => Number.isFinite(n))
-          return existingSeqs.length > 0 ? Math.max(...existingSeqs) + 1 : 1
-        })()
-  architecture.nextInterfaceSeq = seq + 1
-  return `IFACE-${String(seq).padStart(3, '0')}`
+            .map((d) => Number(d.id.replace("IFACE-", "")))
+            .filter((n) => Number.isFinite(n));
+          return existingSeqs.length > 0 ? Math.max(...existingSeqs) + 1 : 1;
+        })();
+  architecture.nextInterfaceSeq = seq + 1;
+  return `IFACE-${String(seq).padStart(3, "0")}`;
 }
 
 // Defines (or redefines) the structured master definition for a single
@@ -888,43 +1266,58 @@ export async function defineInterfaceDefinition(
   toId: string,
   llmOptions?: LlmCallOptions,
 ): Promise<DefineInterfaceDefinitionResult> {
-  const architecture = requireArchitecture(project)
-  const from = architecture.elements.find((e) => e.id === fromId)
-  const to = architecture.elements.find((e) => e.id === toId)
+  const architecture = requireArchitecture(project);
+  const from = architecture.elements.find((e) => e.id === fromId);
+  const to = architecture.elements.find((e) => e.id === toId);
   if (!from || !to) {
-    throw new Error('Both architecture elements must exist to define their interface')
+    throw new Error(
+      "Both architecture elements must exist to define their interface",
+    );
   }
 
   const messages = [
-    { role: 'system' as const, content: DEFINE_INTERFACE_CONTRACT_SYSTEM_PROMPT },
-    { role: 'user' as const, content: formatElementList([from, to]) },
-  ]
-  const result = await llmClient.chat(messages, llmOptions)
-  const operations = result.content.trim() === 'NONE' ? [] : parseOperations(result.content)
+    {
+      role: "system" as const,
+      content: DEFINE_INTERFACE_CONTRACT_SYSTEM_PROMPT,
+    },
+    { role: "user" as const, content: formatElementList([from, to]) },
+  ];
+  const result = await llmClient.chat(messages, llmOptions);
+  const operations =
+    result.content.trim() === "NONE" ? [] : parseOperations(result.content);
+  // DECLARE lines are emitted even when OPERATION is NONE, so parse them
+  // from the raw reply regardless (project harness feature).
+  const declarations = parseDeclarations(result.content);
 
-  const existing = findDefinitionForPair(architecture, fromId, toId)
+  const existing = findDefinitionForPair(architecture, fromId, toId);
   const definition: InterfaceDefinition = existing
-    ? { ...existing, operations, status: 'defined' }
+    ? {
+        ...existing,
+        operations,
+        status: "defined",
+        declarations: mergeDeclarations(existing.declarations, declarations),
+      }
     : {
         id: nextInterfaceId(architecture),
         name: `${from.name} ↔ ${to.name}`,
         participants: [
-          { elementId: fromId, role: 'both' },
-          { elementId: toId, role: 'both' },
+          { elementId: fromId, role: "both" },
+          { elementId: toId, role: "both" },
         ],
         operations,
-        status: 'defined',
-        updatedAt: '',
-      }
-  persistInterfaceDefinition(project, architecture, definition)
+        status: "defined",
+        updatedAt: "",
+        declarations: declarations.length > 0 ? declarations : undefined,
+      };
+  persistInterfaceDefinition(project, architecture, definition);
   // Both sides are seeded aligned here (unlike the single-author case in
   // setInterfaceDefinition) since the Architect authored both sides at once
   // — there is no single "other participant" to leave misaligned.
   for (const p of definition.participants) {
-    const element = architecture.elements.find((e) => e.id === p.elementId)
-    if (element) seedElementInterface(element, definition, p.role)
+    const element = architecture.elements.find((e) => e.id === p.elementId);
+    if (element) seedElementInterface(element, definition, p.role);
   }
-  return { definition, usage: result.usage }
+  return { definition, usage: result.usage };
 }
 
 // Manual counterpart to defineInterfaceDefinition — the human (Architect
@@ -943,22 +1336,24 @@ export function setInterfaceDefinition(
   participants: Array<{ elementId: string; role: InterfaceRole }>,
   operations: InterfaceContractOperation[],
 ): InterfaceDefinition {
-  const architecture = requireArchitecture(project)
+  const architecture = requireArchitecture(project);
   if (participants.length < 2) {
-    throw new Error('An interface definition needs at least 2 participants')
+    throw new Error("An interface definition needs at least 2 participants");
   }
   for (const p of participants) {
     if (!architecture.elements.some((e) => e.id === p.elementId)) {
-      throw new Error(`Architecture element ${p.elementId} not found`)
+      throw new Error(`Architecture element ${p.elementId} not found`);
     }
   }
-  const participantIds = new Set(participants.map((p) => p.elementId))
+  const participantIds = new Set(participants.map((p) => p.elementId));
   const anyConnected = participants.some((p) => {
-    const element = architecture.elements.find((e) => e.id === p.elementId)!
-    return element.interfaces.some((id) => participantIds.has(id))
-  })
+    const element = architecture.elements.find((e) => e.id === p.elementId)!;
+    return element.interfaces.some((id) => participantIds.has(id));
+  });
   if (!anyConnected) {
-    throw new Error('These elements are not connected — add the interface connection first')
+    throw new Error(
+      "These elements are not connected — add the interface connection first",
+    );
   }
 
   const definition: InterfaceDefinition = {
@@ -966,19 +1361,19 @@ export function setInterfaceDefinition(
     name,
     participants,
     operations,
-    status: 'defined',
-    updatedAt: '',
-  }
-  persistInterfaceDefinition(project, architecture, definition)
+    status: "defined",
+    updatedAt: "",
+  };
+  persistInterfaceDefinition(project, architecture, definition);
   // The human authoring this form is editing every participant's shared
   // understanding at once (unlike reconcileElementInterface, which edits
   // just one element's own copy) — seed every participant aligned, same as
   // the LLM path above.
   for (const p of participants) {
-    const element = architecture.elements.find((e) => e.id === p.elementId)
-    if (element) seedElementInterface(element, definition, p.role)
+    const element = architecture.elements.find((e) => e.id === p.elementId);
+    if (element) seedElementInterface(element, definition, p.role);
   }
-  return definition
+  return definition;
 }
 
 // Reconciles one element's own local interface copy against its current
@@ -994,24 +1389,28 @@ export function reconcileElementInterface(
   masterDefinitionId: string,
   operations: InterfaceContractOperation[],
 ): ElementInterfaceDefinition {
-  const architecture = requireArchitecture(project)
-  const element = architecture.elements.find((e) => e.id === elementId)
+  const architecture = requireArchitecture(project);
+  const element = architecture.elements.find((e) => e.id === elementId);
   if (!element) {
-    throw new Error(`Architecture element ${elementId} not found`)
+    throw new Error(`Architecture element ${elementId} not found`);
   }
-  const entry = element.elementInterfaces.find((ei) => ei.masterDefinitionId === masterDefinitionId)
+  const entry = element.elementInterfaces.find(
+    (ei) => ei.masterDefinitionId === masterDefinitionId,
+  );
   if (!entry) {
-    throw new Error(`${elementId} does not participate in interface ${masterDefinitionId}`)
+    throw new Error(
+      `${elementId} does not participate in interface ${masterDefinitionId}`,
+    );
   }
-  entry.operations = operations
-  entry.aligned = true
-  entry.reqsCheckedAt = new Date().toISOString()
-  return entry
+  entry.operations = operations;
+  entry.aligned = true;
+  entry.reqsCheckedAt = new Date().toISOString();
+  return entry;
 }
 
 export interface DefineAllInterfaceDefinitionsResult {
-  definitions: InterfaceDefinition[]
-  usage?: LlmUsage
+  definitions: InterfaceDefinition[];
+  usage?: LlmUsage;
 }
 
 // "Define Interfaces" action bar button — runs defineInterfaceDefinition for
@@ -1032,21 +1431,121 @@ export async function defineAllInterfaceDefinitions(
   llmOptions?: LlmCallOptions,
   force = false,
 ): Promise<DefineAllInterfaceDefinitionsResult> {
-  const architecture = requireArchitecture(project)
-  const pairs = connectedPairs(architecture.elements)
+  const architecture = requireArchitecture(project);
+  const pairs = connectedPairs(architecture.elements);
   const pending = force
     ? pairs
     : pairs.filter((p) => {
-        const definition = findDefinitionForPair(architecture, p.fromId, p.toId)
-        return !definition || definition.status !== 'defined'
-      })
+        const definition = findDefinitionForPair(
+          architecture,
+          p.fromId,
+          p.toId,
+        );
+        return !definition || definition.status !== "defined";
+      });
 
-  let usage: LlmUsage | undefined
+  let usage: LlmUsage | undefined;
   for (const pair of pending) {
-    const result = await defineInterfaceDefinition(project, llmClient, pair.fromId, pair.toId, llmOptions)
-    usage = addUsage(usage, result.usage)
+    const result = await defineInterfaceDefinition(
+      project,
+      llmClient,
+      pair.fromId,
+      pair.toId,
+      llmOptions,
+    );
+    usage = addUsage(usage, result.usage);
   }
-  return { definitions: architecture.interfaceDefinitions ?? [], usage }
+  return { definitions: architecture.interfaceDefinitions ?? [], usage };
+}
+
+export interface DeriveHarnessSpecResult {
+  harnessSpec: HarnessSpec;
+  usage?: LlmUsage;
+}
+
+const HARNESS_CHECK_LINE =
+  /^CHECK:\s*([a-z-]+)\s*\|\s*([a-z-]+)\s*\|\s*(.+)$/gm;
+const HARNESS_LINK_LINE = /^LINK:\s*(IFACE-[^\s|]+)\s*\|\s*(.+)$/gm;
+const HARNESS_NARRATIVE_LINE = /^NARRATIVE:\s*([\s\S]+?)(?:\n{2,}|$)/m;
+
+// "Define Harness" action (project harness feature) — one Architect call
+// producing the HarnessSpec for how this project's harness realises its
+// entry point, element instantiation, inter-element links and run lifecycle
+// on the given platform. Regenerates (never merges) the spec and stores it
+// on the single kind:'harness' element. Also (re)connects the harness
+// element to every other element so the grid draws it wired to all — those
+// edges are not interface contracts (connectedPairs skips them).
+export async function deriveHarnessSpec(
+  project: Project,
+  llmClient: LlmClient,
+  platform: PlatformDescriptor,
+  llmOptions?: LlmCallOptions,
+): Promise<DeriveHarnessSpecResult> {
+  const architecture = requireArchitecture(project);
+  const harness = ensureHarnessElement(project);
+  const others = architecture.elements.filter((e) => e.kind !== "harness");
+  const definitions = architecture.interfaceDefinitions ?? [];
+
+  const messages = buildHarnessSpecMessages(
+    platform,
+    DEFAULT_HARNESS_CHECKLIST,
+    others,
+    definitions,
+  );
+  const result = await llmClient.chat(messages, llmOptions);
+
+  const parsedChecks = new Map<
+    string,
+    { status: HarnessChecklistStatus; realisation: string }
+  >();
+  for (const m of result.content.matchAll(HARNESS_CHECK_LINE)) {
+    const key = m[1].trim();
+    const rawStatus = m[2].trim();
+    const status: HarnessChecklistStatus =
+      rawStatus === "applies"
+        ? "applies"
+        : rawStatus === "not-applicable"
+          ? "not-applicable"
+          : "unknown";
+    parsedChecks.set(key, { status, realisation: m[3].trim() });
+  }
+  // Emit one checklist item per DEFAULT key regardless of what the model
+  // returned — a missing CHECK line becomes 'unknown' rather than dropping
+  // the concern silently.
+  const checklist: HarnessChecklistItem[] = DEFAULT_HARNESS_CHECKLIST.map(
+    (c) => {
+      const parsed = parsedChecks.get(c.key);
+      return {
+        key: c.key,
+        status: parsed?.status ?? "unknown",
+        realisation: parsed?.realisation ?? "",
+      };
+    },
+  );
+
+  const definitionIds = new Set(definitions.map((d) => d.id));
+  const linkRealisations: HarnessLinkRealisation[] = [];
+  for (const m of result.content.matchAll(HARNESS_LINK_LINE)) {
+    const id = m[1].trim();
+    if (!definitionIds.has(id)) continue;
+    linkRealisations.push({ masterDefinitionId: id, summary: m[2].trim() });
+  }
+
+  const narrativeMatch = HARNESS_NARRATIVE_LINE.exec(result.content);
+  const narrative = narrativeMatch ? narrativeMatch[1].trim() : "";
+
+  const harnessSpec: HarnessSpec = {
+    derivedForPlatform: platform.id,
+    checklist,
+    linkRealisations,
+    narrative,
+    derivedAt: new Date().toISOString(),
+  };
+  harness.harnessSpec = harnessSpec;
+  // Wire the harness to every other element for the grid.
+  harness.interfaces = others.map((e) => e.id);
+
+  return { harnessSpec, usage: result.usage };
 }
 
 export interface CheckInterfacesResult {
@@ -1054,22 +1553,22 @@ export interface CheckInterfacesResult {
   // definition has no operations (the LLM found nothing to define, which
   // usually means the responsibility text is too vague to specify a
   // definition from).
-  undefinedPairs: Array<{ fromId: string; toId: string }>
+  undefinedPairs: Array<{ fromId: string; toId: string }>;
   // Definitions whose status is 'stale' (a participant's responsibility
   // text changed since this definition was last defined).
-  staleContracts: InterfaceDefinition[]
+  staleContracts: InterfaceDefinition[];
   // Operations on an otherwise-'defined' definition that are missing
   // range/resolution/unit, or missing both updateFrequency and
   // drivenDirectly (Area B, interface data-contract requirement) — distinct
   // from undefinedPairs, which has no definition/operations to inspect at
   // all.
-  incompleteOperations: IncompleteOperation[]
+  incompleteOperations: IncompleteOperation[];
   // Elements with at least one aligned:false entry — flagged the instant a
   // master definition they participate in changes, until a human
   // reconciles that element's own copy (reconcileElementInterface). Hard
   // blocks Coding for that element (see interfaceGateReasonForElement in
   // modules/coding).
-  misalignedElements: Array<{ elementId: string; masterDefinitionId: string }>
+  misalignedElements: Array<{ elementId: string; masterDefinitionId: string }>;
   // Elements with an elementInterfaces entry whose masterDefinitionId does
   // not match any real definition in architecture.interfaceDefinitions — a
   // dangling reference, distinct from misalignment (aligned can be true on
@@ -1083,17 +1582,27 @@ export interface CheckInterfacesResult {
   // misalignment (see interfaceGateReasonForElement) since there is no
   // "operations" content to fall back on for a definition that doesn't
   // exist at all — a human must re-author or remove the connection.
-  danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }>
-  complete: boolean
+  danglingElementInterfaces: Array<{
+    elementId: string;
+    masterDefinitionId: string;
+  }>;
+  // Non-harness elements that have no platform-neutral declaration (does /
+  // exposes / owns / scope) on any interface definition they participate in
+  // (project harness feature). Advisory only — does NOT block functional-
+  // element Coding — but the harness Coding gate does require every non-
+  // harness element to have one. Re-running Define Interfaces backfills it.
+  missingDeclarations: string[];
+  complete: boolean;
 }
 
 function missingDataContractFields(op: InterfaceContractOperation): string[] {
-  const missing: string[] = []
-  if (!op.range) missing.push('range')
-  if (!op.resolution) missing.push('resolution')
-  if (!op.unit) missing.push('unit')
-  if (!op.updateFrequency && !op.drivenDirectly) missing.push('update frequency (or driven-directly)')
-  return missing
+  const missing: string[] = [];
+  if (!op.range) missing.push("range");
+  if (!op.resolution) missing.push("resolution");
+  if (!op.unit) missing.push("unit");
+  if (!op.updateFrequency && !op.drivenDirectly)
+    missing.push("update frequency (or driven-directly)");
+  return missing;
 }
 
 // "Check Interfaces" action bar button — a local, non-LLM pass over the
@@ -1106,39 +1615,76 @@ function missingDataContractFields(op: InterfaceContractOperation): string[] {
 // but misalignedElements is also read directly by Coding's hard gate
 // (interfaceGateReasonForElement, Area D), not just advisory.
 export function checkInterfaces(project: Project): CheckInterfacesResult {
-  const architecture = requireArchitecture(project)
-  const pairs = connectedPairs(architecture.elements)
-  const definitions = architecture.interfaceDefinitions ?? []
+  const architecture = requireArchitecture(project);
+  const pairs = connectedPairs(architecture.elements);
+  const definitions = architecture.interfaceDefinitions ?? [];
 
-  const undefinedPairs: Array<{ fromId: string; toId: string }> = []
-  const incompleteOperations: IncompleteOperation[] = []
+  const undefinedPairs: Array<{ fromId: string; toId: string }> = [];
+  const incompleteOperations: IncompleteOperation[] = [];
   for (const pair of pairs) {
-    const definition = findDefinitionForPair(architecture, pair.fromId, pair.toId)
-    if (!definition || definition.status !== 'defined' || definition.operations.length === 0) {
-      undefinedPairs.push(pair)
-      continue
+    const definition = findDefinitionForPair(
+      architecture,
+      pair.fromId,
+      pair.toId,
+    );
+    if (
+      !definition ||
+      definition.status !== "defined" ||
+      definition.operations.length === 0
+    ) {
+      undefinedPairs.push(pair);
+      continue;
     }
     for (const op of definition.operations) {
-      const missingFields = missingDataContractFields(op)
+      const missingFields = missingDataContractFields(op);
       if (missingFields.length > 0) {
-        incompleteOperations.push({ fromId: pair.fromId, toId: pair.toId, operationName: op.name, missingFields })
+        incompleteOperations.push({
+          fromId: pair.fromId,
+          toId: pair.toId,
+          operationName: op.name,
+          missingFields,
+        });
       }
     }
   }
-  const staleContracts = definitions.filter((d) => d.status === 'stale')
+  const staleContracts = definitions.filter((d) => d.status === "stale");
 
-  const definitionIds = new Set(definitions.map((d) => d.id))
-  const misalignedElements: Array<{ elementId: string; masterDefinitionId: string }> = []
-  const danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }> = []
+  const definitionIds = new Set(definitions.map((d) => d.id));
+  const misalignedElements: Array<{
+    elementId: string;
+    masterDefinitionId: string;
+  }> = [];
+  const danglingElementInterfaces: Array<{
+    elementId: string;
+    masterDefinitionId: string;
+  }> = [];
   for (const element of architecture.elements) {
     for (const entry of element.elementInterfaces) {
       if (!definitionIds.has(entry.masterDefinitionId)) {
-        danglingElementInterfaces.push({ elementId: element.id, masterDefinitionId: entry.masterDefinitionId })
-        continue
+        danglingElementInterfaces.push({
+          elementId: element.id,
+          masterDefinitionId: entry.masterDefinitionId,
+        });
+        continue;
       }
-      if (!entry.aligned) misalignedElements.push({ elementId: element.id, masterDefinitionId: entry.masterDefinitionId })
+      if (!entry.aligned)
+        misalignedElements.push({
+          elementId: element.id,
+          masterDefinitionId: entry.masterDefinitionId,
+        });
     }
   }
+
+  // Every non-harness element should have a platform-neutral declaration on
+  // at least one definition it participates in (project harness feature).
+  const declaredElementIds = new Set<string>();
+  for (const def of definitions) {
+    for (const decl of def.declarations ?? [])
+      declaredElementIds.add(decl.elementId);
+  }
+  const missingDeclarations = architecture.elements
+    .filter((e) => e.kind !== "harness" && !declaredElementIds.has(e.id))
+    .map((e) => e.id);
 
   return {
     undefinedPairs,
@@ -1146,11 +1692,12 @@ export function checkInterfaces(project: Project): CheckInterfacesResult {
     incompleteOperations,
     misalignedElements,
     danglingElementInterfaces,
+    missingDeclarations,
     complete:
       undefinedPairs.length === 0 &&
       staleContracts.length === 0 &&
       incompleteOperations.length === 0 &&
       misalignedElements.length === 0 &&
       danglingElementInterfaces.length === 0,
-  }
+  };
 }

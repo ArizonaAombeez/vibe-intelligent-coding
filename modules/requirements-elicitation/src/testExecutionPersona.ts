@@ -1,5 +1,5 @@
 import type { LlmMessage } from './LlmClient.js'
-import type { TestCase, TestRun } from './types.js'
+import type { Project, TestCase, TestRun } from './types.js'
 
 // Total character budget for code files folded into the user-reported-
 // issue triage call's context — same rough token-cap proxy (~4 chars/
@@ -26,6 +26,38 @@ export function formatCodeContextForTriage(files: Array<{ path: string; content:
   return `Element's current source files:\n\n${body}${omittedNote}`
 }
 
+// One line per architecture element (id, kind, name, responsibility),
+// including the single kind:'harness' element — folded into both triage
+// prompts so the LLM can name which element(s) it actually suspects are at
+// fault rather than being limited to the test's static
+// architectureElementId. The fault often lies in a collaborator or in the
+// Harness wiring; this list is what lets triage say so. The verdict this
+// produces (SUSPECTED-ELEMENTS: line) is ADVISORY — see
+// TestCaseOutcome.suspectedElementIds.
+export function formatArchitectureForTriage(project: Project): string {
+  const elements = project.architecture?.elements ?? []
+  if (elements.length === 0) return '(no architecture elements defined)'
+  return elements
+    .map((e) => `${e.id} (${e.kind}) ${e.name} — ${e.responsibility}`)
+    .join('\n')
+}
+
+// Appended to both triage user messages: the element list plus a nudge
+// that the static link is a starting point, not a conclusion.
+function architectureContextBlock(architectureContext: string, staticElementHint: string): string {
+  return `Architecture elements (the failure should be attributable to one or more of these):
+${architectureContext}
+
+${staticElementHint}
+After your verdict line, add exactly one more line naming the element id(s)
+you actually suspect are at fault, most likely first:
+
+SUSPECTED-ELEMENTS: <comma-separated element ids>
+
+If you have no reason to suspect anything other than the element the test
+is linked to, just name that one.`
+}
+
 // Test failure triage (Area F, resolved) — every failure must be
 // attributed to code-failure, test-case-failure, or requirement-issue
 // before any status change occurs; a 'test-case-failure' verdict is
@@ -46,11 +78,16 @@ command's captured output, decide whether the failure means:
   test and implementation may both be doing exactly what the requirement
   says, but the requirement text itself needs to change)
 
-Reply using exactly one of these three line formats, nothing else:
+Your reply is exactly two lines. The first is one of these three verdict
+formats:
 
 CODE-FAILURE: <short rationale>
 TEST-CASE-FAILURE: <short rationale>
 REQUIREMENT-ISSUE: <short rationale>
+
+The second line names the architecture element id(s) you suspect are at
+fault (see the SUSPECTED-ELEMENTS instruction in the user message). Output
+nothing else.
 
 Only reply TEST-CASE-FAILURE if you are confident the test itself, not the
 implementation or the requirement, is at fault — this is expected to be
@@ -62,12 +99,21 @@ still default to CODE-FAILURE, since a code-failure verdict feeds back to
 Coding for rework rather than blocking on a human, and rework can reveal a
 test or requirement problem indirectly).`
 
-export function buildTriageMessages(testTitle: string, verifies: string, output: string): LlmMessage[] {
+export function buildTriageMessages(
+  testTitle: string,
+  verifies: string,
+  output: string,
+  architectureContext: string,
+  staticElementId: string | null,
+): LlmMessage[] {
+  const hint = staticElementId
+    ? `The test is statically linked to element ${staticElementId}, but the real fault may lie in a collaborator it calls, or in the Harness wiring.\n`
+    : `The test has no single statically-linked element.\n`
   return [
     { role: 'system', content: TEST_FAILURE_TRIAGE_SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `Test: ${testTitle}\nVerifies: ${verifies}\n\nTest command output:\n${output}`,
+      content: `Test: ${testTitle}\nVerifies: ${verifies}\n\nTest command output:\n${output}\n\n${architectureContextBlock(architectureContext, hint)}`,
     },
   ]
 }
@@ -93,15 +139,19 @@ described problem means:
 - the requirement itself is wrong, ambiguous, or missing what the user
   described
 
-Reply using exactly one of these three line formats, nothing else:
+If the message IS describing a problem with this test case, your reply is
+exactly two lines. The first is one of these three verdict formats:
 
 CODE-FAILURE: <short rationale>
 TEST-CASE-FAILURE: <short rationale>
 REQUIREMENT-ISSUE: <short rationale>
 
+The second line names the architecture element id(s) you suspect are at
+fault (see the SUSPECTED-ELEMENTS instruction below).
+
 If the message is not actually describing a problem with this test case
 (e.g. a general question, or discussion that isn't reporting an issue),
-reply exactly:
+reply with exactly this single line and nothing else:
 
 NOT-AN-ISSUE-REPORT
 
@@ -116,8 +166,13 @@ export function buildUserReportedIssueTriageMessages(
   verifies: string,
   latestRunSummary: string,
   userMessage: string,
+  architectureContext: string,
+  staticElementId: string | null,
   codeContext?: string,
 ): LlmMessage[] {
+  const hint = staticElementId
+    ? `The test is statically linked to element ${staticElementId}, but the real fault may lie in a collaborator it calls, or in the Harness wiring.\n`
+    : `The test has no single statically-linked element.\n`
   const parts = [
     `Test: ${testTitle}`,
     `Verifies: ${verifies}`,
@@ -125,6 +180,7 @@ export function buildUserReportedIssueTriageMessages(
     `User's description of the problem:\n${userMessage}`,
   ]
   if (codeContext) parts.push(codeContext)
+  parts.push(architectureContextBlock(architectureContext, hint))
   return [
     { role: 'system', content: USER_REPORTED_ISSUE_TRIAGE_SYSTEM_PROMPT },
     { role: 'user', content: parts.join('\n\n') },

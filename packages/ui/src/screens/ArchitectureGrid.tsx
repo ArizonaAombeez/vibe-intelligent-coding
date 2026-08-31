@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import * as d3 from 'd3'
-import { EXTERNAL_CONTEXT_ROW, type Architecture, type ArchitectureElement, type ArchitectureElementKind, type Status } from '../api/types'
+import { EXTERNAL_CONTEXT_ROW, HARNESS_ROW, type Architecture, type ArchitectureElement, type ArchitectureElementKind, type Status } from '../api/types'
 import { STATUS_COLOR } from '../statusColor'
 
 interface ArchitectureGridProps {
@@ -48,6 +48,7 @@ const KIND_FILL: Record<ArchitectureElementKind, string> = {
   service: 'var(--accent-bg)',
   external: 'var(--bg-alt)',
   runtime: 'var(--accent-bg)',
+  harness: 'var(--bg-alt)',
 }
 
 const KIND_STROKE: Record<ArchitectureElementKind, string> = {
@@ -56,6 +57,7 @@ const KIND_STROKE: Record<ArchitectureElementKind, string> = {
   service: 'var(--border)',
   external: 'var(--text-muted)',
   runtime: 'var(--accent)',
+  harness: 'var(--accent)',
 }
 
 const KIND_DASH: Record<ArchitectureElementKind, string> = {
@@ -64,6 +66,7 @@ const KIND_DASH: Record<ArchitectureElementKind, string> = {
   service: '',
   external: '',
   runtime: '6,4',
+  harness: '2,3',
 }
 
 function elementX(col: number): number {
@@ -85,7 +88,7 @@ interface WrappedBand {
 // an external band actually exists, so projects with no external elements
 // render identically to before this concept was introduced.
 function elementY(bandIndex: number, row: number, hasExternalBand: boolean): number {
-  if (row === EXTERNAL_CONTEXT_ROW) return MARGIN_TOP
+  if (row === EXTERNAL_CONTEXT_ROW || row === HARNESS_ROW) return MARGIN_TOP
   const mainTop = hasExternalBand ? MARGIN_TOP + CELL_HEIGHT + EXTERNAL_BAND_GAP : MARGIN_TOP
   return mainTop + bandIndex * (CELL_HEIGHT + CELL_GAP)
 }
@@ -98,7 +101,7 @@ function elementY(bandIndex: number, row: number, hasExternalBand: boolean): num
 function computeWrappedLayout(elements: ArchitectureElement[], layerCount: number, maxColsPerRow: number) {
   const elementsByRow = new Map<number, ArchitectureElement[]>()
   for (const el of elements) {
-    if (el.row === EXTERNAL_CONTEXT_ROW) continue
+    if (el.row === EXTERNAL_CONTEXT_ROW || el.row === HARNESS_ROW) continue
     const list = elementsByRow.get(el.row) ?? []
     list.push(el)
     elementsByRow.set(el.row, list)
@@ -173,7 +176,14 @@ export function ArchitectureGrid({
     const svg = d3.select(svgRef.current)
     svg.selectAll('*').remove()
 
-    const externalElements = architecture.elements.filter((e) => e.row === EXTERNAL_CONTEXT_ROW)
+    // The external-context band also hosts the single project-harness
+    // element (project harness feature): both sit "above" the main layer
+    // grid as context/scaffolding rather than on a functional layer. The
+    // harness keeps its own dashed-accent styling (KIND_STROKE/KIND_DASH)
+    // so it still reads as distinct from true external systems.
+    const externalElements = architecture.elements.filter(
+      (e) => e.row === EXTERNAL_CONTEXT_ROW || e.row === HARNESS_ROW,
+    )
     const hasExternalBand = externalElements.length > 0
 
     const maxColByWidth = Math.max(1, Math.floor((containerWidth - MARGIN_LEFT + CELL_GAP) / (CELL_WIDTH + CELL_GAP)))
@@ -185,8 +195,9 @@ export function ArchitectureGrid({
       architecture.layers.length,
       maxColsPerRow,
     )
-    const colFor = (el: ArchitectureElement) => (el.row === EXTERNAL_CONTEXT_ROW ? el.col : colByElementId.get(el.id) ?? el.col)
-    const bandIndexFor = (el: ArchitectureElement) => (el.row === EXTERNAL_CONTEXT_ROW ? 0 : bandIndexByElementId.get(el.id) ?? 0)
+    const colFor = (el: ArchitectureElement) => (el.row === EXTERNAL_CONTEXT_ROW || el.row === HARNESS_ROW ? el.col : colByElementId.get(el.id) ?? el.col)
+    const bandIndexFor = (el: ArchitectureElement) =>
+      el.row === EXTERNAL_CONTEXT_ROW || el.row === HARNESS_ROW ? 0 : bandIndexByElementId.get(el.id) ?? 0
     // First/last band index occupied by each logical layer — a layer that
     // wrapped into multiple bands gets one contiguous background strip
     // spanning all of them, plus a single label on its first band.

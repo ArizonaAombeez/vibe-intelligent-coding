@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, writeFile, readFile, rm, access } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { openLocalSourceTree } from '../src/localSourceTree.js'
+import { openLocalSourceTree, syncTreeInPlace } from '../src/localSourceTree.js'
 import { sourceTreeRoot } from '../src/scaffold.js'
 
 async function exists(p: string): Promise<boolean> {
@@ -93,6 +93,41 @@ test('syncBackAndDispose on a project with no prior srcRoot creates it fresh fro
     assert.equal(await readFile(path.join(srcRoot, 'first-element', 'index.html'), 'utf8'), '<html></html>')
   } finally {
     await rm(projectDir, { recursive: true, force: true })
+  }
+})
+
+test('syncTreeInPlace reconciles dest to match source without renaming dest itself (rename-swap fallback)', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'vic-synctree-test-'))
+  try {
+    const source = path.join(root, 'source')
+    const dest = path.join(root, 'dest')
+    // dest starts with: an unchanged file, a file whose content changes, a
+    // file that gets deleted, a whole folder that gets deleted, and a .git
+    // dir that must survive untouched.
+    await mkdir(path.join(dest, 'el', 'sub'), { recursive: true })
+    await mkdir(path.join(dest, 'gone-dir'), { recursive: true })
+    await mkdir(path.join(dest, '.git'), { recursive: true })
+    await writeFile(path.join(dest, 'el', 'unchanged.txt'), 'same', 'utf8')
+    await writeFile(path.join(dest, 'el', 'changes.txt'), 'old', 'utf8')
+    await writeFile(path.join(dest, 'el', 'removed.txt'), 'bye', 'utf8')
+    await writeFile(path.join(dest, 'gone-dir', 'x.txt'), 'bye', 'utf8')
+    await writeFile(path.join(dest, '.git', 'HEAD'), 'ref: refs/heads/main', 'utf8')
+
+    await mkdir(path.join(source, 'el', 'sub'), { recursive: true })
+    await writeFile(path.join(source, 'el', 'unchanged.txt'), 'same', 'utf8')
+    await writeFile(path.join(source, 'el', 'changes.txt'), 'new', 'utf8')
+    await writeFile(path.join(source, 'el', 'sub', 'added.txt'), 'hello', 'utf8')
+
+    await syncTreeInPlace(source, dest)
+
+    assert.equal(await readFile(path.join(dest, 'el', 'unchanged.txt'), 'utf8'), 'same')
+    assert.equal(await readFile(path.join(dest, 'el', 'changes.txt'), 'utf8'), 'new')
+    assert.equal(await readFile(path.join(dest, 'el', 'sub', 'added.txt'), 'utf8'), 'hello')
+    assert.equal(await exists(path.join(dest, 'el', 'removed.txt')), false, 'removed file should be gone')
+    assert.equal(await exists(path.join(dest, 'gone-dir')), false, 'removed folder should be gone')
+    assert.equal(await readFile(path.join(dest, '.git', 'HEAD'), 'utf8'), 'ref: refs/heads/main', '.git must be left untouched')
+  } finally {
+    await rm(root, { recursive: true, force: true })
   }
 })
 

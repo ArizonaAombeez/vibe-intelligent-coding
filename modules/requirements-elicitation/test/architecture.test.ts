@@ -5,6 +5,7 @@ import {
   createArchitectureElement,
   updateArchitectureElement,
   deleteArchitectureElement,
+  pruneOrphanedInterfaceReferences,
   addLayer,
   removeLayer,
   checkArchitectureConflicts,
@@ -13,11 +14,15 @@ import {
   acceptProposedInterface,
   defineInterfaceDefinition,
   defineAllInterfaceDefinitions,
+  deriveHarnessSpec,
   setInterfaceDefinition,
   checkInterfaces,
+  connectedPairs,
   EXTERNAL_CONTEXT_ROW,
   createRequirementFromForm as createRequirementFromFormReal,
   reassignArchitectureElement,
+  ensureHarnessElement,
+  importArchitecturePart,
 } from '../src/index.js'
 import type {
   LlmCallOptions,
@@ -31,12 +36,19 @@ import type {
 
 function emptyProject(): Project {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: 'proj-1',
     name: 'Test Project',
     projectMode: 'new',
     requirements: [],
   }
+}
+
+// Every project gets one auto-created kind:'harness' element (project
+// harness feature). Tests that predate that concept assert on the
+// functional/service/etc. elements only — filter it out here.
+function nonHarnessElements(project: Project) {
+  return (project.architecture?.elements ?? []).filter((e) => e.kind !== 'harness')
 }
 
 // Requirement ids come from a global counter in real use (see
@@ -83,7 +95,24 @@ test('setArchitectureType seeds the grid with the preset default layers', () => 
 
   assert.equal(project.architectureType, 'web-app')
   assert.deepEqual(project.architecture?.layers, ['UI', 'Service', 'Data'])
-  assert.deepEqual(project.architecture?.elements, [])
+  assert.deepEqual(nonHarnessElements(project), [])
+})
+
+test('setArchitectureType auto-creates the single mandatory harness element', () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app')
+  const harness = project.architecture?.elements.filter((e) => e.kind === 'harness') ?? []
+  assert.equal(harness.length, 1)
+  assert.equal(harness[0].id, 'ARCH-HARNESS')
+  // Re-selecting must not create a second one.
+  setArchitectureType(project, 'web-app')
+  assert.equal((project.architecture?.elements ?? []).filter((e) => e.kind === 'harness').length, 1)
+})
+
+test('deleteArchitectureElement refuses to delete the harness', () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app')
+  assert.throws(() => deleteArchitectureElement(project, 'ARCH-HARNESS'), /mandatory|cannot be deleted/i)
 })
 
 test('setArchitectureType does not wipe existing elements when re-selected', () => {
@@ -99,7 +128,7 @@ test('setArchitectureType does not wipe existing elements when re-selected', () 
 
   setArchitectureType(project, 'web-app')
 
-  assert.equal(project.architecture?.elements.length, 1, 're-selecting the same type must not wipe elements')
+  assert.equal(nonHarnessElements(project).length, 1, 're-selecting the same type must not wipe elements')
 })
 
 test('createArchitectureElement assigns sequential ARCH-NNN ids', () => {
@@ -193,8 +222,8 @@ test('deleteArchitectureElement removes the element and clears dangling referenc
 
   deleteArchitectureElement(project, frontend.id)
 
-  assert.equal(project.architecture?.elements.length, 1)
-  assert.deepEqual(project.architecture?.elements[0].interfaces, [], 'dangling interface reference must be cleared')
+  assert.equal(nonHarnessElements(project).length, 1)
+  assert.deepEqual(nonHarnessElements(project)[0].interfaces, [], 'dangling interface reference must be cleared')
   assert.deepEqual(project.requirements[0].architectureElements, [], 'requirement must fall back to unallocated')
   assert.equal(api.id, 'ARCH-002', 'surviving element keeps its own id')
 })
@@ -203,6 +232,105 @@ test('deleteArchitectureElement throws for an unknown element id', () => {
   const project = emptyProject()
   setArchitectureType(project, 'custom')
   assert.throws(() => deleteArchitectureElement(project, 'ARCH-999'), /ARCH-999/)
+})
+
+test('deleteArchitectureElement also removes the interface definition it participated in and every other element\'s copy (T4.1)', async () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'custom')
+  const engine = createArchitectureElement(project, {
+    kind: 'functional',
+    name: 'Game Engine',
+    responsibility: 'Runs the game loop',
+    row: 0,
+    col: 0,
+  })
+  const repo = createArchitectureElement(project, {
+    kind: 'service',
+    name: 'State Repository',
+    responsibility: 'Persists state',
+    row: 1,
+    col: 0,
+    interfaces: [engine.id],
+  })
+  // Give the pair a real defined contract, and seed both sides' local copy.
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('OPERATION: save|persist state|state|ack|NONE'),
+    engine.id,
+    repo.id,
+  )
+  const defBefore = project.architecture!.interfaceDefinitions!.find((d) =>
+    d.participants.some((p) => p.elementId === repo.id),
+  )
+  assert.ok(defBefore, 'contract exists before delete')
+  assert.ok(
+    project.architecture!.elements.find((e) => e.id === engine.id)!.elementInterfaces.length > 0,
+    'engine has a local copy of the contract before delete',
+  )
+
+  deleteArchitectureElement(project, repo.id)
+
+  assert.equal(
+    project.architecture!.interfaceDefinitions!.some((d) => d.id === defBefore.id),
+    false,
+    'the definition naming the deleted element is gone',
+  )
+  assert.deepEqual(
+    project.architecture!.elements.find((e) => e.id === engine.id)!.elementInterfaces,
+    [],
+    "the surviving element's local copy of that now-dead contract is cleared",
+  )
+})
+
+test('pruneOrphanedInterfaceReferences is idempotent and only removes provably-dead refs (T4.2)', async () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'custom')
+  const a = createArchitectureElement(project, { kind: 'functional', name: 'A', responsibility: 'a', row: 0, col: 0 })
+  const b = createArchitectureElement(project, {
+    kind: 'service',
+    name: 'B',
+    responsibility: 'b',
+    row: 1,
+    col: 0,
+    interfaces: [a.id],
+  })
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('OPERATION: ping|ping|x|y|NONE'),
+    a.id,
+    b.id,
+  )
+  // Inject an orphan directly, as a stale save would carry it.
+  project.architecture!.interfaceDefinitions!.push({
+    id: 'IFACE-DEAD',
+    name: 'A <-> Ghost',
+    participants: [
+      { elementId: a.id, role: 'both' },
+      { elementId: 'ARCH-GHOST', role: 'both' },
+    ],
+    status: 'defined',
+    updatedAt: new Date().toISOString(),
+    operations: [],
+  })
+  project.architecture!.elements.find((e) => e.id === a.id)!.elementInterfaces.push({
+    masterDefinitionId: 'IFACE-DEAD',
+    role: 'both',
+    aligned: true,
+    operations: [],
+  })
+  project.architecture!.elements.find((e) => e.id === a.id)!.interfaces.push('ARCH-GHOST')
+
+  const first = pruneOrphanedInterfaceReferences(project.architecture!)
+  assert.deepEqual(first.removedDefinitionIds, ['IFACE-DEAD'])
+  assert.equal(first.clearedElementInterfaceRefs.length, 1)
+  assert.deepEqual(first.removedGraphEdges, [{ elementId: a.id, toId: 'ARCH-GHOST' }])
+  // The real contract is untouched.
+  assert.ok(project.architecture!.interfaceDefinitions!.some((d) => d.id !== 'IFACE-DEAD'))
+
+  const second = pruneOrphanedInterfaceReferences(project.architecture!)
+  assert.deepEqual(second.removedDefinitionIds, [])
+  assert.equal(second.clearedElementInterfaceRefs.length, 0)
+  assert.deepEqual(second.removedGraphEdges, [])
 })
 
 test('addLayer appends a new layer row', () => {
@@ -422,7 +550,7 @@ test('autoConfigureAndAllocate only fills gaps: existing elements and already-al
 
   await autoConfigureAndAllocate(project, fake)
 
-  assert.equal(project.architecture?.elements.length, 2, 'existing element is kept, one new element added')
+  assert.equal(nonHarnessElements(project).length, 2, 'existing element is kept, one new element added')
   assert.deepEqual(
     project.requirements.find((r) => r.id === allocated.id)?.architectureElements,
     [existing.id],
@@ -494,7 +622,48 @@ test('autoAllocateLlm allocates onto existing elements only, never creating new 
   const fake = new FakeLlmClient(`ALLOCATE: ${r1.id}|Login UI`)
   const result = await autoAllocateLlm(project, fake)
 
-  assert.equal(project.architecture?.elements.length, 1, 'no new element was created')
+  assert.equal(nonHarnessElements(project).length, 1, 'no new element was created')
+  assert.deepEqual(result.allocatedRequirementIds, [r1.id])
+  assert.deepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [existing.id])
+})
+
+test('autoAllocateLlm allocates an import-prefixed requirement id (IMP_REQ-NNN)', async () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app')
+  const existing = createArchitectureElement(project, {
+    kind: 'functional',
+    name: 'Login UI',
+    responsibility: 'Renders the login form',
+    row: 0,
+    col: 0,
+  })
+  const r1 = createRequirementFromForm(project, { text: 'The system shall render a login form' })
+  // Simulate an imported requirement: id carries the IMP_ prefix that
+  // projectParts.importRequirementsFromPart stamps on.
+  r1.id = `IMP_${r1.id}`
+
+  const fake = new FakeLlmClient(`ALLOCATE: ${r1.id}|Login UI`)
+  const result = await autoAllocateLlm(project, fake)
+
+  assert.deepEqual(result.allocatedRequirementIds, [r1.id])
+  assert.deepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [existing.id])
+})
+
+test('autoAllocateLlm resolves a module name the LLM returned with different casing / trailing punctuation', async () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app')
+  const existing = createArchitectureElement(project, {
+    kind: 'functional',
+    name: 'Game Engine',
+    responsibility: 'Runs the game loop',
+    row: 0,
+    col: 0,
+  })
+  const r1 = createRequirementFromForm(project, { text: 'The system shall advance the game one tick' })
+
+  const fake = new FakeLlmClient(`ALLOCATE: ${r1.id}|game engine.`)
+  const result = await autoAllocateLlm(project, fake)
+
   assert.deepEqual(result.allocatedRequirementIds, [r1.id])
   assert.deepEqual(project.requirements.find((r) => r.id === r1.id)?.architectureElements, [existing.id])
 })
@@ -993,4 +1162,195 @@ test('defineInterfaceDefinition recovers a real id when nextInterfaceSeq is corr
   assert.equal(result.definition.id.includes('undefined'), false)
   assert.equal(result.definition.id.includes('NaN'), false)
   assert.match(result.definition.id, /^IFACE-\d+$/)
+})
+
+// ---------------------------------------------------------------------------
+// Project harness feature: DECLARE lines, deriveHarnessSpec, harness gating
+// ---------------------------------------------------------------------------
+
+test('defineInterfaceDefinition parses DECLARE lines into platform-neutral declarations', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  const llmClient = new FakeLlmClient(
+    'OPERATION: chargeCard|Charges the customer|orderId: string|receiptId: string|NONE\n' +
+      `DECLARE: ${from.id}|manages order lifecycle|submitOrder;cancelOrder|orders;orderTotals|${to.id}\n` +
+      `DECLARE: ${to.id}|processes payments|chargeCard|receipts|NONE`,
+  )
+
+  const result = await defineInterfaceDefinition(project, llmClient, from.id, to.id)
+
+  const decls = result.definition.declarations ?? []
+  assert.equal(decls.length, 2)
+  const fromDecl = decls.find((d) => d.elementId === from.id)!
+  assert.equal(fromDecl.does, 'manages order lifecycle')
+  assert.deepEqual(fromDecl.exposes, ['submitOrder', 'cancelOrder'])
+  assert.deepEqual(fromDecl.owns, ['orders', 'orderTotals'])
+  assert.deepEqual(fromDecl.visibleTo, [to.id])
+  const toDecl = decls.find((d) => d.elementId === to.id)!
+  assert.deepEqual(toDecl.visibleTo, ['none'])
+})
+
+test('DECLARE lines are parsed even when OPERATION reply is NONE', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  const llmClient = new FakeLlmClient(
+    'NONE\n' +
+      `DECLARE: ${from.id}|does A|callA|dataA|ALL\n` +
+      `DECLARE: ${to.id}|does B|callB|dataB|ALL`,
+  )
+
+  const result = await defineInterfaceDefinition(project, llmClient, from.id, to.id)
+
+  assert.deepEqual(result.definition.operations, [])
+  assert.equal((result.definition.declarations ?? []).length, 2)
+  assert.deepEqual((result.definition.declarations ?? [])[0].visibleTo, ['all'])
+})
+
+test('checkInterfaces reports non-harness elements with no declaration, advisory only', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  // Define with declarations only for `from`.
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient('NONE\n' + `DECLARE: ${from.id}|does A|callA|dataA|NONE`),
+    from.id,
+    to.id,
+  )
+
+  const result = checkInterfaces(project)
+  assert.deepEqual(result.missingDeclarations, [to.id])
+  // Advisory: does not by itself make the check incomplete-for-blocking
+  // reasons beyond the pre-existing undefinedPairs logic.
+})
+
+test('deriveHarnessSpec stores a spec on the harness element and wires it to every other element', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  await defineInterfaceDefinition(
+    project,
+    new FakeLlmClient(
+      'OPERATION: chargeCard|Charges|orderId|receiptId|NONE\n' +
+        `DECLARE: ${from.id}|orders|submitOrder|orders|${to.id}\n` +
+        `DECLARE: ${to.id}|payments|chargeCard|receipts|NONE`,
+    ),
+    from.id,
+    to.id,
+  )
+  const ifaceId = project.architecture!.interfaceDefinitions![0].id
+
+  const platform = {
+    id: 'web' as const,
+    label: 'Web App',
+    entryPointHint: 'index.html + main.tsx',
+    wiringHint: 'ES module imports',
+    lifecycleHint: 'start only',
+    builtIn: true,
+  }
+  const reply =
+    'CHECK: entry-point|applies|index.html loads src/main.tsx which mounts the app\n' +
+    'CHECK: element-instantiation|applies|main.tsx constructs each element in order\n' +
+    'CHECK: lifecycle-stop|not-applicable|the web page has no explicit stop phase\n' +
+    `LINK: ${ifaceId}|Order Service is constructed with a reference to Payment Service\n` +
+    'NARRATIVE: index.html loads main.tsx which builds Payment Service then Order Service and calls start().\n\n'
+  const result = await deriveHarnessSpec(project, new FakeLlmClient(reply), platform)
+
+  const harness = project.architecture!.elements.find((e) => e.kind === 'harness')!
+  assert.ok(harness.harnessSpec)
+  assert.equal(harness.harnessSpec!.derivedForPlatform, 'web')
+  // One checklist item per default key, missing ones filled as 'unknown'.
+  assert.equal(harness.harnessSpec!.checklist.length, 8)
+  assert.equal(harness.harnessSpec!.checklist.find((c) => c.key === 'entry-point')!.status, 'applies')
+  assert.equal(harness.harnessSpec!.checklist.find((c) => c.key === 'lifecycle-stop')!.status, 'not-applicable')
+  assert.equal(harness.harnessSpec!.checklist.find((c) => c.key === 'config-load')!.status, 'unknown')
+  assert.equal(harness.harnessSpec!.linkRealisations.length, 1)
+  assert.equal(harness.harnessSpec!.linkRealisations[0].masterDefinitionId, ifaceId)
+  assert.match(harness.harnessSpec!.narrative, /main\.tsx/)
+  // Wired to every non-harness element for the grid.
+  assert.deepEqual(harness.interfaces.sort(), [from.id, to.id].sort())
+})
+
+test('connectedPairs skips edges touching the harness', async () => {
+  const project = emptyProject()
+  const { from, to } = twoConnectedElements(project)
+  const platform = {
+    id: 'web' as const,
+    label: 'Web App',
+    entryPointHint: 'x',
+    wiringHint: 'y',
+    lifecycleHint: 'z',
+    builtIn: true,
+  }
+  await deriveHarnessSpec(project, new FakeLlmClient('NARRATIVE: n\n\n'), platform)
+  // Harness is now wired to from+to, but connectedPairs must still only
+  // return the real from<->to pair.
+  const pairs = connectedPairs(project.architecture!.elements)
+  assert.equal(pairs.length, 1)
+  assert.deepEqual([pairs[0].fromId, pairs[0].toId].sort(), [from.id, to.id].sort())
+})
+
+test('importArchitecturePart drops the source project\'s harness — never a second harness', () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app') // auto-creates ARCH-HARNESS
+  assert.equal((project.architecture?.elements ?? []).filter((e) => e.kind === 'harness').length, 1)
+
+  const imported = importArchitecturePart(project, {
+    architectureType: 'web-app',
+    architecture: {
+      layers: ['Imported Layer'],
+      nextElementSeq: 2,
+      nextInterfaceSeq: 1,
+      elements: [
+        { id: 'ARCH-HARNESS', kind: 'harness', name: 'Harness', responsibility: 'wires it', row: -2, col: 0, rowSpan: 1, colSpan: 1, interfaces: ['ARCH-001'], elementInterfaces: [] },
+        { id: 'ARCH-001', kind: 'functional', name: 'Imported UI', responsibility: 'renders', row: 0, col: 0, rowSpan: 1, colSpan: 1, interfaces: [], elementInterfaces: [] },
+      ],
+    },
+  })
+
+  const harnesses = (project.architecture?.elements ?? []).filter((e) => e.kind === 'harness')
+  assert.equal(harnesses.length, 1, 'still exactly one harness after import')
+  assert.equal(harnesses[0].id, 'ARCH-HARNESS', 'the project\'s own harness is kept')
+  assert.equal(imported.length, 1, 'only the non-harness element was imported')
+  assert.equal(imported[0].kind, 'functional')
+})
+
+test('ensureHarnessElement self-heals a project that already has two harnesses', () => {
+  const project = emptyProject()
+  setArchitectureType(project, 'web-app')
+  // Simulate the pre-fix broken state: a second harness with an IMP_ id.
+  project.architecture!.elements.push({
+    id: 'IMP_ARCH-HARNESS',
+    kind: 'harness',
+    name: 'Harness',
+    responsibility: 'imported dup',
+    row: -2,
+    col: 1,
+    rowSpan: 1,
+    colSpan: 1,
+    interfaces: [],
+    elementInterfaces: [],
+  })
+  // A real element pointing at the dup harness id.
+  project.architecture!.elements.push({
+    id: 'ARCH-001',
+    kind: 'functional',
+    name: 'UI',
+    responsibility: 'x',
+    row: 0,
+    col: 0,
+    rowSpan: 1,
+    colSpan: 1,
+    interfaces: ['IMP_ARCH-HARNESS'],
+    elementInterfaces: [],
+  })
+  assert.equal(project.architecture!.elements.filter((e) => e.kind === 'harness').length, 2)
+
+  const kept = ensureHarnessElement(project)
+
+  assert.equal(kept.id, 'ARCH-HARNESS')
+  assert.equal(project.architecture!.elements.filter((e) => e.kind === 'harness').length, 1)
+  assert.deepEqual(
+    project.architecture!.elements.find((e) => e.id === 'ARCH-001')?.interfaces,
+    ['ARCH-HARNESS'],
+    'interface reference repointed to the surviving harness',
+  )
 })

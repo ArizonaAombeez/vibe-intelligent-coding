@@ -1,8 +1,57 @@
-import { cp, mkdtemp, rename, rm, stat } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { withFsRetry } from './fsRetry.js'
 import { sourceTreeRoot } from './scaffold.js'
+
+// Fallback sync path: recursively reconcile `dest` to match `source`
+// WITHOUT ever renaming, deleting, or recreating `dest` itself. Used only
+// when the atomic rename-swap in syncBackAndDispose fails outright — some
+// SMB shares (and Windows itself, when the user has the project folder open
+// in Explorer/an editor, or an indexer/AV holds a handle) refuse to rename
+// the top-level `src` directory with EPERM no matter how many times it is
+// retried, because a directory with open handles anywhere beneath it cannot
+// be renamed. Individual file writes into that same tree still succeed, so
+// this walks the tree and copies changed files in place, creating missing
+// directories and removing entries that no longer exist in `source`. It is
+// not atomic — a crash mid-sync could leave a partially-updated tree — but a
+// non-atomic sync that completes beats an atomic one that can never run. The
+// `.git` folder is skipped (the real srcRoot keeps its own repo history via
+// gitCommitAll, which runs against the local copy before this).
+export async function syncTreeInPlace(source: string, dest: string): Promise<void> {
+  await withFsRetry(() => mkdir(dest, { recursive: true }))
+  const [sourceEntries, destEntries] = await Promise.all([
+    readdir(source, { withFileTypes: true }),
+    readdir(dest, { withFileTypes: true }),
+  ])
+  const sourceNames = new Set(sourceEntries.map((e) => e.name))
+
+  // Remove anything in dest that source no longer has (never .git).
+  for (const entry of destEntries) {
+    if (entry.name === '.git') continue
+    if (sourceNames.has(entry.name)) continue
+    await withFsRetry(() => rm(path.join(dest, entry.name), { recursive: true, force: true }))
+  }
+
+  for (const entry of sourceEntries) {
+    if (entry.name === '.git') continue
+    const from = path.join(source, entry.name)
+    const to = path.join(dest, entry.name)
+    if (entry.isDirectory()) {
+      await syncTreeInPlace(from, to)
+      continue
+    }
+    // Copy only when content differs — avoids rewriting every unchanged file
+    // over the network on each run (and avoids bumping mtimes the SMB
+    // client's cache then has to reconcile).
+    const [nextBuf, prevBuf] = await Promise.all([
+      readFile(from),
+      readFile(to).catch(() => null),
+    ])
+    if (prevBuf && prevBuf.equals(nextBuf)) continue
+    await withFsRetry(() => writeFile(to, nextBuf))
+  }
+}
 
 // Every filesystem operation a single Coding run performs against srcRoot
 // (scaffoldProjectSourceTree's mkdir/write, wipeScopedSubfolder's wipe,
@@ -108,18 +157,34 @@ export async function openLocalSourceTree(srcRoot: string): Promise<LocalSourceT
         () => false,
       )
       if (srcRootExists) {
+        let renamedOut = false
         try {
           await withFsRetry(() => rename(srcRoot, backupDir))
-        } catch (err) {
+          renamedOut = true
+        } catch {
+          // Renaming the whole `src` directory can fail hard (EPERM/EBUSY)
+          // when a handle is open anywhere beneath it — the user has the
+          // folder open, an editor/indexer/AV is touching it, or the SMB
+          // server just won't rename a directory in that state. Retrying
+          // doesn't help (the handle stays open for the whole run). Fall
+          // back to a non-atomic file-by-file sync that never touches
+          // `srcRoot` itself: it writes the finished output straight into
+          // the existing tree. The staged copy is no longer needed on this
+          // path.
           await rm(stagingDir, { recursive: true, force: true }).catch(() => {})
-          throw new Error(
-            `Failed to sync Coding output back into ${srcRoot} — the original is untouched, and the new output was safely discarded. The run can be retried. Underlying error: ${(err as Error).message}`,
-          )
+          try {
+            await syncTreeInPlace(localSrcRoot, srcRoot)
+          } catch (err) {
+            throw new Error(
+              `Failed to sync Coding output back into ${srcRoot} — the atomic swap could not run (a file or folder under src is held open), and the in-place fallback also failed partway. Some files may be updated and some not; re-run Coding after closing anything that has the project's src folder open. Underlying error: ${(err as Error).message}`,
+            )
+          }
+          return
         }
         try {
           await withFsRetry(() => rename(stagingDir, srcRoot))
         } catch (err) {
-          await rename(backupDir, srcRoot).catch(() => {})
+          if (renamedOut) await rename(backupDir, srcRoot).catch(() => {})
           throw new Error(
             `Failed to sync Coding output back into ${srcRoot} — the original was restored, and the run's new output is preserved at ${stagingDir} for manual recovery if the restore above also failed. Underlying error: ${(err as Error).message}`,
           )

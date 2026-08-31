@@ -97,6 +97,13 @@ export interface AgentRunOptions {
   // runCodingForElement's existing catch already turns it into a
   // 'cli-error' CodingRun with no changes needed there.
   signal?: AbortSignal
+  // T3.2: resume a prior CLI session (`claude --resume <id>`) so a later
+  // iteration of the coding loop is the SAME agent continuing its own work
+  // with full context, not a fresh agent re-reading a cold prompt. The id
+  // comes from a previous AgentRunResult.sessionId. If the CLI rejects the
+  // id (expired/unknown), the caller falls back to a full fresh prompt.
+  // OpenCodeAgentClient ignores this, same as the other Claude-only fields.
+  resumeSessionId?: string
 }
 
 // Provider-agnostic timing breakdown for one runAgentTask call — captured
@@ -174,6 +181,56 @@ function toAgentUsage(usage: ClaudeCodePrintResult['usage']): AgentChatUsage | u
   }
 }
 
+// Translates one Claude Code `--output-format stream-json` event object into
+// the SAME `{ type, part: { type, tool, text, state } }` line shape that
+// OpenCode's `--format json` already emits — so formatCodingLog (in the UI)
+// and formatCodingLog's server-side twin need only one parser for both
+// backends. Returns null for events that carry nothing worth showing live
+// (system/init frames, empty deltas). The mapped object is what gets
+// re-serialised (one per line) into the live-run log the Coding screen
+// polls; without this, a Claude Coding run showed *nothing* until the very
+// end, because `--output-format json` buffers one document for the whole run.
+function claudeStreamEventToLogLine(evt: unknown): string | null {
+  if (!evt || typeof evt !== 'object') return null
+  const e = evt as Record<string, any>
+
+  // assistant/user message frames — pull out text + tool_use blocks.
+  if (e.type === 'assistant' && e.message?.content) {
+    const blocks: any[] = Array.isArray(e.message.content) ? e.message.content : []
+    const out: string[] = []
+    for (const b of blocks) {
+      if (b?.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+        out.push(JSON.stringify({ type: 'text', part: { type: 'text', text: b.text } }))
+      } else if (b?.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim()) {
+        out.push(JSON.stringify({ type: 'reasoning', part: { type: 'reasoning', text: b.thinking } }))
+      } else if (b?.type === 'tool_use' && typeof b.name === 'string') {
+        out.push(
+          JSON.stringify({
+            type: 'tool_use',
+            part: { type: 'tool', tool: b.name.toLowerCase(), state: { status: 'running', input: b.input ?? {} } },
+          }),
+        )
+      }
+    }
+    return out.length > 0 ? out.join('\n') : null
+  }
+
+  // tool results come back on a user frame — surface an error if it failed.
+  if (e.type === 'user' && e.message?.content) {
+    const blocks: any[] = Array.isArray(e.message.content) ? e.message.content : []
+    const out: string[] = []
+    for (const b of blocks) {
+      if (b?.type === 'tool_result' && b.is_error) {
+        const text = typeof b.content === 'string' ? b.content : Array.isArray(b.content) ? b.content.map((c: any) => c?.text).join(' ') : ''
+        out.push(JSON.stringify({ type: 'tool_use', part: { type: 'tool', tool: 'tool', state: { status: 'error', error: text.slice(0, 300) } } }))
+      }
+    }
+    return out.length > 0 ? out.join('\n') : null
+  }
+
+  return null
+}
+
 export class ClaudeCodeAgentClient {
   async runAgentTask(prompt: string, options: AgentRunOptions): Promise<AgentRunResult> {
     const binary = options.binary ?? 'claude'
@@ -181,16 +238,67 @@ export class ClaudeCodeAgentClient {
     const args = [
       ...binaryArgs,
       '--print',
+      // stream-json (not plain json) so the caller's onChunk sees tool
+      // calls / reasoning / text as they happen — a multi-minute Coding run
+      // otherwise looks completely silent in the live-run panel until it
+      // exits. --verbose is required by the CLI when combining --print with
+      // --output-format stream-json.
       '--output-format',
-      'json',
+      'stream-json',
+      '--verbose',
       '--permission-mode',
       options.permissionMode ?? 'acceptEdits',
     ]
     if (options.model) args.push('--model', options.model)
     if (options.effort) args.push('--effort', options.effort)
+    // T3.2: continue a prior session rather than starting cold.
+    if (options.resumeSessionId) args.push('--resume', options.resumeSessionId)
 
-    const { stdout, stderr, exitCode, timing } = await runCli(binary, args, prompt, options.cwd, options.onChunk, options.signal)
-    const rawLog = stdout + (stderr ? `\n${stderr}` : '')
+    // Accumulates the terminal `type:"result"` frame from the stream so the
+    // rest of this method keeps working exactly as it did with plain json.
+    let resultFrame: ClaudeCodePrintResult | undefined
+    // Re-serialised normalised event lines — this is what becomes rawLog,
+    // matching the OpenCode client's newline-delimited-JSON rawLog shape so
+    // formatCodingLog handles both identically.
+    const normalisedLines: string[] = []
+
+    let carry = ''
+    const onStreamChunk = (chunk: string) => {
+      carry += chunk
+      const lines = carry.split('\n')
+      carry = lines.pop() ?? ''
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        let evt: any
+        try {
+          evt = JSON.parse(trimmed)
+        } catch {
+          continue
+        }
+        if (evt?.type === 'result') {
+          resultFrame = evt
+          continue
+        }
+        const mapped = claudeStreamEventToLogLine(evt)
+        if (mapped) {
+          normalisedLines.push(mapped)
+          options.onChunk?.(mapped + '\n')
+        }
+      }
+    }
+
+    const { stdout, stderr, exitCode, timing } = await runCli(binary, args, prompt, options.cwd, onStreamChunk, options.signal)
+    // Flush any trailing partial line.
+    if (carry.trim()) {
+      try {
+        const evt = JSON.parse(carry.trim())
+        if (evt?.type === 'result') resultFrame = evt
+      } catch {
+        /* ignore */
+      }
+    }
+    const rawLog = normalisedLines.join('\n') + (stderr ? `\n${stderr}` : '') || stdout
 
     if (exitCode !== 0) {
       throw new ClaudeCodeAgentError(
@@ -201,16 +309,18 @@ export class ClaudeCodeAgentClient {
       )
     }
 
-    let parsed: ClaudeCodePrintResult
-    try {
-      parsed = JSON.parse(stdout)
-    } catch {
-      throw new ClaudeCodeAgentError(`claude CLI did not return valid JSON: ${stdout.slice(0, 200)}`, exitCode, rawLog, timing)
+    if (!resultFrame) {
+      throw new ClaudeCodeAgentError(
+        `claude CLI stream ended without a result frame: ${stdout.slice(0, 200)}`,
+        exitCode,
+        rawLog,
+        timing,
+      )
     }
 
-    if (parsed.is_error) {
+    if (resultFrame.is_error) {
       throw new ClaudeCodeAgentError(
-        `claude CLI reported an error: ${parsed.result ?? parsed.subtype ?? 'unknown error'}`,
+        `claude CLI reported an error: ${resultFrame.result ?? resultFrame.subtype ?? 'unknown error'}`,
         exitCode,
         rawLog,
         timing,
@@ -220,8 +330,8 @@ export class ClaudeCodeAgentClient {
     return {
       rawLog,
       exitCode,
-      sessionId: parsed.session_id,
-      usage: toAgentUsage(parsed.usage),
+      sessionId: resultFrame.session_id,
+      usage: toAgentUsage(resultFrame.usage),
       providerId: 'claude-code',
       timing,
     }

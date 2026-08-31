@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   Architecture,
   ArchitectureElement,
+  ChatMessageLink,
   CurrentOperation,
   ImportedTestCaseSet,
   ProjectSettings,
@@ -16,6 +17,7 @@ import type {
 import { toOperationError } from '../api/errorCode'
 import { STATUS_COLOR, STATUS_LABEL } from '../statusColor'
 import { highlightRequirementIds } from './requirementIdHighlight'
+import { ChatDock } from '../components/ChatDock'
 import './RequirementsScreen.css'
 import './TestCreationScreen.css'
 
@@ -26,11 +28,10 @@ interface TestCreationScreenProps {
   settings: ProjectSettings
   onSettingsChange: (settings: ProjectSettings) => void
   onOpenSettings: () => void
-}
-
-interface TestCreationChatEntry {
-  role: 'user' | 'qa'
-  text: string
+  // Chat link chips navigate to other screens; Test Creation only needs the
+  // handler to pass into ChatDock (chip targets — requirement/element/test —
+  // all resolve on their own screens).
+  onChatNavigate: (link: ChatMessageLink) => void
 }
 
 // TestCaseStatus ('not-run'/'passing'/'failing') isn't literally the same
@@ -114,6 +115,7 @@ export function TestCreationScreen({
   settings,
   onSettingsChange,
   onOpenSettings,
+  onChatNavigate,
 }: TestCreationScreenProps) {
   const [testSuite, setTestSuite] = useState<TestSuite | null>(null)
   const [architecture, setArchitecture] = useState<Architecture | null>(null)
@@ -154,14 +156,23 @@ export function TestCreationScreen({
     diff: string
     rawLog: string
     rejectedFiles?: string[]
+    timing?: {
+      msTotal: number
+      msScaffold: number
+      msGitInit: number
+      msAgentCli: number
+      msToFirstAgentOutput?: number
+      msScopeGate: number
+      msCommit: number
+    }
   } | null>(null)
+  // Rolling per-test durations from this session's "Generate All Automations"
+  // run so the slowness is quantified in the UI, not just server logs.
+  const [genTimings, setGenTimings] = useState<Array<{ testId: string; ms: number }>>([])
 
-  const [chatHistory, setChatHistory] = useState<TestCreationChatEntry[]>([])
-  const [chatInput, setChatInput] = useState('')
+  // QA-chat proposal cards still live here (surface-specific side content
+  // under the shared ChatDock's transcript).
   const [proposedTests, setProposedTests] = useState<ProposedTest[]>([])
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
-  const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
 
   async function reload() {
     try {
@@ -176,8 +187,10 @@ export function TestCreationScreen({
       setImportedTestCases(imported)
       setRequirements(reqs)
       setLoadError(null)
+      return suite
     } catch (err) {
       setLoadError(toOperationError(err).error ?? 'Failed to load Test Creation data.')
+      return null
     }
   }
 
@@ -279,8 +292,10 @@ export function TestCreationScreen({
 
   async function handleGenerateFile(testId: string) {
     await withBusyAction('QA is writing the test file...', async () => {
+      const startedAt = Date.now()
       const result = await api.generateTestFile(projectId, testId)
       setLastGenerateResult(result)
+      setGenTimings((prev) => [...prev, { testId, ms: result.timing?.msTotal ?? Date.now() - startedAt }])
       await reload()
     })
   }
@@ -294,18 +309,60 @@ export function TestCreationScreen({
   // the test's runnable code, distinct from "Generate All Test Cases"
   // above, which only ever proposes/creates the traceability records, not
   // code.
-  async function handleGenerateAllAutomations() {
-    const pending = tests.filter((t) => !t.filePath)
-    if (busy || pending.length === 0) return
-    setBusy(true)
+  // Core loop, factored out so the chained "Generate All Tests & Automations"
+  // action can pass a freshly-fetched pending list rather than relying on the
+  // `tests` closure, which a preceding handleGenerateAll()+reload() in the
+  // same handler would not have refreshed. `manageBusy` is false when a
+  // caller already holds the busy flag.
+  async function generateAutomationsFor(
+    pending: TestCase[],
+    { manageBusy = true }: { manageBusy?: boolean } = {},
+  ) {
+    if (pending.length === 0) return
+    if (manageBusy) setBusy(true)
+    const batchStartedAt = Date.now()
+    let done = 0
     try {
       for (const testCase of pending) {
-        onOperationChange({ text: `QA is writing the test file for ${testCase.id}...` })
+        const each = Date.now()
+        const avgSoFar = done > 0 ? (each - batchStartedAt) / done : 0
+        const etaSuffix = avgSoFar > 0 ? ` — ~${Math.round((avgSoFar * (pending.length - done)) / 1000)}s left` : ''
+        onOperationChange({
+          text: `QA is writing the test file for ${testCase.id}... (${done + 1}/${pending.length}${etaSuffix})`,
+        })
         const result = await api.generateTestFile(projectId, testCase.id)
         setLastGenerateResult(result)
+        setGenTimings((prev) => [...prev, { testId: testCase.id, ms: result.timing?.msTotal ?? Date.now() - each }])
+        done += 1
       }
       await reload()
       onOperationChange({ text: null })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    } finally {
+      if (manageBusy) setBusy(false)
+    }
+  }
+
+  async function handleGenerateAllAutomations() {
+    if (busy) return
+    await generateAutomationsFor(tests.filter((t) => !t.filePath))
+  }
+
+  // T2.3: chain the two previously-unconnected steps — propose the
+  // traceability records, then immediately generate a runnable file for
+  // every one that lacks it. One busy span, and the automation pass reads
+  // the pending list from the reload result so it isn't a stale closure.
+  async function handleGenerateAllAndAutomations() {
+    if (busy) return
+    setBusy(true)
+    try {
+      onOperationChange({ text: 'QA is proposing tests...' })
+      const result = await api.generateAllTests(projectId)
+      setRejected(result.rejected)
+      const freshSuite = await reload()
+      const pending = (freshSuite?.tests ?? []).filter((t) => !t.deletedAt && !t.filePath)
+      await generateAutomationsFor(pending, { manageBusy: false })
     } catch (err) {
       onOperationChange(toOperationError(err))
     } finally {
@@ -432,29 +489,21 @@ export function TestCreationScreen({
     onSettingsChange(updated)
   }
 
-  async function handleChatSend() {
-    if (!chatInput.trim() || chatBusy) return
-    const message = chatInput.trim()
-    setChatHistory((prev) => [...prev, { role: 'user', text: message }])
-    setChatInput('')
-    setChatBusy(true)
-    setChatError(null)
-    setChatErrorIsLlmNotConfigured(false)
-    onOperationChange({ text: 'QA is thinking...' })
-    try {
-      const result = await api.testCreationChat(projectId, selectedElementId || null, message)
-      setChatHistory((prev) => [...prev, { role: 'qa', text: result.reply }])
-      setProposedTests((prev) => [...prev, ...result.proposedTests])
-      onOperationChange({ text: null })
-    } catch (err) {
-      const operationError = toOperationError(err)
-      setChatError(operationError.error ?? null)
-      setChatErrorIsLlmNotConfigured(operationError.errorCode === 'llm-not-configured')
-      onOperationChange(operationError)
-    } finally {
-      setChatBusy(false)
-    }
-  }
+  const sendTestCreationChat = useCallback(
+    async (sessionId: string, message: string) => {
+      onOperationChange({ text: 'QA is thinking...' })
+      try {
+        const result = await api.testCreationChat(projectId, selectedElementId || null, message, sessionId)
+        setProposedTests((prev) => [...prev, ...result.proposedTests])
+        onOperationChange({ text: null })
+        return { userMessage: result.userMessage, assistantMessage: result.assistantMessage }
+      } catch (err) {
+        onOperationChange(toOperationError(err))
+        throw err
+      }
+    },
+    [api, projectId, selectedElementId, onOperationChange],
+  )
 
   async function handleAcceptTestProposal(proposal: ProposedTest) {
     await api.acceptProposedTest(projectId, proposal, selectedElementId || null)
@@ -596,6 +645,14 @@ export function TestCreationScreen({
           Generate Integration Tests
         </button>
 
+        <button
+          type="button"
+          onClick={handleGenerateAllAndAutomations}
+          disabled={busy}
+          title="Proposes the requirement-traced test cases, then writes a runnable test file for every one — the whole Test Creation step in one action"
+        >
+          Generate All Tests &amp; Automations
+        </button>
         <button type="button" onClick={handleGenerateAll} disabled={busy}>
           Generate All Test Cases
         </button>
@@ -863,11 +920,40 @@ export function TestCreationScreen({
                       {lastGenerateResult.status === 'cli-error' && 'The Claude Code CLI run failed. See the raw log below.'}
                     </div>
                   )}
+                  {lastGenerateResult.timing && (
+                    <div className="test-creation-timing">
+                      <strong>
+                        Took {(lastGenerateResult.timing.msTotal / 1000).toFixed(1)}s
+                      </strong>{' '}
+                      — agent CLI {(lastGenerateResult.timing.msAgentCli / 1000).toFixed(1)}s
+                      {lastGenerateResult.timing.msToFirstAgentOutput !== undefined &&
+                        ` (first output after ${(lastGenerateResult.timing.msToFirstAgentOutput / 1000).toFixed(1)}s)`}
+                      , scaffold {lastGenerateResult.timing.msScaffold}ms, git {lastGenerateResult.timing.msGitInit}ms,
+                      scope-gate {lastGenerateResult.timing.msScopeGate}ms, commit {lastGenerateResult.timing.msCommit}ms
+                    </div>
+                  )}
                   <details className="test-creation-raw-log">
                     <summary>Raw output</summary>
                     <pre>{lastGenerateResult.rawLog}</pre>
                   </details>
                 </>
+              )}
+
+              {genTimings.length > 0 && (
+                <details className="test-creation-raw-log">
+                  <summary>
+                    Test-file generation timings ({genTimings.length} run
+                    {genTimings.length === 1 ? '' : 's'}, avg{' '}
+                    {(genTimings.reduce((s, t) => s + t.ms, 0) / genTimings.length / 1000).toFixed(1)}s)
+                  </summary>
+                  <ul>
+                    {genTimings.map((t, i) => (
+                      <li key={i}>
+                        {t.testId}: {(t.ms / 1000).toFixed(1)}s
+                      </li>
+                    ))}
+                  </ul>
+                </details>
               )}
             </>
           )}
@@ -878,108 +964,72 @@ export function TestCreationScreen({
       </div>
 
       <div className="test-creation-llm-panel">
-        <div className="analyst-chat-panel">
-          <div className="analyst-chat-heading-row">
-            <h2>LLM output</h2>
-            <span className="analyst-chat-hint">
-              Ask QA to help think through what tests the selected element needs — every reply, proposal, and
-              in-progress file update from this tab appears here.
-            </span>
-          </div>
-          <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>
-            {chatHistory.length === 0 && !chatBusy && (
-              <p className="analyst-chat-empty">No messages yet — start the conversation below.</p>
-            )}
-            {chatHistory.map((entry, i) => (
-              <div key={i} className={`analyst-chat-entry analyst-chat-entry-${entry.role}`}>
-                <strong>{entry.role === 'user' ? 'You' : 'QA'}</strong>
-                <p>{highlightRequirementIds(entry.text)}</p>
-              </div>
-            ))}
-            {chatBusy && <p className="analyst-chat-empty">QA is thinking...</p>}
-
-            {lastGenerateResult && (
-              <div className="analyst-chat-entry analyst-chat-entry-qa">
-                <strong>File generation</strong>
-                {lastGenerateResult.status !== 'success' && (
-                  <div className="test-creation-run-banner">
-                    {lastGenerateResult.status === 'rejected-scope' && (
-                      <>
-                        The CLI wrote outside its allowed scope — those changes were reverted.
-                        {lastGenerateResult.rejectedFiles && lastGenerateResult.rejectedFiles.length > 0 && (
-                          <ul>
-                            {lastGenerateResult.rejectedFiles.map((f) => (
-                              <li key={f}>{f}</li>
-                            ))}
-                          </ul>
-                        )}
-                      </>
-                    )}
-                    {lastGenerateResult.status === 'cli-error' && 'The Claude Code CLI run failed. See the raw log below.'}
-                  </div>
-                )}
-                <details className="test-creation-raw-log" open>
-                  <summary>Raw output</summary>
-                  <pre>{lastGenerateResult.rawLog}</pre>
-                </details>
-              </div>
-            )}
-          </div>
-
-          {chatError && (
-            <div className="analyst-chat-error">
-              <span>{chatError}</span>
-              {chatErrorIsLlmNotConfigured ? (
-                <button type="button" onClick={onOpenSettings}>
-                  Open Settings
-                </button>
-              ) : (
-                <button type="button" onClick={handleChatSend}>
-                  Retry
-                </button>
-              )}
-            </div>
-          )}
-
-          {proposedTests.length > 0 && (
-            <div className="analyst-chat-proposals">
-              <h3>Proposed tests</h3>
-              {proposedTests.map((proposal, i) => (
-                <div key={`${proposal.title}-${i}`} className="analyst-chat-proposal">
-                  <p>
-                    <strong>{proposal.title}</strong> — verifies {proposal.requirementIds.join(', ') || '(no requirements named)'}
-                  </p>
-                  <div className="analyst-chat-proposal-actions">
-                    <button type="button" onClick={() => handleAcceptTestProposal(proposal)}>
-                      Accept
-                    </button>
-                    <button type="button" onClick={() => handleDiscardTestProposal(proposal)}>
-                      Discard
-                    </button>
-                  </div>
+        <ChatDock
+          api={api}
+          projectId={projectId}
+          surface="qa-creation"
+          variant="embedded"
+          roleLabel="QA"
+          heading="LLM output"
+          hint="Ask QA to help think through what tests the selected element needs — every reply, proposal, and in-progress file update from this tab appears here."
+          placeholder="Ask QA..."
+          onOpenSettings={onOpenSettings}
+          onNavigateLink={onChatNavigate}
+          renderMessageText={highlightRequirementIds}
+          sendMessage={sendTestCreationChat}
+          renderExtras={() => (
+            <>
+              {lastGenerateResult && (
+                <div className="analyst-chat-entry analyst-chat-entry-qa">
+                  <strong>File generation</strong>
+                  {lastGenerateResult.status !== 'success' && (
+                    <div className="test-creation-run-banner">
+                      {lastGenerateResult.status === 'rejected-scope' && (
+                        <>
+                          The CLI wrote outside its allowed scope — those changes were reverted.
+                          {lastGenerateResult.rejectedFiles && lastGenerateResult.rejectedFiles.length > 0 && (
+                            <ul>
+                              {lastGenerateResult.rejectedFiles.map((f) => (
+                                <li key={f}>{f}</li>
+                              ))}
+                            </ul>
+                          )}
+                        </>
+                      )}
+                      {lastGenerateResult.status === 'cli-error' &&
+                        'The Claude Code CLI run failed. See the raw log below.'}
+                    </div>
+                  )}
+                  <details className="test-creation-raw-log" open>
+                    <summary>Raw output</summary>
+                    <pre>{lastGenerateResult.rawLog}</pre>
+                  </details>
                 </div>
-              ))}
-            </div>
+              )}
+              {proposedTests.length > 0 && (
+                <div className="analyst-chat-proposals">
+                  <h3>Proposed tests</h3>
+                  {proposedTests.map((proposal, i) => (
+                    <div key={`${proposal.title}-${i}`} className="analyst-chat-proposal">
+                      <p>
+                        <strong>{proposal.title}</strong> — verifies{' '}
+                        {proposal.requirementIds.join(', ') || '(no requirements named)'}
+                      </p>
+                      <div className="analyst-chat-proposal-actions">
+                        <button type="button" onClick={() => handleAcceptTestProposal(proposal)}>
+                          Accept
+                        </button>
+                        <button type="button" onClick={() => handleDiscardTestProposal(proposal)}>
+                          Discard
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
-
-          <div className="analyst-chat-input-row">
-            <textarea
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleChatSend()
-                }
-              }}
-              placeholder="Ask QA..."
-              rows={2}
-            />
-            <button type="button" onClick={handleChatSend} disabled={!chatInput.trim() || chatBusy}>
-              Send
-            </button>
-          </div>
-        </div>
+        />
       </div>
 
       </div>

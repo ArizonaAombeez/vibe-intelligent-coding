@@ -6,7 +6,12 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ClaudeCodeAgentClient } from 'vic-llm-claude-code'
 import type { Project } from 'vic-requirements-elicitation'
-import { runCodingForElement, sourceTreeRoot, interfaceChangedSinceLastCoding } from '../src/index.js'
+import {
+  buildCodingPrompt,
+  runCodingForElement,
+  sourceTreeRoot,
+  interfaceChangedSinceLastCoding,
+} from '../src/index.js'
 
 const fixture = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -273,6 +278,9 @@ test('runCodingForElement: an element with no allocated requirement at "allocate
 test('runCodingForElement: an element with at least one allocated requirement among several proceeds normally', async () => {
   process.env.FAKE_CLAUDE_MODE = 'write-in-scope'
   process.env.FAKE_CLAUDE_WRITE_PATH = 'generated.txt'
+  // T3.3: the fixture's test file must tag every allocated requirement or
+  // the loop keeps iterating for coverage.
+  process.env.FAKE_CLAUDE_COVERS = 'REQ-001 REQ-002'
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
@@ -293,7 +301,247 @@ test('runCodingForElement: an element with at least one allocated requirement am
   } finally {
     await rm(dir, { recursive: true, force: true })
     delete process.env.FAKE_CLAUDE_WRITE_PATH
+    delete process.env.FAKE_CLAUDE_COVERS
   }
+})
+
+test('runCodingForElement: a run that writes code but no *.test.* file is rejected-no-tests (code still committed, not counted as success)', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'write-in-scope'
+  process.env.FAKE_CLAUDE_WRITE_PATH = 'generated.txt'
+  process.env.FAKE_CLAUDE_NO_TEST = '1' // suppress the fixture's companion test file
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    const client = new ClaudeCodeAgentClient()
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, { binary: 'node', binaryArgs: [fixture] })
+
+    assert.equal(run.status, 'rejected-no-tests')
+    // The code the agent wrote is kept (merged + committed) — discarding
+    // real work over a missing test would be worse.
+    assert.ok(run.diff.includes('generated.txt'), 'the written code should still be in the committed diff')
+    assert.ok(
+      await exists(path.join(sourceTreeRoot(dir), 'login-ui', 'generated.txt')),
+      'the code file should be present on disk',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    delete process.env.FAKE_CLAUDE_WRITE_PATH
+    delete process.env.FAKE_CLAUDE_NO_TEST
+  }
+})
+
+test('runCodingForElement: a run that writes a *.test.mjs alongside code is success', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'write-in-scope'
+  process.env.FAKE_CLAUDE_WRITE_PATH = 'generated.txt' // fixture also drops generated.test.mjs
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    const client = new ClaudeCodeAgentClient()
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, { binary: 'node', binaryArgs: [fixture] })
+
+    assert.equal(run.status, 'success')
+    assert.ok(
+      await exists(path.join(sourceTreeRoot(dir), 'login-ui', 'generated.test.mjs')),
+      'the mandatory test file should be present',
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    delete process.env.FAKE_CLAUDE_WRITE_PATH
+  }
+})
+
+test('runCodingForElement: an agent that drops a node_modules/ (ran npm install) does not break git add / the merge-back', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    let call = 0
+    const client = {
+      async runAgentTask(_p: string, o: { cwd: string }) {
+        call++
+        const { writeFile, mkdir } = await import('node:fs/promises')
+        // Real code + a covering test...
+        await writeFile(path.join(o.cwd, 'renderer.js'), 'export function draw(){}\n', 'utf8')
+        await writeFile(path.join(o.cwd, 'renderer.test.mjs'), '// covers: REQ-001\nprocess.exit(0)\n', 'utf8')
+        // ...plus a bogus node_modules the agent should never have created.
+        // Includes a nested dir + a lockfile, the exact shape that produced
+        // the "git add failed … Permission denied … failed to insert into
+        // database" cli-error.
+        await mkdir(path.join(o.cwd, 'node_modules', '.bin'), { recursive: true })
+        await writeFile(path.join(o.cwd, 'node_modules', '.bin', 'prebuild-install'), '#!/bin/sh\n', 'utf8')
+        await mkdir(path.join(o.cwd, 'node_modules', 'napi-build-utils'), { recursive: true })
+        await writeFile(path.join(o.cwd, 'node_modules', 'napi-build-utils', 'index.js'), 'module.exports={}\n', 'utf8')
+        await writeFile(path.join(o.cwd, 'package-lock.json'), '{"lockfileVersion":3}\n', 'utf8')
+        return { rawLog: `iter ${call}`, exitCode: 0, providerId: 'claude-code' as const, sessionId: 's', timing: { msTotal: 5 } }
+      },
+    }
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
+
+    assert.equal(run.status, 'success', 'the run should succeed despite the stray node_modules')
+    const scope = path.join(sourceTreeRoot(dir), 'login-ui')
+    assert.ok(await exists(path.join(scope, 'renderer.js')), 'real code merged back')
+    assert.ok(await exists(path.join(scope, 'renderer.test.mjs')), 'test file merged back')
+    assert.equal(await exists(path.join(scope, 'node_modules')), false, 'node_modules must NOT be synced onto the project tree')
+    assert.equal(await exists(path.join(scope, 'package-lock.json')), false, 'lockfile must NOT be synced back')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+// --- T3 coding loop --------------------------------------------------------
+
+test('runCodingForElement (loop): converges — a first iteration with a failing test, a second that fixes it, then done', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    let call = 0
+    const client = {
+      async runAgentTask(prompt: string, o: { cwd: string; resumeSessionId?: string }) {
+        call++
+        const { writeFile } = await import('node:fs/promises')
+        await writeFile(path.join(o.cwd, 'engine.js'), `// v${call}\nexport const ok = ${call >= 2}\n`, 'utf8')
+        // Iteration 1: a test that FAILS (exit 1). Iteration 2: passes.
+        const body =
+          call === 1
+            ? '// covers: REQ-001\nprocess.exit(1)\n'
+            : '// covers: REQ-001\nprocess.exit(0)\n'
+        await writeFile(path.join(o.cwd, 'engine.test.mjs'), body, 'utf8')
+        // The 2nd call must be a resumed session (continuity).
+        if (call === 2) assert.equal(o.resumeSessionId, 'sess-1', 'iteration 2 resumes iteration 1\'s session')
+        return { rawLog: `iter ${call}`, exitCode: 0, providerId: 'claude-code' as const, sessionId: 'sess-1', timing: { msTotal: 5 } }
+      },
+    }
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
+
+    assert.equal(run.status, 'success')
+    assert.equal(run.stoppedBecause, 'done')
+    assert.equal(run.iterations, 2)
+    assert.equal(call, 2)
+    assert.equal(run.swTestResult?.passed, true)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCodingForElement (loop): a persistently failing test ends success-tests-failing via the stall check, not the cap', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    let call = 0
+    const client = {
+      async runAgentTask(_p: string, o: { cwd: string }) {
+        call++
+        const { writeFile } = await import('node:fs/promises')
+        // Same code + same failing test every time -> no new diff after
+        // iteration 1, same failing set -> stall.
+        await writeFile(path.join(o.cwd, 'engine.js'), '// fixed content\n', 'utf8')
+        await writeFile(path.join(o.cwd, 'engine.test.mjs'), '// covers: REQ-001\nprocess.exit(1)\n', 'utf8')
+        return { rawLog: `iter ${call}`, exitCode: 0, providerId: 'claude-code' as const, sessionId: 's', timing: { msTotal: 5 } }
+      },
+    }
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
+
+    assert.equal(run.status, 'success-tests-failing')
+    assert.equal(run.stoppedBecause, 'stalled')
+    assert.ok((run.iterations ?? 0) >= 2 && (run.iterations ?? 0) < 8, 'stopped by stall, well before the cap')
+    assert.equal(run.swTestResult?.passed, false)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCodingForElement (loop): passing tests but an uncovered requirement ends success-tests-failing', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    project.requirements.push({
+      id: 'REQ-002',
+      text: 'Second requirement',
+      type: null,
+      status: 'allocated',
+      createdAt: new Date().toISOString(),
+      provenance: 'human',
+      architectureElements: ['ARCH-001'],
+    })
+    let call = 0
+    const client = {
+      async runAgentTask(_p: string, o: { cwd: string }) {
+        call++
+        const { writeFile } = await import('node:fs/promises')
+        await writeFile(path.join(o.cwd, 'engine.js'), '// static\n', 'utf8')
+        // Tags REQ-001 but never REQ-002 -> coverage gap that never closes.
+        await writeFile(path.join(o.cwd, 'engine.test.mjs'), '// covers: REQ-001\nprocess.exit(0)\n', 'utf8')
+        return { rawLog: `iter ${call}`, exitCode: 0, providerId: 'claude-code' as const, sessionId: 's', timing: { msTotal: 5 } }
+      },
+    }
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
+
+    assert.equal(run.status, 'success-tests-failing')
+    // The coverage gap is recorded on the iteration that produced code.
+    const codingIter = run.iterationHistory?.find((h) => h.status === 'success')
+    assert.deepEqual(codingIter?.uncoveredRequirementIds, ['REQ-002'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCodingForElement (loop): an abort signal stops the loop, not just the current CLI call', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    const ac = new AbortController()
+    let call = 0
+    const client = {
+      async runAgentTask(_p: string, o: { cwd: string }) {
+        call++
+        const { writeFile } = await import('node:fs/promises')
+        await writeFile(path.join(o.cwd, 'engine.js'), `// v${call}\n`, 'utf8')
+        await writeFile(path.join(o.cwd, 'engine.test.mjs'), '// covers: REQ-001\nprocess.exit(1)\n', 'utf8')
+        ac.abort() // request cancel after the first iteration's call
+        return { rawLog: `iter ${call}`, exitCode: 0, providerId: 'claude-code' as const, sessionId: 's', timing: { msTotal: 5 } }
+      },
+    }
+
+    const run = await runCodingForElement(project, dir, 'ARCH-001', client, { signal: ac.signal })
+
+    assert.equal(call, 1, 'the loop must not start a second iteration after abort')
+    assert.equal(run.stoppedBecause, 'cancelled')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('buildCodingPrompt: a non-harness element is NOT told to write under its own <prefix>/ (T1.1 — cwd already IS the element folder)', () => {
+  const project = baseProject()
+  const prompt = buildCodingPrompt(project, 'ARCH-001', 'login-ui', 'initial-build', {
+    id: 'web',
+    label: 'Web App',
+    builtIn: true,
+    entryPointHint: 'index.html',
+    wiringHint: 'main.js',
+    lifecycleHint: 'DOMContentLoaded',
+  })
+  // The doubled-folder bug was the prompt saying "under login-ui/ relative
+  // to your working directory" while cwd was already login-ui/.
+  assert.ok(!/under `?login-ui\/`? relative to your working directory/.test(prompt))
+  assert.ok(!/from `?login-ui\/`? as the working directory/.test(prompt))
+  assert.ok(!/at `?login-ui\/index\.js`?/.test(prompt))
+  // It SHOULD tell the agent the cwd is the element folder and to write in it.
+  assert.match(prompt, /working directory IS this element's own folder/i)
+  assert.match(prompt, /do NOT create a "login-ui" subfolder/i)
+})
+
+test('buildCodingPrompt: still tells the agent the runnable test-file contract (T1.4)', () => {
+  const project = baseProject()
+  const prompt = buildCodingPrompt(project, 'ARCH-001', 'login-ui', 'initial-build')
+  assert.match(prompt, /\.test\.<ext>/)
+  assert.match(prompt, /\.test\.ts .* silently skipped/i)
+  assert.match(prompt, /covers: IMP_REQ/i)
 })
 
 test('runCodingForElement: an element with an undefined connected interface is rejected before any subprocess is spawned', async () => {
@@ -521,16 +769,16 @@ test('runCodingForElement: a CLI-level failure returns status cli-error without 
   }
 })
 
-// GLM/OpenCode-specific retry (see runCoding.ts's runOnce/retry comment):
-// GLM-5.x has a documented bug where a streamed tool-call response can drop
-// its tool-call deltas mid-stream, producing a clean exit with nothing ever
-// written — indistinguishable, from runCodingForElement's perspective, from
-// any other empty-output run except for providerId. This exercises that
-// retry path directly against a stub CodingAgentClient (not the real
-// fake-claude-agent.mjs fixture, which always reports providerId
-// 'claude-code') so the empty-then-success sequence and the providerId gate
-// can both be controlled precisely.
-test('runCodingForElement: an opencode run that writes nothing is retried once, and a write on the retry succeeds', async () => {
+// GLM/OpenCode-specific in-iteration retry (see runOneCodingIteration's
+// runOnce/retry comment): GLM-5.x can drop tool-call deltas mid-stream,
+// producing a clean exit with nothing written. Within ONE loop iteration
+// that empty run is retried once. This exercises that against a stub
+// CodingAgentClient. Note the T3 loop then does its own convergence work on
+// top: after the first iteration lands code + a passing test, the loop's
+// requirement-coverage check runs one more iteration (the stub keeps
+// writing the same file → no-op → stall exit), so the agent is invoked
+// 2 (iter 1: empty + GLM retry) + 1 (iter 2: no-op) = 3 times total.
+test('runCodingForElement: an opencode run that writes nothing is retried once within an iteration, and a write on the retry lands', async () => {
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
@@ -539,20 +787,19 @@ test('runCodingForElement: an opencode run that writes nothing is retried once, 
       async runAgentTask(_prompt: string, runOptions: { cwd: string }) {
         callCount++
         if (callCount === 1) {
-          // First attempt: CLI "succeeds" (exit 0) but writes nothing —
-          // the exact shape GLM's dropped-tool-call-delta bug produces.
           return { rawLog: 'first attempt: no tool calls landed', exitCode: 0, providerId: 'opencode' as const, timing: { msTotal: 10 } }
         }
-        // Retry: writes the element's file for real.
         const { writeFile } = await import('node:fs/promises')
         await writeFile(path.join(runOptions.cwd, 'index.html'), '<html></html>', 'utf8')
+        await writeFile(path.join(runOptions.cwd, 'index.test.mjs'), '// covers: REQ-001\nprocess.exit(0)\n', 'utf8')
         return { rawLog: 'retry: wrote index.html', exitCode: 0, providerId: 'opencode' as const, timing: { msTotal: 10 } }
       },
     }
 
     const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
 
-    assert.equal(callCount, 2, 'the agent should be invoked exactly twice: the empty first attempt, then one retry')
+    // iter 1: empty + GLM retry (2 calls, lands code + covering test => done).
+    assert.equal(callCount, 2, 'iteration 1: the empty first attempt then one GLM retry, which lands a covering test => loop is done')
     assert.equal(run.status, 'success')
     assert.equal(run.providerId, 'opencode')
     assert.ok(await exists(path.join(sourceTreeRoot(dir), 'login-ui', 'index.html')))
@@ -561,7 +808,7 @@ test('runCodingForElement: an opencode run that writes nothing is retried once, 
   }
 })
 
-test('runCodingForElement: an opencode run that writes nothing on both attempts is rejected-empty-output after exactly one retry', async () => {
+test('runCodingForElement: an opencode iteration that writes nothing on both attempts stalls at rejected-empty-output', async () => {
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
@@ -575,19 +822,22 @@ test('runCodingForElement: an opencode run that writes nothing on both attempts 
 
     const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
 
-    assert.equal(callCount, 2, 'a second empty attempt should not trigger a further retry — one retry only')
+    // The GLM double-call is per iteration. iter 1: empty + GLM retry
+    // (2 calls) => rejected-empty-output at attempt 0. iter 2: empty + GLM
+    // retry (2 calls) => rejected-empty-output at attempt 1 => stall exit.
+    // 2 + 2 = 4.
+    assert.equal(callCount, 4)
     assert.equal(run.status, 'rejected-empty-output')
     assert.equal(run.diff, '')
+    assert.equal(run.stoppedBecause, 'stalled')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })
 
-// Confirms the retry is genuinely GLM/opencode-scoped, not a general
-// empty-output retry that would double the CLI cost for every provider —
-// Claude Code hasn't shown this failure pattern, so it keeps its existing
-// single-attempt behavior.
-test('runCodingForElement: a claude-code run that writes nothing is NOT retried', async () => {
+// The GLM double-call is genuinely provider-scoped; Claude Code gets one
+// call per iteration.
+test('runCodingForElement: a claude-code iteration that writes nothing is not double-called; the loop retries once then stalls', async () => {
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
@@ -601,9 +851,275 @@ test('runCodingForElement: a claude-code run that writes nothing is NOT retried'
 
     const run = await runCodingForElement(project, dir, 'ARCH-001', client, {})
 
-    assert.equal(callCount, 1, 'claude-code empty-output runs should not be retried')
+    // One call per iteration; iter 1 empty (attempt 0, not an exit),
+    // iter 2 empty (attempt 1 => stall exit). 1 + 1 = 2.
+    assert.equal(callCount, 2, 'claude-code: one call per iteration, and the loop retries a no-op once')
     assert.equal(run.status, 'rejected-empty-output')
+    assert.equal(run.stoppedBecause, 'stalled')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// Project harness feature: the kind:'harness' element's own coding path
+// ---------------------------------------------------------------------------
+
+const WEB_PLATFORM = {
+  id: 'web' as const,
+  label: 'Web App',
+  entryPointHint: 'index.html + main.tsx',
+  wiringHint: 'ES module imports',
+  lifecycleHint: 'start only',
+  builtIn: true,
+}
+
+function harnessProject(): Project {
+  const p = baseProject()
+  p.platform = 'web'
+  p.architecture!.elements.push({
+    id: 'ARCH-HARNESS',
+    kind: 'harness',
+    name: 'Harness',
+    responsibility: 'Owns the entry point and wiring.',
+    row: -2,
+    col: 0,
+    rowSpan: 1,
+    colSpan: 1,
+    interfaces: ['ARCH-001', 'ARCH-002'],
+    elementInterfaces: [],
+    harnessSpec: {
+      derivedForPlatform: 'web',
+      checklist: [{ key: 'entry-point', status: 'applies', realisation: 'index.html loads main.tsx' }],
+      linkRealisations: [{ masterDefinitionId: 'IFACE-001', summary: 'Login UI constructed with an Auth Service ref' }],
+      narrative: 'main.tsx builds Auth Service then Login UI and calls start().',
+      derivedAt: new Date().toISOString(),
+    },
+  })
+  return p
+}
+
+test('runCodingForElement (harness): blocked when no platform is selected', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = harnessProject()
+    project.platform = undefined
+    const client = { async runAgentTask() { throw new Error('should not run') } }
+    const run = await runCodingForElement(project, dir, 'ARCH-HARNESS', client, {})
+    assert.equal(run.status, 'rejected-not-eligible')
+    assert.match(run.rawLog, /platform/i)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCodingForElement (harness): blocked when harnessSpec platform mismatches project.platform', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = harnessProject()
+    project.architecture!.elements.find((e) => e.kind === 'harness')!.harnessSpec!.derivedForPlatform = 'android'
+    const client = { async runAgentTask() { throw new Error('should not run') } }
+    const run = await runCodingForElement(project, dir, 'ARCH-HARNESS', client, { platform: WEB_PLATFORM })
+    assert.equal(run.status, 'rejected-not-eligible')
+    assert.match(run.rawLog, /Define Harness again/i)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runCodingForElement (harness): writes the entry file at the src root, commits, success', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'write-in-scope'
+  process.env.FAKE_CLAUDE_WRITE_PATH = 'main.tsx'
+  const dir = await tempProjectDir()
+  try {
+    const project = harnessProject()
+    const client = new ClaudeCodeAgentClient()
+    const run = await runCodingForElement(project, dir, 'ARCH-HARNESS', client, {
+      binary: 'node',
+      binaryArgs: [fixture],
+      platform: WEB_PLATFORM,
+    })
+    assert.equal(run.status, 'success')
+    assert.equal(run.allowedSubfolder, '_harness')
+    assert.match(run.diff, /main\.tsx/)
+    assert.ok(await exists(path.join(sourceTreeRoot(dir), 'main.tsx')))
+    assert.ok(!run.warnings, 'a clean in-scope write produces no warnings')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    delete process.env.FAKE_CLAUDE_WRITE_PATH
+  }
+})
+
+test('runCodingForElement (harness): a write into an element folder is reverted and flagged, run still succeeds if it also wrote the entry', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'write-in-scope'
+  // Fixture writes exactly one path; point it at an element folder and
+  // assert it never lands in the real tree and surfaces a warning.
+  process.env.FAKE_CLAUDE_WRITE_PATH = 'login-ui/sneaky.txt'
+  const dir = await tempProjectDir()
+  try {
+    const project = harnessProject()
+    const client = new ClaudeCodeAgentClient()
+    const run = await runCodingForElement(project, dir, 'ARCH-HARNESS', client, {
+      binary: 'node',
+      binaryArgs: [fixture],
+      platform: WEB_PLATFORM,
+    })
+    // Nothing in-scope was written, so from the merge-back's view this is
+    // an empty run — but the out-of-scope attempt must still be flagged.
+    assert.ok(!(await exists(path.join(sourceTreeRoot(dir), 'login-ui', 'sneaky.txt'))))
+    assert.ok(run.warnings && run.warnings.some((w) => /sneaky\.txt/.test(w)))
+    assert.ok(run.warnings.some((w) => /missing (a )?requirement or interface/i.test(w)))
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+    delete process.env.FAKE_CLAUDE_WRITE_PATH
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Harness prompt: the "Elements to instantiate and wire" block
+// ---------------------------------------------------------------------------
+
+// harnessProject() (above) has ARCH-001/ARCH-002 and a single IFACE-001 with
+// NO declarations. This variant adds declarations across TWO interface
+// definitions so ARCH-001 has two InterfaceElementDeclarations to merge.
+function harnessProjectWithDeclarations(): Project {
+  const p = harnessProject()
+  const arch = p.architecture!
+  arch.elements.push({
+    id: 'ARCH-003', kind: 'service', name: 'Telemetry', responsibility: 'Records events',
+    row: 0, col: 2, rowSpan: 1, colSpan: 1, interfaces: [], elementInterfaces: [],
+  })
+  arch.elements.find((e) => e.kind === 'harness')!.interfaces.push('ARCH-003')
+  arch.interfaceDefinitions = [
+    {
+      id: 'IFACE-001', name: 'Login UI <-> Auth Service',
+      participants: [{ elementId: 'ARCH-001', role: 'both' }, { elementId: 'ARCH-002', role: 'both' }],
+      status: 'defined', updatedAt: new Date().toISOString(), operations: [],
+      declarations: [
+        { elementId: 'ARCH-001', does: 'Renders login', exposes: ['renderForm'], owns: ['formState'], visibleTo: ['ARCH-002'] },
+        { elementId: 'ARCH-002', does: 'Authenticates', exposes: ['login'], owns: ['sessions'], visibleTo: ['none'] },
+      ],
+    },
+    {
+      id: 'IFACE-002', name: 'Login UI <-> Telemetry',
+      participants: [{ elementId: 'ARCH-001', role: 'both' }, { elementId: 'ARCH-003', role: 'both' }],
+      status: 'defined', updatedAt: new Date().toISOString(), operations: [],
+      declarations: [
+        { elementId: 'ARCH-001', does: 'Renders login', exposes: ['emitEvent'], owns: ['eventQueue'], visibleTo: ['ARCH-003'] },
+        { elementId: 'ARCH-003', does: 'Records events', exposes: ['record'], owns: [], visibleTo: ['none'] },
+      ],
+    },
+  ]
+  return p
+}
+
+test('buildHarnessCodingPrompt: an element in two interface definitions gets ALL its exposes/owns merged, not just the first', () => {
+  const project = harnessProjectWithDeclarations()
+  const prompt = buildCodingPrompt(project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM)
+  // Both definitions' contributions for ARCH-001 must survive the merge.
+  assert.match(prompt, /renderForm/)
+  assert.match(prompt, /emitEvent/)
+  assert.match(prompt, /formState/)
+  assert.match(prompt, /eventQueue/)
+})
+
+test('buildHarnessCodingPrompt: surfaces owns and data-visibility, previously dropped entirely', () => {
+  const project = harnessProjectWithDeclarations()
+  const prompt = buildCodingPrompt(project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM)
+  // owns is a union across both definitions; visibleTo is last-writer-wins
+  // (IFACE-002's ['ARCH-003'] over IFACE-001's ['ARCH-002']) per the
+  // InterfaceElementDeclaration doc comment in types.ts.
+  assert.match(prompt, /owns: [^\n]*formState/)
+  assert.match(prompt, /owns: [^\n]*eventQueue/)
+  assert.match(prompt, /data visible to: ARCH-003/)
+})
+
+test('buildHarnessCodingPrompt: test-file instruction carries the swTestInstruction hazards plus the node-vs-browser one', () => {
+  const project = harnessProject()
+  const prompt = buildCodingPrompt(project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM)
+  assert.match(prompt, /\.mjs/)
+  assert.match(prompt, /silently skipped/i)
+  assert.match(prompt, /do NOT append any non-code text/i)
+  // The harness-only hazard: its test runs under node, the app is browser ESM.
+  assert.match(prompt, /runs under `node`/)
+  assert.match(prompt, /ReferenceError/)
+})
+
+// ---------------------------------------------------------------------------
+// Harness prompt: the freshly-scanned element API manifest (Step 4)
+// ---------------------------------------------------------------------------
+
+const ELEMENT_APIS_FIXTURE = [
+  {
+    elementId: 'ARCH-001', folder: 'login-ui', entryFile: 'index.js', scanned: true,
+    exports: [
+      { name: 'createForm', kind: 'function' as const, params: 'rootEl, onSubmit' },
+      { name: 'FormState', kind: 'class' as const, methods: ['constructor(initial)', 'reset()'] },
+      { name: 'DEFAULT_TIMEOUT', kind: 'const' as const },
+    ],
+  },
+  {
+    elementId: 'ARCH-002', folder: 'auth-service', entryFile: 'index.js', scanned: true,
+    exports: [{ name: 'login', kind: 'function' as const, params: 'username, password' }],
+  },
+]
+
+test('buildHarnessCodingPrompt: inlines the scanned API as code: lines with real signatures', () => {
+  const project = harnessProject()
+  const prompt = buildCodingPrompt(
+    project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM, undefined, ELEMENT_APIS_FIXTURE,
+  )
+  assert.match(prompt, /code: \.\/login-ui\/index\.js/)
+  assert.match(prompt, /function createForm\(rootEl, onSubmit\)/)
+  assert.match(prompt, /class FormState \{ constructor\(initial\); reset\(\) \}/)
+  assert.match(prompt, /const DEFAULT_TIMEOUT/)
+  assert.match(prompt, /function login\(username, password\)/)
+})
+
+test('buildHarnessCodingPrompt: with a manifest, the old "READ every element\'s folder" invitation is gone', () => {
+  const project = harnessProject()
+  const withManifest = buildCodingPrompt(
+    project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM, undefined, ELEMENT_APIS_FIXTURE,
+  )
+  assert.ok(!/MAY READ every element's folder to see what it exports/.test(withManifest))
+  assert.match(withManifest, /do NOT glob, list, or read element folders/i)
+  // The duplicate pre-generated import list is gone too.
+  assert.ok(!/import \{ \/\* \.\.\. \*\/ \}/.test(withManifest))
+})
+
+test('buildHarnessCodingPrompt: an element with no scanned code renders NOT YET WRITTEN and a provisional-wiring note', () => {
+  const project = harnessProject()
+  const apis = [
+    { elementId: 'ARCH-001', folder: 'login-ui', entryFile: 'index.js', scanned: false, exports: [] },
+    ELEMENT_APIS_FIXTURE[1],
+  ]
+  const prompt = buildCodingPrompt(
+    project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM, undefined, apis,
+  )
+  assert.match(prompt, /login-ui\/index\.js — NOT YET WRITTEN/)
+  assert.match(prompt, /wiring is provisional/i)
+})
+
+test('buildHarnessCodingPrompt: uses the harness self-review variant, not the element one', () => {
+  const project = harnessProject()
+  const prompt = buildCodingPrompt(project, 'ARCH-HARNESS', '_harness', 'manual-recode', WEB_PLATFORM)
+  assert.ok(!/reusing existing code already in this subfolder/.test(prompt))
+  assert.match(prompt, /without re-reading your own files/)
+})
+
+test('buildHarnessCodingPrompt: a non-web platform lists no code: lines and keeps the read-the-folders wording', () => {
+  const project = harnessProject()
+  project.platform = 'cli'
+  const CLI_PLATFORM = { id: 'cli' as const, label: 'CLI', builtIn: true, entryPointHint: 'main()', wiringHint: 'DI', lifecycleHint: 'start + SIGINT' }
+  // scanElementApis on a non-web platform returns scanned:false / no entryFile.
+  const apis = [
+    { elementId: 'ARCH-001', folder: 'login-ui', entryFile: undefined, scanned: false, exports: [] },
+    { elementId: 'ARCH-002', folder: 'auth-service', entryFile: undefined, scanned: false, exports: [] },
+  ]
+  const prompt = buildCodingPrompt(
+    project, 'ARCH-HARNESS', '_harness', 'manual-recode', CLI_PLATFORM, undefined, apis,
+  )
+  assert.ok(!/code: /.test(prompt))
+  assert.match(prompt, /no single mandated entry file per element/i)
+  assert.match(prompt, /read each element's folder/i)
 })

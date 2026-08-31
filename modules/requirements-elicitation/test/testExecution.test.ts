@@ -10,6 +10,15 @@ function emptyProject(): Project {
     name: 'Test Project',
     projectMode: 'new',
     requirements: [],
+    architecture: {
+      // Minimal — only the fields formatArchitectureForTriage /
+      // parseSuspectedElementIds read (id, kind, name, responsibility).
+      elements: [
+        { id: 'ARCH-001', kind: 'service', name: 'Login UI', responsibility: 'renders the login form' },
+        { id: 'ARCH-002', kind: 'service', name: 'Auth API', responsibility: 'validates credentials' },
+        { id: 'ARCH-HARNESS', kind: 'harness', name: 'Harness', responsibility: 'wires elements together' },
+      ],
+    } as unknown as Project['architecture'],
     testSuite: {
       tests: [
         {
@@ -80,6 +89,31 @@ test('triageTestFailure defaults to unattributed on a malformed reply', async ()
   const result = await triageTestFailure(project, fake, run, 'TEST-001')
 
   assert.equal(result.triage, 'unattributed')
+})
+
+test('triageTestFailure parses SUSPECTED-ELEMENTS and writes them to the outcome (advisory)', async () => {
+  const project = emptyProject()
+  const run = runWithFailingOutcome()
+  const fake = new FakeLlmClient(
+    'CODE-FAILURE: the harness never wires the auth client into the login UI\nSUSPECTED-ELEMENTS: ARCH-HARNESS, ARCH-002',
+  )
+
+  const result = await triageTestFailure(project, fake, run, 'TEST-001')
+
+  assert.deepEqual(result.suspectedElementIds, ['ARCH-HARNESS', 'ARCH-002'])
+  assert.deepEqual(run.outcomes[0].suspectedElementIds, ['ARCH-HARNESS', 'ARCH-002'])
+  // Advisory only — triage verdict unaffected, nothing routed.
+  assert.equal(result.triage, 'code-failure')
+})
+
+test('triageTestFailure falls back to the static link when SUSPECTED-ELEMENTS is missing or unknown', async () => {
+  const project = emptyProject()
+  const run = runWithFailingOutcome()
+  const fake = new FakeLlmClient('CODE-FAILURE: something broke\nSUSPECTED-ELEMENTS: ARCH-BOGUS, not-an-id')
+
+  const result = await triageTestFailure(project, fake, run, 'TEST-001')
+
+  assert.deepEqual(result.suspectedElementIds, ['ARCH-001'])
 })
 
 test('triageTestFailure throws for a passing outcome', async () => {

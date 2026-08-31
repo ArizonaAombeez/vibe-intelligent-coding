@@ -1,0 +1,119 @@
+/* ChatDock reuses the existing .analyst-chat-* rules (defined in
+   RequirementsScreen.css and mirrored in ArchitectureScreen.css) for the
+   dock shell, panel, history, error and input row. Only the pieces new to
+   the tabbed/linked version live here. */
+
+.chat-dock-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+}
+
+.chat-dock-tab {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  font-size: 12px;
+  max-width: 200px;
+}
+
+.chat-dock-tab-active {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+
+.chat-dock-tab-label {
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
+  padding: 4px 6px 4px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat-dock-tab-close {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 8px 4px 4px;
+  cursor: pointer;
+}
+
+.chat-dock-tab-close:hover:not(:disabled) {
+  color: var(--status-red);
+}
+
+.chat-dock-tab-new {
+  background: none;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 14px;
+  line-height: 1;
+  padding: 4px 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.chat-dock-tab-new:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-dock-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.chat-link-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  max-width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+}
+
+.chat-link-chip:hover {
+  background: var(--accent-bg);
+}
+
+.chat-link-chip-kind {
+  color: var(--accent);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  flex-shrink: 0;
+}
+
+.chat-link-chip-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chat-dock-dispatch {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}

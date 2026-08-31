@@ -11,7 +11,15 @@ export interface ScopeReadinessEntry {
 }
 
 function hasSuccessfulCodingRun(project: Project, elementId: string): boolean {
-  return (project.codingRuns ?? []).some((run) => run.architectureElementId === elementId && run.status === 'success')
+  // 'success-tests-failing' counts here: the T3 loop DID produce code and a
+  // test file on disk (it just didn't converge), so Test Execution should
+  // sweep and report those files red rather than showing the scope as
+  // never-coded.
+  return (project.codingRuns ?? []).some(
+    (run) =>
+      run.architectureElementId === elementId &&
+      (run.status === 'success' || run.status === 'success-tests-failing'),
+  )
 }
 
 // Per-scope readiness for Test Execution (Area F) — a requirement-based test

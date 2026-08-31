@@ -3,6 +3,20 @@
   max-width: 1200px;
 }
 
+/* While a run is live the fixed right-hand panel is on screen — reserve a
+   gutter so it never sits on top of the Generated Files list or the detail
+   pane. :has() lets the layout react to the panel's presence with no JS. */
+.coding-screen:has(.coding-live-log) {
+  padding-right: 500px;
+  max-width: none;
+}
+
+@media (max-width: 1400px) {
+  .coding-screen:has(.coding-live-log) {
+    padding-right: 440px;
+  }
+}
+
 .coding-screen h1 {
   font-size: 22px;
   color: var(--text-h);
@@ -413,6 +427,17 @@
   background: var(--status-amber);
 }
 
+.coding-harness-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  color: var(--text-h);
+  border: 1px solid var(--border);
+  background: var(--bg-alt, transparent);
+}
+
 .coding-detail-pane {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -499,6 +524,25 @@
   border: 1px solid var(--status-red);
 }
 
+.coding-run-banner-rejected-no-tests,
+.coding-run-banner-rejected-not-eligible {
+  background: color-mix(in srgb, var(--status-amber) 12%, transparent);
+  border: 1px solid var(--status-amber);
+}
+
+.coding-run-banner-info {
+  background: color-mix(in srgb, var(--accent, #4a9) 10%, transparent);
+  border: 1px solid var(--accent, #4a9);
+}
+
+.coding-run-banner code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em;
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+
 .coding-run-banner-locked {
   background: color-mix(in srgb, var(--status-amber) 12%, transparent);
   border: 1px solid var(--status-amber);
@@ -582,7 +626,7 @@
   top: 72px;
   right: 20px;
   bottom: 20px;
-  width: 420px;
+  width: 460px;
   max-width: calc(100vw - 40px);
   display: flex;
   flex-direction: column;
@@ -592,6 +636,111 @@
   padding: 12px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
   z-index: 20;
+}
+
+.coding-live-log-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  overflow-y: auto;
+}
+
+.coding-live-log-activity {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.coding-live-log-activity h4,
+.coding-log-digest-section h4 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0 0 4px;
+}
+
+/* Structured digest — shared by the live panel and a finished run's view. */
+.coding-log-digest {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0;
+}
+
+.coding-log-digest-section ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.coding-log-digest-section li {
+  font-family: ui-monospace, monospace;
+}
+
+.coding-log-digest-errors li {
+  color: var(--status-red);
+}
+
+.coding-log-digest-thought {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow-y: auto;
+}
+
+/* Coding-level (SW) test result block on a finished run. */
+.coding-sw-test-result {
+  border: 1px solid var(--status-green);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 10px 0;
+}
+
+.coding-sw-test-result-failed {
+  border-color: var(--status-red);
+  background: color-mix(in srgb, var(--status-red) 8%, transparent);
+}
+
+.coding-sw-test-result-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.coding-sw-test-file {
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.coding-sw-test-file summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.coding-sw-test-file pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 11px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  max-height: 240px;
+  overflow-y: auto;
+  margin: 6px 0 0;
 }
 
 .coding-live-log-heading {

@@ -27,6 +27,39 @@ test('runAgentTask parses a successful result', async () => {
   }
 })
 
+test('runAgentTask normalises stream-json events into OpenCode-shaped log lines and streams them via onChunk', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'stream-events'
+  const cwd = await tempDir()
+  try {
+    const chunks: string[] = []
+    const client = new ClaudeCodeAgentClient()
+    const result = await client.runAgentTask('do the thing', {
+      cwd,
+      binary: 'node',
+      binaryArgs: [fixture],
+      onChunk: (c) => chunks.push(c),
+    })
+
+    assert.equal(result.exitCode, 0)
+    assert.equal(result.sessionId, 'agent-session-stream')
+    assert.equal(result.usage?.totalTokens, 15)
+
+    // onChunk saw normalised lines DURING the run, not one blob at the end.
+    const streamed = chunks.join('')
+    assert.match(streamed, /"type":"reasoning"/)
+    assert.match(streamed, /"type":"tool_use"/)
+    assert.match(streamed, /"tool":"write"/)
+    assert.match(streamed, /"status":"error"/)
+
+    // rawLog is the same newline-delimited-JSON shape as the OpenCode client's.
+    for (const line of result.rawLog.split('\n').filter(Boolean)) {
+      assert.doesNotThrow(() => JSON.parse(line), `rawLog line should be valid JSON: ${line}`)
+    }
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test('runAgentTask always passes --permission-mode, defaulting to acceptEdits', async () => {
   process.env.FAKE_CLAUDE_MODE = 'echo-args'
   const cwd = await tempDir()

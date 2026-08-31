@@ -11,6 +11,9 @@ export type {
   QualityScoreDeduction,
   AnalystSeverity,
   ArchitectureTypeId,
+  BuiltInPlatformId,
+  PlatformId,
+  PlatformDescriptor,
   Architecture,
   ArchitectureElement,
   ArchitectureElementKind,
@@ -18,9 +21,15 @@ export type {
   ArchitectureConflictKind,
   InterfaceRole,
   InterfaceDefinition,
+  InterfaceElementDeclaration,
   ElementInterfaceDefinition,
   InterfaceContractOperation,
   IncompleteOperation,
+  HarnessChecklistKey,
+  HarnessChecklistStatus,
+  HarnessChecklistItem,
+  HarnessLinkRealisation,
+  HarnessSpec,
   PhaseTabGating,
   ProjectSettings,
   ConflictCheckRecord,
@@ -56,14 +65,29 @@ export type {
   TestRunKind,
   TestRun,
   TestRegressionRun,
+  ChatSurface,
+  ChatMessageLink,
+  ChatMessage,
+  ChatSession,
 } from './types.js'
 export { ARCHITECTURE_TYPES, findArchitectureType } from './architectureTypes.js'
 export type { ArchitectureTypeOption } from './architectureTypes.js'
+export {
+  BUILT_IN_PLATFORMS,
+  DEFAULT_HARNESS_CHECKLIST,
+  buildHarnessResponsibility,
+  harnessRootWritePrefixesForPlatform,
+  findPlatform,
+  isBuiltInPlatformId,
+  platformSlug,
+} from './platforms.js'
 export {
   setArchitectureType,
   createArchitectureElement,
   updateArchitectureElement,
   deleteArchitectureElement,
+  pruneOrphanedInterfaceReferences,
+  ensureHarnessElement,
   addLayer,
   removeLayer,
   checkArchitectureConflicts,
@@ -75,11 +99,13 @@ export {
   checkInterfaceConflict,
   defineInterfaceDefinition,
   defineAllInterfaceDefinitions,
+  deriveHarnessSpec,
   setInterfaceDefinition,
   reconcileElementInterface,
   checkInterfaces,
   nextFreeColumn,
   EXTERNAL_CONTEXT_ROW,
+  HARNESS_ROW,
   connectedPairs,
 } from './architecture.js'
 export type {
@@ -94,6 +120,7 @@ export type {
   CheckInterfaceConflictResult,
   DefineInterfaceDefinitionResult,
   DefineAllInterfaceDefinitionsResult,
+  DeriveHarnessSpecResult,
   CheckInterfacesResult,
 } from './architecture.js'
 export {
@@ -105,6 +132,12 @@ export { generateProjectOverview } from './projectOverview.js'
 export type { GenerateProjectOverviewResult } from './projectOverview.js'
 export { ProjectStore } from './store.js'
 export type { ProjectStoreOptions } from './store.js'
+export { computePhaseReadiness } from './phaseReadiness.js'
+export type {
+  PhaseReadiness,
+  PhaseBlocker,
+  PhaseStatus,
+} from './phaseReadiness.js'
 export type { LlmRole, LlmMessage, LlmClient, LlmCallOptions, LlmUsage, LlmChatResult } from './LlmClient.js'
 export {
   DEFAULT_ANALYST_SYSTEM_PROMPT,
@@ -115,7 +148,13 @@ export {
   buildGapCheckPrompt,
   buildSplitPrompt,
 } from './analystPersona.js'
-export { DEFAULT_ARCHITECT_SYSTEM_PROMPT, buildArchitectChatMessages } from './architecturePersona.js'
+export {
+  DEFAULT_ARCHITECT_SYSTEM_PROMPT,
+  DEFINE_INTERFACE_CONTRACT_SYSTEM_PROMPT,
+  DEFINE_HARNESS_SPEC_SYSTEM_PROMPT,
+  buildArchitectChatMessages,
+  buildHarnessSpecMessages,
+} from './architecturePersona.js'
 export {
   createTestCase,
   updateTestCase,
@@ -158,6 +197,7 @@ export {
   DEFAULT_QA_TEST_EXECUTION_SYSTEM_PROMPT,
   buildTestExecutionChatMessages,
   formatCodeContextForTriage,
+  formatArchitectureForTriage,
 } from './testExecutionPersona.js'
 export { triageTestFailure, confirmTestCaseFailure, chatWithQATestExecution, classifyAndDispatchUserReportedIssue } from './testExecution.js'
 export type { TriageTestFailureResult, ChatWithQATestExecutionResult, UserReportedIssueDispatch, ClassifyUserReportedIssueResult } from './testExecution.js'

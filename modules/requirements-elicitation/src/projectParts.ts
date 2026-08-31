@@ -1,4 +1,5 @@
 import { findArchitectureType } from './architectureTypes.js'
+import { HARNESS_ELEMENT_ID } from './architecture.js'
 import type { Architecture, ArchitectureElement, Project, Requirement, RequirementConflict } from './types.js'
 
 // Mirrors packages/ui/src/api/types.ts's PhaseId — kept as a plain string
@@ -176,15 +177,29 @@ export function importArchitecturePart(project: Project, data: ArchitecturePartD
   const rowOffset = architecture.layers.length
   architecture.layers.push(...data.architecture.layers)
 
+  // The harness (kind:'harness') is a per-project singleton the target
+  // project already owns via ensureHarnessElement — importing the source
+  // project's harness would produce a SECOND one (with an IMP_ id), which
+  // must never happen. Drop it from the imported set entirely; any
+  // interface reference to it from another imported element is remapped to
+  // the target project's own harness id below.
+  const targetHarnessId =
+    architecture.elements.find((e) => e.kind === 'harness')?.id ?? HARNESS_ELEMENT_ID
+  const sourceElements = data.architecture.elements.filter((e) => e.kind !== 'harness')
+  const droppedHarnessSourceIds = new Set(
+    data.architecture.elements.filter((e) => e.kind === 'harness').map((e) => e.id),
+  )
+
   const taken = new Set(architecture.elements.map((e) => e.id))
   const idMap = new Map<string, string>()
-  for (const element of data.architecture.elements) {
+  for (const droppedId of droppedHarnessSourceIds) idMap.set(droppedId, targetHarnessId)
+  for (const element of sourceElements) {
     const newId = uniqueId(`${IMPORTED_ID_PREFIX}${element.id}`, taken)
     taken.add(newId)
     idMap.set(element.id, newId)
   }
 
-  const imported: ArchitectureElement[] = data.architecture.elements.map((source) => ({
+  const imported: ArchitectureElement[] = sourceElements.map((source) => ({
     ...source,
     id: idMap.get(source.id)!,
     responsibility: remapResponsibilityText(source.responsibility, idMap),

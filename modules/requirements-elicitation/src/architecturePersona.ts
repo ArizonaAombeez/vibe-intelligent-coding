@@ -1,5 +1,10 @@
 import type { LlmMessage } from './LlmClient.js'
-import type { Architecture, ArchitectureElement } from './types.js'
+import type {
+  Architecture,
+  ArchitectureElement,
+  InterfaceDefinition,
+  PlatformDescriptor,
+} from './types.js'
 
 export const DEFAULT_ARCHITECT_SYSTEM_PROMPT = `You are the Architect, responsible for the Architecture stage of a
 software project. You help the user design, extend, and refine the
@@ -77,12 +82,127 @@ elements' names, kinds, and roles (e.g. a controller/opponent element
 feeding a game engine plausibly reports a chosen move or action, and reads
 back the state it needs to choose one) rather than giving up — this is a
 best-effort draft the human will review and correct, not a final contract.
-Only reply with the single word NONE when the two elements are so unrelated
-or abstract that no plausible operation can be inferred at all.`
+Only reply with the single word NONE for OPERATION lines when the two
+elements are so unrelated or abstract that no plausible operation can be
+inferred at all.
+
+Then, ALWAYS — even if you replied NONE for operations — emit exactly one
+DECLARE line for EACH of the two elements, describing it platform-neutrally:
+
+DECLARE: <element id>|<what this element does, one line>|<exposes: names of the function calls or signals it offers other elements, semicolon-separated, or NONE>|<owns: names of the data it owns, semicolon-separated, or NONE>|<visibleTo: element ids that may see its owned data, semicolon-separated, or ALL, or NONE>
+  Use the element id exactly as given (e.g. ARCH-003).
+  "exposes" are conceptual call/signal names, never a language or framework
+  construct — no return types, no syntax.
+  "owns" is the data this element is the single owner of; nothing is global,
+  every datum has exactly one owning element.
+  "visibleTo" says which other elements are allowed to read that owned data.
+  Do not name any language, framework, platform, or wiring mechanism
+  anywhere in a DECLARE line — how these are realised is decided later.`
 
 function formatExistingElements(elements: ArchitectureElement[]): string {
   if (elements.length === 0) return '(none yet)'
   return elements.map((e) => `- ${e.id} (${e.kind}): ${e.name} — ${e.responsibility}`).join('\n')
+}
+
+// Define Harness (project harness feature) — one call producing the plan
+// for how THIS project's single harness element realises its entry point,
+// element instantiation, inter-element links and run lifecycle on the
+// currently selected platform. Same fixed-line-grammar, human-reviewed
+// pattern as the rest of this file. The caller (deriveHarnessSpec in
+// architecture.ts) supplies the platform hints, the checklist keys, the
+// element inventory and the interface definitions as a user message.
+export const DEFINE_HARNESS_SPEC_SYSTEM_PROMPT = `You are the Architect, defining how a project's HARNESS is realised on a
+specific target platform.
+
+The harness is the single composition root and entry point of the project.
+Its job — and ONLY its job — is to: own the platform entry point;
+instantiate every functional element; establish the declared connections
+between elements; and drive the run lifecycle. It contains no functional
+logic of its own. Every other element is implemented in isolation and must
+NOT create an entry point or wire anything — the harness does all of it.
+
+You are given: the target platform and how entry points / wiring /
+lifecycle conventionally look on it; a fixed checklist of harness concerns;
+the list of elements to instantiate; and the platform-neutral interface
+declarations describing what each element exposes and owns.
+
+Reply using exactly these line formats, nothing else:
+
+CHECK: <key>|<applies or not-applicable>|<one sentence: how this concern is realised on this platform, or why it does not apply>
+  One line for EVERY checklist key given, in any order.
+
+LINK: <interface definition id>|<one sentence naming the concrete platform mechanism that realises this connection between the two elements>
+  One line for EVERY interface definition given. Name the real mechanism
+  for THIS platform (e.g. "constructor injection in main()", "an Android
+  ViewModel exposing a StateFlow the other observes", "a shared event bus
+  subscription") — this is the per-link realisation note the harness code
+  will be written to match.
+
+NARRATIVE: <one paragraph, plain prose, tying the above together: the file(s) that form the entry point, the order elements are constructed in, and how the run is started and stopped>
+
+Be concrete and specific to the given platform. Do not invent elements or
+interfaces that were not given to you.`
+
+export function buildHarnessSpecMessages(
+  platform: PlatformDescriptor,
+  checklistKeys: ReadonlyArray<{ key: string; description: string }>,
+  elements: ArchitectureElement[],
+  interfaceDefinitions: InterfaceDefinition[],
+): LlmMessage[] {
+  const platformBlock = [
+    `Target platform: ${platform.label} (${platform.id})`,
+    `Entry point on this platform: ${platform.entryPointHint}`,
+    `Wiring on this platform: ${platform.wiringHint}`,
+    `Run lifecycle on this platform: ${platform.lifecycleHint}`,
+  ].join('\n')
+
+  const checklistBlock = checklistKeys.map((c) => `- ${c.key}: ${c.description}`).join('\n')
+
+  const elementBlock =
+    elements.length > 0
+      ? elements.map((e) => `- ${e.id} (${e.kind}): ${e.name} — ${e.responsibility}`).join('\n')
+      : '(no elements yet — the harness may have nothing to instantiate; still describe the entry point)'
+
+  const declByElement = new Map<string, string[]>()
+  for (const def of interfaceDefinitions) {
+    for (const decl of def.declarations ?? []) {
+      const lines = declByElement.get(decl.elementId) ?? []
+      lines.push(
+        `exposes: ${decl.exposes.join('; ') || 'NONE'}; owns: ${decl.owns.join('; ') || 'NONE'}; visibleTo: ${decl.visibleTo.join('; ') || 'NONE'}`,
+      )
+      declByElement.set(decl.elementId, lines)
+    }
+  }
+  const declarationBlock =
+    declByElement.size > 0
+      ? Array.from(declByElement.entries())
+          .map(([id, lines]) => `- ${id}: ${lines[0]}`)
+          .join('\n')
+      : '(no interface declarations yet)'
+
+  const interfaceBlock =
+    interfaceDefinitions.length > 0
+      ? interfaceDefinitions
+          .map((d) => {
+            const parts = d.participants.map((p) => `${p.elementId} (${p.role})`).join(', ')
+            const ops = d.operations.map((o) => o.name).join(', ') || 'none listed'
+            return `- ${d.id} "${d.name}": between ${parts}; operations: ${ops}`
+          })
+          .join('\n')
+      : '(no interface definitions yet — emit no LINK lines)'
+
+  const userContent = [
+    platformBlock,
+    `\nHarness checklist keys (emit one CHECK line for each):\n${checklistBlock}`,
+    `\nElements to instantiate:\n${elementBlock}`,
+    `\nPlatform-neutral element declarations:\n${declarationBlock}`,
+    `\nInterface definitions (emit one LINK line for each):\n${interfaceBlock}`,
+  ].join('\n')
+
+  return [
+    { role: 'system', content: DEFINE_HARNESS_SPEC_SYSTEM_PROMPT },
+    { role: 'user', content: userContent },
+  ]
 }
 
 export function buildArchitectChatMessages(

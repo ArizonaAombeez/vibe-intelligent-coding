@@ -216,6 +216,69 @@ test('runElementTestSuite: a test case with no generated file is left untouched 
   }
 })
 
+test('runElementTestSuite: a test case whose recorded file was deleted is reset to not-run and recorded in run.missingFiles', async () => {
+  const { dir, project, testCase } = await setUpProjectWithTest(true)
+  try {
+    // First run: file exists, produces a real passing outcome.
+    const first = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
+    assert.equal(first.outcomes[0]?.passed, true)
+    assert.equal(testCase.status, 'passing')
+
+    // The source tree is re-coded and the generated test file is lost, but
+    // the TestCase record still points at it.
+    await rm(path.join(sourceTreeRoot(dir), 'login-ui', 'login.test.mjs'), { force: true })
+
+    const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
+
+    assert.deepEqual(
+      run.missingFiles,
+      [{ testCaseId: testCase.id, filePath: 'login-ui/login.test.mjs' }],
+      'the vanished file is recorded on the run',
+    )
+    assert.equal(testCase.filePath, undefined, 'the dead pointer is cleared')
+    assert.equal(testCase.status, 'not-run', 'the test case is reset, not left stale-passing')
+    assert.deepEqual(run.outcomes, [], 'no outcome is fabricated for a test whose file is gone')
+    assert.match(run.rawLog, /recorded but missing from disk/)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runElementTestSuite: harness scope discovers test files at the source-tree root, not just inside _harness/', async () => {
+  const dir = await tempProjectDir()
+  try {
+    const project = baseProject()
+    project.architecture!.elements.push({
+      id: 'ARCH-HARNESS',
+      kind: 'harness',
+      name: 'Harness',
+      responsibility: 'Composition root',
+      row: 0,
+      col: 2,
+      rowSpan: 1,
+      colSpan: 1,
+      interfaces: [],
+      elementInterfaces: [],
+    })
+    await scaffoldProjectSourceTree(project, dir)
+    const srcRoot = sourceTreeRoot(dir)
+    // A cross-cutting test the harness run wrote next to the entry point,
+    // not inside its own (docs-only) _harness/ folder.
+    await writeFile(path.join(srcRoot, 'app-boot.test.mjs'), `console.log('boot ok');\n`, 'utf-8')
+
+    const run = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-HARNESS' })
+
+    assert.deepEqual(
+      run.swOutcomes,
+      [{ name: 'app-boot.test.mjs', passed: true }],
+      'the root-level harness test is discovered and run',
+    )
+    assert.equal(run.exitCode, 0)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('runElementTestSuite rejects a scope that has never been scaffolded, without spawning a subprocess', async () => {
   const dir = await tempProjectDir()
   try {
@@ -285,6 +348,73 @@ test('runFullRegression sweeps an architecture element with no requirement-based
     assert.ok(swRun, 'the zero-TestCase element still got its own element-scoped run')
     assert.deepEqual(swRun!.outcomes, [], 'no requirement-traced outcomes, since it has no TestCase')
     assert.deepEqual(swRun!.swOutcomes, [{ name: 'tick.test.mjs', passed: true }])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runElementTestSuite: only:"requirement" runs only the TestCase-owned file and carries SW outcomes forward', async () => {
+  const dir = await tempProjectDir()
+  const project = baseProject()
+  await scaffoldProjectSourceTree(project, dir)
+  const srcRoot = sourceTreeRoot(dir)
+  // Two files in the same element scope: one owned by a TestCase, one not.
+  await writeTestFile(srcRoot, 'login-ui', 'login.test.mjs', true)
+  await writeTestFile(srcRoot, 'login-ui', 'coding-agent-extra.test.mjs', true)
+  const { testCase } = createTestCase(project, {
+    type: 'functional',
+    title: 'Renders login form',
+    requirementIds: ['REQ-001'],
+    architectureElementId: 'ARCH-001',
+  })
+  testCase!.filePath = 'login-ui/login.test.mjs'
+  try {
+    // First: an unfiltered run establishes both columns.
+    const full = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
+    assert.equal(full.outcomes.length, 1)
+    assert.deepEqual(
+      full.swOutcomes!.map((o) => o.name).sort(),
+      ['coding-agent-extra.test.mjs'],
+    )
+
+    // Now break the SW-only file and run only:"requirement" — it must NOT
+    // run the broken file, and must carry the previous SW outcome forward.
+    await writeTestFile(srcRoot, 'login-ui', 'coding-agent-extra.test.mjs', false)
+    const reqOnly = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001', only: 'requirement' })
+    assert.equal(reqOnly.outcomes.length, 1)
+    assert.equal(reqOnly.outcomes[0].passed, true)
+    assert.deepEqual(reqOnly.swOutcomes, [{ name: 'coding-agent-extra.test.mjs', passed: true }], 'SW column carried forward, broken file not re-run')
+    assert.doesNotMatch(reqOnly.rawLog, /coding-agent-extra/, 'the SW-only file was not executed')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('runElementTestSuite: only:"sw" runs only non-TestCase files and carries requirement outcomes forward', async () => {
+  const dir = await tempProjectDir()
+  const project = baseProject()
+  await scaffoldProjectSourceTree(project, dir)
+  const srcRoot = sourceTreeRoot(dir)
+  await writeTestFile(srcRoot, 'login-ui', 'login.test.mjs', true)
+  await writeTestFile(srcRoot, 'login-ui', 'coding-agent-extra.test.mjs', true)
+  const { testCase } = createTestCase(project, {
+    type: 'functional',
+    title: 'Renders login form',
+    requirementIds: ['REQ-001'],
+    architectureElementId: 'ARCH-001',
+  })
+  testCase!.filePath = 'login-ui/login.test.mjs'
+  try {
+    await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001' })
+
+    // Break the requirement file, run only:"sw" — requirement outcome must
+    // be carried forward as passing, and the broken file not re-run.
+    await writeTestFile(srcRoot, 'login-ui', 'login.test.mjs', false)
+    const swOnly = await runElementTestSuite(project, dir, { architectureElementId: 'ARCH-001', only: 'sw' })
+    assert.deepEqual(swOnly.swOutcomes, [{ name: 'coding-agent-extra.test.mjs', passed: true }])
+    assert.equal(swOnly.outcomes.length, 1)
+    assert.equal(swOnly.outcomes[0].passed, true, 'requirement outcome carried forward')
+    assert.doesNotMatch(swOnly.rawLog, /login\.test\.mjs/, 'the requirement file was not executed')
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

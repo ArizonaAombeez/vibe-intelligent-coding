@@ -6,3 +6,6 @@ dist/
 
 # Local project data created by running the server — not source.
 .vic-projects/
+
+# TypeScript incremental build info
+*.tsbuildinfo

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type {
   Architecture,
+  ChatMessageLink,
   CurrentOperation,
   Requirement,
   ScopeReadiness,
@@ -8,7 +9,6 @@ import type {
   SwTestOutcome,
   TestCase,
   TestCommandScope,
-  TestExecutionChatDispatch,
   TestRegressionRun,
   TestRun,
   TestSuite,
@@ -17,6 +17,8 @@ import type {
 import { toOperationError } from '../api/errorCode'
 import { STATUS_COLOR } from '../statusColor'
 import { highlightRequirementIds } from './requirementIdHighlight'
+import { ChatDock } from '../components/ChatDock'
+import type { PendingChatNav } from '../navigation/chatLinkNav'
 import './RequirementsScreen.css'
 import './TestExecutionScreen.css'
 import '../components/Tooltip.css'
@@ -26,16 +28,10 @@ interface TestExecutionScreenProps {
   projectId: string
   onOperationChange: (op: CurrentOperation) => void
   onOpenSettings: () => void
+  onChatNavigate: (link: ChatMessageLink) => void
+  pendingChatNav: PendingChatNav | null
+  onChatNavConsumed: () => void
 }
-
-interface TestExecutionChatEntry {
-  role: 'user' | 'qa'
-  text: string
-}
-
-const DEFAULT_CHAT_HEIGHT = 260
-const MIN_CHAT_HEIGHT = 120
-const MAX_CHAT_HEIGHT = 640
 
 const TRIAGE_LABEL: Record<NonNullable<TestRun['outcomes'][number]['triage']>, string> = {
   'code-failure': 'Code failure',
@@ -44,24 +40,19 @@ const TRIAGE_LABEL: Record<NonNullable<TestRun['outcomes'][number]['triage']>, s
   unattributed: 'Not yet triaged',
 }
 
-// Shown as a follow-up QA chat entry when the dispatch classification
-// finds an issue report (Area F "User-reported issue triage", resolved) —
-// code-failure/requirement-issue have already been auto-dispatched by the
-// time this renders (see classifyAndDispatchUserReportedIssue), so these
-// say what happened, not what to do next; test-case-failure is a
-// proposal only, so its line tells the user what to do manually.
-const DISPATCH_SUMMARY: Record<TestExecutionChatDispatch['verdict'], (d: TestExecutionChatDispatch) => string> = {
-  'code-failure': (d) =>
-    `Dispatched as a code failure — flagged for re-coding on ${d.dispatchedTo ?? 'the affected element(s)'}. ${d.rationale}`,
-  'requirement-issue': (d) =>
-    `Dispatched as a requirement issue — ${d.dispatchedTo ?? 'the requirement'} has been amended. ${d.rationale}`,
-  'test-case-failure': (d) =>
-    `Triaged as a test case failure — this needs manual review; the test itself likely needs updating. ${d.rationale}`,
-}
+type NotReadyReason = Extract<ScopeReadiness, { ready: false }>['reason']
 
-const NOT_READY_REASON_LABEL: Record<Extract<ScopeReadiness, { ready: false }>['reason'], string> = {
+const NOT_READY_REASON_LABEL: Record<NotReadyReason, string> = {
   'element-not-coded': 'This element has not been coded yet — run Step 5 Coding for it before running its tests.',
   'interface-element-not-coded': 'One or both elements on this interface have not been coded yet — run Step 5 Coding for them before running this test.',
+}
+
+// TS control-flow analysis doesn't reliably narrow `!x.ready` on a
+// `Map.get()` result whose value is a boolean-discriminated union widened
+// through undefined — spell the check out.
+function notReadyReasonLabel(readiness: ScopeReadiness | undefined): string | null {
+  if (!readiness || readiness.ready) return null
+  return NOT_READY_REASON_LABEL[readiness.reason]
 }
 
 // Explains what a requirement-based test case needs next, for the row's
@@ -121,6 +112,48 @@ function latestRunForTest(runs: TestRun[], testId: string): { run: TestRun; outc
   if (!run) return null
   const outcome = run.outcomes.find((o) => o.testCaseId === testId)!
   return { run, outcome }
+}
+
+// True when the most recent run that touched this test's scope found its
+// recorded file missing from disk (source tree re-coded, generated test
+// file lost) and reset it. Distinct from "never generated": the test WAS
+// generated once and needs regenerating, not authoring from scratch.
+function fileMissingForTest(runs: TestRun[], testId: string): boolean {
+  const withMissing = runs
+    .filter((r) => (r.missingFiles ?? []).some((m) => m.testCaseId === testId))
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+  const latestMissing = withMissing[0]
+  if (!latestMissing) return false
+  // A later run that produced a real outcome for this test supersedes the
+  // stale "missing" record (the file was regenerated since).
+  const latestOutcome = latestRunForTest(runs, testId)
+  return !latestOutcome || latestOutcome.run.startedAt <= latestMissing.startedAt
+}
+
+// T1.5(b): most recent run whose SCOPE covers this test but which produced
+// NO outcome for it — i.e. the test's scope was executed and this test
+// simply never ran (no generated file, or a file the runner can't match).
+// Without this, such a run is invisible: latestRunForTest filters on
+// r.outcomes.some(...), so a zero-outcome run matches nothing and the row
+// renders "Not run", identical to never-attempted, with the explanatory
+// rawLog unreachable.
+function attemptedWithoutOutcome(runs: TestRun[], test: TestCase): TestRun | null {
+  const scopeKey = scopeKeyForTest(test)
+  const scoped = runs
+    .filter((r) => {
+      const key = r.interfaceElementIds
+        ? `if:${[...r.interfaceElementIds].sort().join('|')}`
+        : `el:${r.architectureElementId}`
+      return key === scopeKey
+    })
+    .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
+  const latestScopeRun = scoped[0]
+  if (!latestScopeRun) return null
+  if (latestScopeRun.outcomes.some((o) => o.testCaseId === test.id)) return null
+  // A later real outcome supersedes it.
+  const latestOutcome = latestRunForTest(runs, test.id)
+  if (latestOutcome && latestOutcome.run.startedAt > latestScopeRun.startedAt) return null
+  return latestScopeRun
 }
 
 // Most recent element-scoped TestRun for a given scope, regardless of
@@ -223,7 +256,15 @@ function groupSwTestsByScope(runs: TestRun[], architecture: Architecture): SwTes
   return result.sort((a, b) => a.label.localeCompare(b.label))
 }
 
-export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenSettings }: TestExecutionScreenProps) {
+export function TestExecutionScreen({
+  api,
+  projectId,
+  onOperationChange,
+  onOpenSettings,
+  onChatNavigate,
+  pendingChatNav,
+  onChatNavConsumed,
+}: TestExecutionScreenProps) {
   const [testSuite, setTestSuite] = useState<TestSuite | null>(null)
   const [architecture, setArchitecture] = useState<Architecture | null>(null)
   const [runs, setRuns] = useState<TestRun[]>([])
@@ -241,37 +282,6 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
   const [, setRunStatusText] = useState<string | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
 
-  const [chatHistory, setChatHistory] = useState<TestExecutionChatEntry[]>([])
-  const [chatInput, setChatInput] = useState('')
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
-  const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
-  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT)
-  const resizingRef = useRef(false)
-
-  const handleResizeStart = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      resizingRef.current = true
-      const startY = e.clientY
-      const startHeight = chatHeight
-
-      function onMove(moveEvent: MouseEvent) {
-        if (!resizingRef.current) return
-        const delta = startY - moveEvent.clientY
-        const next = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, startHeight + delta))
-        setChatHeight(next)
-      }
-      function onUp() {
-        resizingRef.current = false
-        window.removeEventListener('mousemove', onMove)
-        window.removeEventListener('mouseup', onUp)
-      }
-      window.addEventListener('mousemove', onMove)
-      window.addEventListener('mouseup', onUp)
-    },
-    [chatHeight],
-  )
 
   async function reload() {
     const [suite, arch, allRuns, allRegressionRuns, allRequirements, readiness] = await Promise.all([
@@ -302,7 +312,9 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
   const swGroups = architecture ? groupSwTestsByScope(runs, architecture) : []
   const selectedSwGroup = swGroups.find((g) => g.scopeKey === selectedSwScopeKey) ?? null
   const checkedCount = checkedTestIds.size
-  const readinessByScopeKey = new Map(readinessEntries.map((e) => [e.scopeKey, e.readiness]))
+  const readinessByScopeKey = new Map<string, ScopeReadiness>(
+    readinessEntries.map((e) => [e.scopeKey, e.readiness]),
+  )
   const isScopeReady = (scopeKey: string) => readinessByScopeKey.get(scopeKey)?.ready !== false
   const readyGroups = groups.filter((g) => isScopeReady(g.scopeKey))
   const notReadyGroups = groups.filter((g) => !isScopeReady(g.scopeKey))
@@ -442,16 +454,40 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     }
   }
 
+  // T2.4: a requirement-scoped run over test cases that have no generated
+  // automation just records zero outcomes (nothing to execute). Offer to
+  // generate the missing files first — sequentially, same rationale as the
+  // Test Creation screen's bulk button (the server's per-project run lock
+  // rejects concurrent CLI runs anyway). Returns true if the caller should
+  // proceed with the run, false if the user cancelled.
+  async function ensureAutomationsForScope(scopeTests: TestCase[]): Promise<boolean> {
+    const missing = scopeTests.filter((t) => !t.filePath)
+    if (missing.length === 0) return true
+    const proceed = window.confirm(
+      `${missing.length} of these test case(s) have no generated automation yet, so running now would produce no result for them. Generate the missing test files first? (This makes ${missing.length} agent call(s) and may take a few minutes.)`,
+    )
+    if (!proceed) return true // run anyway — the diagnostic rawLog explains the empty result
+    for (let i = 0; i < missing.length; i++) {
+      setRunStatusText(`Generating test file ${i + 1}/${missing.length} (${missing[i].id})...`)
+      onOperationChange({ text: `Generating test file ${i + 1}/${missing.length} (${missing[i].id})...` })
+      await api.generateTestFile(projectId, missing[i].id)
+    }
+    await reload()
+    return true
+  }
+
   async function handleRunTests(test: TestCase) {
     await withBusyAction(`Running tests for ${scopeLabel(test, architecture!)}...`, async () => {
-      await api.runElementTests(projectId, scopeForTest(test))
+      await ensureAutomationsForScope([test])
+      await api.runElementTests(projectId, scopeForTest(test), 'requirement')
       await reload()
     })
   }
 
   async function handleRunGroup(group: TestGroup) {
     await withBusyAction(`Running ${group.tests.length} test(s) for ${group.label}...`, async () => {
-      await api.runElementTests(projectId, group.scope)
+      await ensureAutomationsForScope(group.tests)
+      await api.runElementTests(projectId, group.scope, 'requirement')
       await reload()
     })
   }
@@ -464,7 +500,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
       for (let i = 0; i < touchedGroups.length; i++) {
         setRunStatusText(`Running ${touchedGroups[i].label} (${i + 1}/${touchedGroups.length})...`)
         onOperationChange({ text: `Running ${touchedGroups[i].label} (${i + 1}/${touchedGroups.length})...` })
-        await api.runElementTests(projectId, touchedGroups[i].scope)
+        await api.runElementTests(projectId, touchedGroups[i].scope, 'requirement')
       }
       await reload()
     })
@@ -474,10 +510,11 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     if (!architecture || groups.length === 0) return
     const runnableGroups = readyGroups.filter((g) => g.tests.length > 0)
     await withBusyAction(`Running all requirement-based tests across ${runnableGroups.length} element(s)...`, async () => {
+      await ensureAutomationsForScope(runnableGroups.flatMap((g) => g.tests))
       for (let i = 0; i < runnableGroups.length; i++) {
         setRunStatusText(`Running ${runnableGroups[i].label} (${i + 1}/${runnableGroups.length})...`)
         onOperationChange({ text: `Running ${runnableGroups[i].label} (${i + 1}/${runnableGroups.length})...` })
-        await api.runElementTests(projectId, runnableGroups[i].scope)
+        await api.runElementTests(projectId, runnableGroups[i].scope, 'requirement')
       }
       await reload()
     })
@@ -492,7 +529,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
 
   async function handleRunSwGroup(group: SwTestGroup) {
     await withBusyAction(`Running coding-agent tests for ${group.label}...`, async () => {
-      await api.runElementTests(projectId, group.scope)
+      await api.runElementTests(projectId, group.scope, 'sw')
       await reload()
     })
   }
@@ -503,7 +540,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
       for (let i = 0; i < swGroups.length; i++) {
         setRunStatusText(`Running ${swGroups[i].label} (${i + 1}/${swGroups.length})...`)
         onOperationChange({ text: `Running ${swGroups[i].label} (${i + 1}/${swGroups.length})...` })
-        await api.runElementTests(projectId, swGroups[i].scope)
+        await api.runElementTests(projectId, swGroups[i].scope, 'sw')
       }
       await reload()
     })
@@ -516,7 +553,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
       for (let i = 0; i < selectedGroups.length; i++) {
         setRunStatusText(`Running ${selectedGroups[i].label} (${i + 1}/${selectedGroups.length})...`)
         onOperationChange({ text: `Running ${selectedGroups[i].label} (${i + 1}/${selectedGroups.length})...` })
-        await api.runElementTests(projectId, selectedGroups[i].scope)
+        await api.runElementTests(projectId, selectedGroups[i].scope, 'sw')
       }
       await reload()
     })
@@ -538,35 +575,46 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     })
   }
 
-  async function handleChatSend() {
-    if (!chatInput.trim() || chatBusy) return
-    const message = chatInput.trim()
-    setChatHistory((prev) => [...prev, { role: 'user', text: message }])
-    setChatInput('')
-    setChatBusy(true)
-    setChatError(null)
-    setChatErrorIsLlmNotConfigured(false)
-    onOperationChange({ text: 'QA is thinking...' })
-    try {
-      const result = await api.testExecutionChat(projectId, selectedTest?.id ?? null, latest?.run.id ?? null, message)
-      setChatHistory((prev) => [...prev, { role: 'qa', text: result.reply }])
-      if (result.dispatch) {
-        setChatHistory((prev) => [...prev, { role: 'qa', text: DISPATCH_SUMMARY[result.dispatch!.verdict](result.dispatch!) }])
-        // The dispatch mutated project state (element.pendingRecodeReason /
-        // a requirement's text) — reload so the rest of this screen (and
-        // any element/requirement status it derives) reflects it.
-        await reload()
+  const sendQaExecutionChat = useCallback(
+    async (sessionId: string, message: string) => {
+      onOperationChange({ text: 'QA is thinking...' })
+      try {
+        const result = await api.testExecutionChat(
+          projectId,
+          selectedTest?.id ?? null,
+          latest?.run.id ?? null,
+          message,
+          sessionId,
+        )
+        if (result.dispatch) {
+          // The dispatch mutated project state (element.pendingRecodeReason
+          // / a requirement's text) — reload so the rest of this screen (and
+          // any element/requirement status it derives) reflects it. The
+          // dispatch summary + link chips render from the persisted
+          // assistant message itself (see ChatTranscript).
+          await reload()
+        }
+        onOperationChange({ text: null })
+        return { userMessage: result.userMessage, assistantMessage: result.assistantMessage }
+      } catch (err) {
+        onOperationChange(toOperationError(err))
+        throw err
       }
-      onOperationChange({ text: null })
-    } catch (err) {
-      const operationError = toOperationError(err)
-      setChatError(operationError.error ?? null)
-      setChatErrorIsLlmNotConfigured(operationError.errorCode === 'llm-not-configured')
-      onOperationChange(operationError)
-    } finally {
-      setChatBusy(false)
-    }
-  }
+    },
+    // The callback re-creates when the focused test or run changes, which
+    // is what we want (a new send should target the current focus). reload
+    // is a plain per-render function — same disable the rest of this file
+    // uses for it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, projectId, selectedTest?.id, latest?.run.id, onOperationChange],
+  )
+
+  // Consume a chat link chip that targeted a test case — select it here.
+  useEffect(() => {
+    if (!pendingChatNav || pendingChatNav.kind !== 'testCase') return
+    setSelectedTestId(pendingChatNav.id)
+    onChatNavConsumed()
+  }, [pendingChatNav, onChatNavConsumed])
 
   function renderTestGroup(group: TestGroup, ready: boolean) {
     const groupOutcomes = group.tests.map((t) => latestRunForTest(runs, t.id)?.outcome)
@@ -586,7 +634,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
     const ranCount = groupOutcomes.filter(Boolean).length
     const collapsed = collapsedGroups.has(group.scopeKey)
     const readiness = readinessByScopeKey.get(group.scopeKey)
-    const notReadyReason = readiness && !readiness.ready ? NOT_READY_REASON_LABEL[readiness.reason] : null
+    const notReadyReason = notReadyReasonLabel(readiness)
     const failingOutcomes = groupOutcomes.filter((o): o is NonNullable<typeof o> => !!o && !o.passed)
     const untriaged = failingOutcomes.filter((o) => !o.triage || o.triage === 'unattributed').length
     const needsConfirm = failingOutcomes.filter((o) => o.triage === 'test-case-failure' && !o.testCaseFailureConfirmedAt).length
@@ -668,7 +716,20 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
             {group.tests.map((test) => {
               const found = latestRunForTest(runs, test.id)
               const outcome = found?.outcome
-              const dotColor = !outcome ? STATUS_COLOR['not-started'] : outcome.passed ? STATUS_COLOR.complete : STATUS_COLOR.blocked
+              const fileMissing = !outcome && fileMissingForTest(runs, test.id)
+              // T1.5(b): the test's scope was run but this test produced no
+              // outcome — it has no generated file (or one the runner can't
+              // match). Distinct from "never attempted".
+              const ranButNoOutcome =
+                !outcome && !fileMissing && !test.filePath && !!attemptedWithoutOutcome(runs, test)
+              const dotColor =
+                fileMissing || ranButNoOutcome
+                  ? STATUS_COLOR.blocked
+                  : !outcome
+                    ? STATUS_COLOR['not-started']
+                    : outcome.passed
+                      ? STATUS_COLOR.complete
+                      : STATUS_COLOR.blocked
               return (
                 <li
                   key={test.id}
@@ -677,7 +738,14 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
                       ? 'test-execution-row test-execution-row-selected has-tooltip'
                       : 'test-execution-row has-tooltip'
                   }
-                  data-tooltip={notReadyReason ?? testRowTooltip(outcome)}
+                  data-tooltip={
+                    notReadyReason ??
+                    (fileMissing
+                      ? 'This test was generated once, but its file is missing from disk (source tree re-coded). Regenerate it via Generate Test File on the Test Creation tab.'
+                      : ranButNoOutcome
+                        ? 'This test’s scope was run but it has no generated automation, so nothing executed for it. Generate its test file on the Test Creation tab.'
+                        : testRowTooltip(outcome))
+                  }
                 >
                   <input
                     type="checkbox"
@@ -690,7 +758,17 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
                   <span className="test-execution-row-body" onClick={() => selectTest(test.id)}>
                     <span className="test-execution-status-dot" style={{ background: dotColor }} />
                     <span className="test-execution-title">{test.title}</span>
-                    <span className="test-execution-run-state">{!outcome ? 'Not run' : outcome.passed ? 'Passed' : 'Failed'}</span>
+                    <span className="test-execution-run-state">
+                      {fileMissing
+                        ? 'File missing — regenerate'
+                        : ranButNoOutcome
+                          ? 'Not executed — no file'
+                          : !outcome
+                            ? 'Not run'
+                            : outcome.passed
+                              ? 'Passed'
+                              : 'Failed'}
+                    </span>
                     {outcome && !outcome.passed && (
                       <span className="test-execution-triage-badge">{TRIAGE_LABEL[outcome.triage ?? 'unattributed']}</span>
                     )}
@@ -844,7 +922,7 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
                     : STATUS_COLOR.blocked
               const collapsed = collapsedSwGroups.has(group.scopeKey)
               const swReadiness = readinessByScopeKey.get(group.scopeKey)
-              const swNotReadyReason = swReadiness && !swReadiness.ready ? NOT_READY_REASON_LABEL[swReadiness.reason] : null
+              const swNotReadyReason = notReadyReasonLabel(swReadiness)
               const swGroupTooltip =
                 swNotReadyReason ??
                 (!group.run
@@ -1080,63 +1158,20 @@ export function TestExecutionScreen({ api, projectId, onOperationChange, onOpenS
         </>
       )}
 
-      <div className="analyst-chat-dock" style={{ height: chatHeight }}>
-        <div className="analyst-chat-resize-handle" onMouseDown={handleResizeStart} />
-        <div className="analyst-chat-panel">
-          <div className="analyst-chat-heading-row">
-            <h2>QA chat</h2>
-            <span className="analyst-chat-hint">
-              Ask QA to help interpret a run's output, or describe an issue you found — QA may dispatch it as a
-              requirement change, a test case fix, or a coding fix.
-            </span>
-          </div>
-          <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>
-            {chatHistory.length === 0 && !chatBusy && (
-              <p className="analyst-chat-empty">No messages yet — start the conversation below.</p>
-            )}
-            {chatHistory.map((entry, i) => (
-              <div key={i} className={`analyst-chat-entry analyst-chat-entry-${entry.role}`}>
-                <strong>{entry.role === 'user' ? 'You' : 'QA'}</strong>
-                <p>{highlightRequirementIds(entry.text)}</p>
-              </div>
-            ))}
-            {chatBusy && <p className="analyst-chat-empty">QA is thinking...</p>}
-          </div>
-
-          {chatError && (
-            <div className="analyst-chat-error">
-              <span>{chatError}</span>
-              {chatErrorIsLlmNotConfigured ? (
-                <button type="button" onClick={onOpenSettings}>
-                  Open Settings
-                </button>
-              ) : (
-                <button type="button" onClick={handleChatSend}>
-                  Retry
-                </button>
-              )}
-            </div>
-          )}
-
-          <div className="analyst-chat-input-row">
-            <textarea
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleChatSend()
-                }
-              }}
-              placeholder="Ask QA..."
-              rows={2}
-            />
-            <button type="button" onClick={handleChatSend} disabled={!chatInput.trim() || chatBusy}>
-              Send
-            </button>
-          </div>
-        </div>
-      </div>
+      <ChatDock
+        api={api}
+        projectId={projectId}
+        surface="qa-execution"
+        roleLabel="QA"
+        heading="QA chat"
+        hint="Ask QA to help interpret a run's output, or describe an issue you found — QA may dispatch it as a requirement change, a test case fix, or a coding fix."
+        placeholder="Ask QA..."
+        currentFocus={{ testCaseId: selectedTest?.id, runId: latest?.run.id }}
+        onOpenSettings={onOpenSettings}
+        onNavigateLink={onChatNavigate}
+        renderMessageText={highlightRequirementIds}
+        sendMessage={sendQaExecutionChat}
+      />
     </div>
   )
 }

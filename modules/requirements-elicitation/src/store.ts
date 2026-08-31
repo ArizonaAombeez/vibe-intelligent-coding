@@ -1,5 +1,6 @@
-import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { ensureHarnessElement, pruneOrphanedInterfaceReferences } from './architecture.js'
 import { SCHEMA_VERSION, type Project, type ProjectMode } from './types.js'
 
 const PROJECT_FILE = 'project.json'
@@ -29,6 +30,13 @@ function dropLegacyConflictShape(project: Project): Project {
 function applyLegacyDefaults(project: Project): Project {
   if (!project.projectMode) {
     project.projectMode = 'new'
+  }
+  // Persistent chat (ChatSession) landed after many projects already
+  // existed; nothing was ever persisted before it, so there's nothing to
+  // backfill — just normalise the field to [] so every call site can
+  // .push/.find on it directly rather than guarding for undefined.
+  if (!Array.isArray(project.chatSessions)) {
+    project.chatSessions = []
   }
   for (const requirement of project.requirements) {
     if (!requirement.provenance) {
@@ -83,6 +91,54 @@ function migrateArchitectureElementShape(project: Project): Project {
       requirement.architectureElements = []
     }
   }
+  return project
+}
+
+// Schema v1 -> v2 (project harness feature). Ensures any project that
+// already has an architecture gains its single mandatory harness element;
+// leaves project.platform and every InterfaceDefinition.declarations
+// undefined (the user must pick a platform, and re-running Define
+// Interfaces backfills declarations — neither is guessed here). Idempotent:
+// a project already at v2 is returned untouched. ensureHarnessElement is
+// itself idempotent, so re-running this is harmless.
+function migrateToV2(project: Project): Project {
+  if ((project.schemaVersion ?? 1) >= 2) return project
+  if (project.architecture && !project.architecture.elements.some((e) => e.kind === 'harness')) {
+    ensureHarnessElement(project)
+  }
+  project.schemaVersion = 2
+  return project
+}
+
+// Schema v2 -> v3 (T4.2). Removes every interface reference left pointing at
+// an element that no longer exists — interfaceDefinitions naming a deleted
+// participant, every element's denormalised elementInterfaces copy of a
+// since-removed definition, and stale element.interfaces graph edges. This
+// is the repair half of the exact condition checkInterfaces already reports
+// as danglingElementInterfaces; before this, deleteArchitectureElement never
+// cleaned any of it up (Worm 2 carried IFACE entries for ARCH-002/006/007
+// long after those elements were gone, which permanently blocked Coding and
+// would permanently block the new architecture-phase readiness check).
+// Idempotent — pruneOrphanedInterfaceReferences only ever removes references
+// to ids that provably don't exist, so a clean project is untouched.
+function migrateToV3(project: Project): Project {
+  if ((project.schemaVersion ?? 1) >= 3) return project
+  if (project.architecture) {
+    const removed = pruneOrphanedInterfaceReferences(project.architecture)
+    if (
+      removed.removedDefinitionIds.length > 0 ||
+      removed.clearedElementInterfaceRefs.length > 0 ||
+      removed.removedGraphEdges.length > 0
+    ) {
+      console.warn(
+        `[migrate v3] project ${project.id}: pruned orphaned interface refs — ` +
+          `${removed.removedDefinitionIds.length} definition(s) [${removed.removedDefinitionIds.join(', ')}], ` +
+          `${removed.clearedElementInterfaceRefs.length} element-interface copy(ies), ` +
+          `${removed.removedGraphEdges.length} graph edge(s)`,
+      )
+    }
+  }
+  project.schemaVersion = 3
   return project
 }
 
@@ -159,6 +215,10 @@ export class ProjectStore {
       name,
       projectMode: mode,
       requirements: [],
+      // Initialised here (not left undefined) so a freshly created project
+      // deep-equals what loadProject's normaliser produces — see
+      // applyLegacyDefaults.
+      chatSessions: [],
     }
     await this.saveProject(project)
     return project
@@ -167,7 +227,11 @@ export class ProjectStore {
   async loadProject(id: string): Promise<Project> {
     const file = path.join(this.projectDir(id), PROJECT_FILE)
     const raw = await readFile(file, 'utf-8')
-    return applyLegacyDefaults(migrateArchitectureElementShape(dropLegacyConflictShape(JSON.parse(raw) as Project)))
+    return migrateToV3(
+      migrateToV2(
+        applyLegacyDefaults(migrateArchitectureElementShape(dropLegacyConflictShape(JSON.parse(raw) as Project))),
+      ),
+    )
   }
 
   async saveProject(project: Project): Promise<void> {
@@ -182,6 +246,30 @@ export class ProjectStore {
     project.name = name
     await this.saveProject(project)
     return project
+  }
+
+  // Deep-copies an existing project's whole directory (project.json + the
+  // generated src/ tree) into a brand-new project directory, then applies
+  // `mutate` to the clone (id + name are set by this method; `mutate` is for
+  // everything else — platform, clearing derived state, etc.) and saves it.
+  // Used by the "branch to a new project on platform change" flow (project
+  // harness feature). The source project is left completely untouched.
+  async copyProject(
+    sourceId: string,
+    newName: string,
+    mutate?: (clone: Project) => void,
+  ): Promise<Project> {
+    const source = await this.loadProject(sourceId)
+    const newId = await this.buildProjectDirName(newName)
+    const sourceDir = this.projectDir(sourceId)
+    const targetDir = this.projectDir(newId)
+    // Copy the entire project directory first (brings src/ across), then
+    // overwrite project.json with the mutated clone.
+    await cp(sourceDir, targetDir, { recursive: true })
+    const clone: Project = { ...structuredClone(source), id: newId, name: newName }
+    mutate?.(clone)
+    await this.saveProject(clone)
+    return clone
   }
 
   async deleteProject(id: string): Promise<void> {

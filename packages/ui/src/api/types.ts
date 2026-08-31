@@ -40,6 +40,20 @@ export interface PhaseInfo {
   substeps: SubstepInfo[]
 }
 
+// T2.2: a concrete thing blocking a phase from being complete, with a
+// one-click fix target. Rendered as a banner on the blocked screen.
+export interface PhaseBlocker {
+  phaseId: PhaseId
+  reason: string
+  fixPhaseId: PhaseId
+  fixLabel: string
+}
+
+export interface PhaseReadiness {
+  statuses: Record<PhaseId, Status>
+  blockers: PhaseBlocker[]
+}
+
 export interface ProjectSummary {
   id: string
   name: string
@@ -104,6 +118,8 @@ export interface OpenProjectResult {
   // Null until the Architect selects one at the top of the Architecture tab
   // (Area B, "Architecture type selection").
   architectureType: ArchitectureTypeId | null
+  // Null until the user picks one (project harness feature).
+  platform?: PlatformId | null
   projectMode: ProjectMode
   // Set once the project's codebase zip has been uploaded via Import
   // Project (REQ-055) — undefined for 'new' mode projects, and for
@@ -139,11 +155,63 @@ export interface ArchitectureTypeOption {
   dynamicDesignDefault: boolean
 }
 
+// Project platform (project harness feature) — one per project, distinct
+// from ArchitectureTypeId. Drives how the Harness realises the entry point,
+// element instantiation, inter-element links and run lifecycle. Mirrors the
+// core module's PlatformDescriptor.
+export type BuiltInPlatformId = 'embedded' | 'web' | 'android' | 'desktop' | 'cli' | 'server'
+export type PlatformId = BuiltInPlatformId | (string & {})
+
+export interface PlatformDescriptor {
+  id: PlatformId
+  label: string
+  entryPointHint: string
+  wiringHint: string
+  lifecycleHint: string
+  builtIn: boolean
+  createdBy?: string
+  createdAt?: string
+}
+
+// The harness element's derived realisation plan (project harness feature).
+export type HarnessChecklistKey =
+  | 'entry-point'
+  | 'element-instantiation'
+  | 'inter-element-links'
+  | 'lifecycle-start'
+  | 'lifecycle-stop'
+  | 'config-load'
+  | 'dependency-order'
+  | 'error-surface'
+export type HarnessChecklistStatus = 'applies' | 'not-applicable' | 'unknown'
+export interface HarnessChecklistItem {
+  key: HarnessChecklistKey
+  status: HarnessChecklistStatus
+  realisation: string
+}
+export interface HarnessLinkRealisation {
+  masterDefinitionId: string
+  summary: string
+}
+export interface HarnessSpec {
+  derivedForPlatform: PlatformId
+  checklist: HarnessChecklistItem[]
+  linkRealisations: HarnessLinkRealisation[]
+  narrative: string
+  derivedAt: string
+}
+
 // Grid-based architecture structure (Area B, resolved) — mirrors
 // modules/requirements-elicitation/src/types.ts's Architecture/
 // ArchitectureElement, kept as a plain type here rather than importing the
 // core module, per the UI-as-a-pluggable-module principle.
-export type ArchitectureElementKind = 'functional' | 'interface-spine' | 'service' | 'external' | 'runtime'
+export type ArchitectureElementKind =
+  | 'functional'
+  | 'interface-spine'
+  | 'service'
+  | 'external'
+  | 'runtime'
+  | 'harness'
 
 export interface ArchitectureElement {
   id: string
@@ -157,6 +225,9 @@ export interface ArchitectureElement {
   interfaces: string[]
   elementInterfaces: ElementInterfaceDefinition[]
   dynamicDesignEnabled?: boolean
+  // Only ever set on the single kind:'harness' element (project harness
+  // feature).
+  harnessSpec?: HarnessSpec
 }
 
 export type ArchitectureConflictKind =
@@ -198,6 +269,17 @@ export interface InterfaceDefinition {
   operations: InterfaceContractOperation[]
   status: 'defined' | 'stale'
   updatedAt: string
+  // Platform-neutral per-participant declarations (project harness
+  // feature) — what each element does / exposes / owns / who can see it.
+  declarations?: InterfaceElementDeclaration[]
+}
+
+export interface InterfaceElementDeclaration {
+  elementId: string
+  does: string
+  exposes: string[]
+  owns: string[]
+  visibleTo: string[]
 }
 
 // One element's own local copy of an interface it participates in — lives
@@ -221,6 +303,11 @@ export interface Architecture {
   interfaceDefinitions?: InterfaceDefinition[]
 }
 
+// Reserved row for the single project-harness element (project harness
+// feature) — one band above EXTERNAL_CONTEXT_ROW. Mirrors the core
+// module's HARNESS_ROW.
+export const HARNESS_ROW = -2
+
 export interface IncompleteOperation {
   fromId: string
   toId: string
@@ -239,6 +326,10 @@ export interface CheckInterfacesResult {
   // (historical projects that generated an "IFACE-undefined" id before a
   // counter-init bug was fixed).
   danglingElementInterfaces: Array<{ elementId: string; masterDefinitionId: string }>
+  // Non-harness elements with no platform-neutral declaration yet (project
+  // harness feature). Advisory — does not block functional-element Coding,
+  // but the Harness Coding gate requires every element to have one.
+  missingDeclarations: string[]
   complete: boolean
 }
 
@@ -319,12 +410,15 @@ export interface ArchitectChatResult {
   reply: string
   proposedElements: ProposedArchitectureElement[]
   proposedInterfaces: ProposedInterface[]
+  // Present only when the send was bound to a persistent chat session.
+  userMessage?: ChatMessage
+  assistantMessage?: ChatMessage
 }
 
 // Coding & Review-Rework (Area D, resolved) — mirrors
 // modules/requirements-elicitation/src/types.ts's CodingRun, kept as a
 // plain type here per the UI-as-a-pluggable-module principle.
-export type CodingRunStatus = 'success' | 'rejected-scope' | 'rejected-multi-element' | 'rejected-not-eligible' | 'rejected-empty-output' | 'cli-error'
+export type CodingRunStatus = 'success' | 'rejected-scope' | 'rejected-multi-element' | 'rejected-not-eligible' | 'rejected-empty-output' | 'rejected-no-tests' | 'success-tests-failing' | 'cli-error'
 
 export interface CodingRun {
   id: string
@@ -337,6 +431,10 @@ export interface CodingRun {
   exitCode: number | null
   allowedSubfolder: string
   rejectedFiles?: string[]
+  // Advisory notes on an otherwise-successful run — currently the harness
+  // branch's "attempted to modify an element folder, reverted" flags
+  // (project harness feature).
+  warnings?: string[]
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number }
   // Which agent client/provider actually ran this (e.g. 'claude-code',
   // 'opencode') and which model was requested — undefined only for runs
@@ -355,6 +453,26 @@ export interface CodingRun {
     msToFirstOutput?: number
     msTotal: number
   }
+  // Result of running the element's own freshly-written test files as part
+  // of this Coding run — present on a run that committed code + at least one
+  // "*.test.<ext>" file. passed:false does NOT mean the run failed (status
+  // stays 'success'), but the Coding screen surfaces it prominently and the
+  // next run's prompt is told to fix the failing tests.
+  swTestResult?: {
+    passed: boolean
+    filesRun: number
+    files: Array<{ name: string; passed: boolean; output: string }>
+  }
+  // T3 coding loop: how many iterations ran, per-iteration history, and why
+  // it stopped. Absent on single-shot paths (harness runs, gate rejections).
+  iterations?: number
+  iterationHistory?: Array<{
+    status: CodingRunStatus
+    swTestsPassed?: boolean
+    failingTestNames?: string[]
+    uncoveredRequirementIds?: string[]
+  }>
+  stoppedBecause?: 'done' | 'stalled' | 'cap' | 'budget' | 'cancelled' | 'cli-error' | 'rejected'
 }
 
 // "Analyse Code" (Area D) — mirrors
@@ -450,6 +568,9 @@ export interface ProposedTest {
 export interface TestCreationChatResult {
   reply: string
   proposedTests: ProposedTest[]
+  // Present only when the send was bound to a persistent chat session.
+  userMessage?: ChatMessage
+  assistantMessage?: ChatMessage
 }
 
 // A user-described issue's dispatch outcome (Area F "User-reported issue
@@ -466,11 +587,62 @@ export interface TestExecutionChatDispatch {
   // code-failure, requirementId for requirement-issue. Undefined for
   // test-case-failure (nothing is dispatched yet, pending confirmation).
   dispatchedTo?: string
+  // Architecture element id(s) triage suspects are at fault, most likely
+  // first. ADVISORY: does not change which element got pendingRecodeReason;
+  // rendered as chips + rationale. Always present (falls back to the test's
+  // static link).
+  suspectedElementIds?: string[]
 }
 
 export interface TestExecutionChatResult {
   reply: string
   dispatch?: TestExecutionChatDispatch
+  // Present only when the send was bound to a persistent chat session — the
+  // two messages the server appended and stored (with links/dispatch on the
+  // assistant one). The UI reconciles its optimistic entries against these.
+  userMessage?: ChatMessage
+  assistantMessage?: ChatMessage
+}
+
+// ---- Persistent chat (ChatSession) ----------------------------------------
+export type ChatSurface = 'analyst' | 'architect' | 'qa-creation' | 'qa-execution'
+
+export interface ChatMessageLink {
+  kind: 'requirement' | 'element' | 'testCase'
+  id: string
+  label: string
+}
+
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  links?: ChatMessageLink[]
+  dispatch?: {
+    verdict: 'code-failure' | 'test-case-failure' | 'requirement-issue'
+    rationale: string
+    dispatchedTo?: string
+    suspectedElementIds?: string[]
+  }
+  createdAt: string
+}
+
+export interface ChatSessionFocus {
+  testCaseId?: string
+  runId?: string
+  requirementId?: string
+  architectureElementId?: string
+}
+
+export interface ChatSession {
+  id: string
+  surface: ChatSurface
+  title: string
+  focus?: ChatSessionFocus
+  messages: ChatMessage[]
+  createdAt: string
+  updatedAt: string
+  archivedAt?: string
 }
 
 export type TestOutcomeTriage = 'code-failure' | 'test-case-failure' | 'requirement-issue' | 'unattributed'
@@ -509,6 +681,12 @@ export interface TestRun {
   // out of the command output at all; undefined for runs that predate this
   // field or whose output couldn't be parsed per-test.
   swOutcomes?: SwTestOutcome[]
+  // Test cases whose recorded filePath no longer resolved to a file on disk
+  // when this run swept the scope (source tree re-coded, generated test file
+  // lost). The run clears the dead filePath and resets those cases to
+  // 'not-run'; recorded here so the UI can show "file missing — regenerate"
+  // rather than silently producing no outcome. Undefined on older runs.
+  missingFiles?: Array<{ testCaseId: string; filePath: string }>
   mutationScore?: { killed: number; survived: number; percentage: number }
 }
 
@@ -517,7 +695,10 @@ export interface TestRegressionRun {
   startedAt: string
   finishedAt: string
   runIds: string[]
+  // True only when >=1 requirement-traced outcome ran and all passed.
   allPassed: boolean
+  // How many requirement-traced outcomes ran. 0 => nothing to pass.
+  outcomeCount: number
   trigger: 'coding-success' | 'manual'
 }
 
@@ -718,6 +899,9 @@ export interface LastChecksResult {
 export interface AnalystChatResult {
   reply: string
   proposedRequirements: string[]
+  // Present only when the send was bound to a persistent chat session.
+  userMessage?: ChatMessage
+  assistantMessage?: ChatMessage
 }
 
 // Mirrors modules/requirements-elicitation/src/types.ts's provenance union
@@ -966,6 +1150,14 @@ export interface PersonaAvailablePlugin {
 // 'user' list — see VicCoreApi.listPersonaSettings/savePersonaSettings.
 export type PersonaScope = 'admin' | 'user'
 
+// VIC's recommended model-level settings for a persona given its current
+// backing plugin — shown as a hint in Settings > Personas and applied by
+// the "Auto-adopt recommended models" button.
+export interface PersonaModelRecommendation {
+  values: Record<string, string>
+  why: string
+}
+
 export interface PersonaSettings {
   id: string
   label: string
@@ -973,6 +1165,8 @@ export interface PersonaSettings {
   pluginLabel?: string
   availablePlugins: PersonaAvailablePlugin[]
   fields: PersonaOverrideField[]
+  recommendation?: PersonaModelRecommendation
+  agentRecommendation?: PersonaModelRecommendation
   // Second, optional "agent" model level this persona's master model can
   // delegate scoped sub-tasks to. Only true for Dev (Coding) today — the
   // dropdown below is only rendered when this is true.
@@ -1015,7 +1209,7 @@ export interface VicCoreApi {
   // Requirements elicitation (Area A)
   listRequirements(projectId: string): Promise<Requirement[]>
   createRequirement(projectId: string, text: string): Promise<Requirement>
-  analystChat(projectId: string, message: string): Promise<AnalystChatResult>
+  analystChat(projectId: string, message: string, sessionId?: string): Promise<AnalystChatResult>
   acceptProposedRequirement(projectId: string, text: string): Promise<Requirement>
   updateRequirement(projectId: string, requirementId: string, text: string): Promise<Requirement>
   // Split Requirement — propose (LLM call, no mutation), references
@@ -1082,6 +1276,29 @@ export interface VicCoreApi {
   getArchitectureType(projectId: string): Promise<ArchitectureTypeId | null>
   setArchitectureType(projectId: string, typeId: ArchitectureTypeId): Promise<void>
 
+  // Project platform + Harness (project harness feature)
+  listPlatforms(): Promise<PlatformDescriptor[]>
+  addCustomPlatform(fields: {
+    label: string
+    entryPointHint: string
+    wiringHint: string
+    lifecycleHint: string
+  }): Promise<PlatformDescriptor>
+  deleteCustomPlatform(platformId: string): Promise<void>
+  getProjectPlatform(projectId: string): Promise<PlatformId | null>
+  // Setting the platform also auto-derives the harness spec for it (T2.1).
+  // harnessSpecDerived says whether that ran; harnessSpecError carries a
+  // non-fatal Architect-LLM failure (the platform is still saved).
+  setProjectPlatform(
+    projectId: string,
+    platformId: string,
+  ): Promise<{ platform: string; harnessSpecDerived: boolean; harnessSpecError?: string }>
+  branchProjectPlatform(
+    projectId: string,
+    platformId: string,
+  ): Promise<{ originalProject: { id: string; name: string }; newProject: { id: string; name: string } }>
+  defineHarness(projectId: string): Promise<HarnessSpec>
+
   // Architecture grid (Area B — static design, allocation, traceability)
   getArchitecture(projectId: string): Promise<Architecture | null>
   createArchitectureElement(
@@ -1099,7 +1316,7 @@ export interface VicCoreApi {
   checkArchitectureConflicts(projectId: string): Promise<ArchitectureConflict[]>
   autoConfigureAndAllocate(projectId: string): Promise<AutoConfigureAndAllocateResult>
   autoAllocate(projectId: string, mode: 'llm'): Promise<AutoAllocateResult>
-  architectChat(projectId: string, message: string): Promise<ArchitectChatResult>
+  architectChat(projectId: string, message: string, sessionId?: string): Promise<ArchitectChatResult>
   acceptProposedArchitectureElement(
     projectId: string,
     fields: { kind: ArchitectureElementKind; name: string; layer: string; responsibility: string },
@@ -1224,11 +1441,16 @@ export interface VicCoreApi {
   // an <iframe src> for HTML preview, or via fetch for a text view) — not
   // a fetch wrapper itself since the consumer decides how to load it.
   sourceFileUrl(projectId: string, relativePath: string): string
+  // URL of the generated project served over http as a runnable site (Run
+  // Local preview) — needed for web projects because opening index.html from
+  // a file:// path blocks ES-module imports as cross-origin.
+  previewUrl(projectId: string): string
   downloadSourceTree(projectId: string): Promise<{ blob: Blob; filename: string }>
 
   // Test Creation (Area E)
   getTestSuite(projectId: string): Promise<TestSuite | null>
   getTestScopeReadiness(projectId: string): Promise<ScopeReadinessEntry[]>
+  getPhaseReadiness(projectId: string): Promise<PhaseReadiness>
   createTestCase(
     projectId: string,
     fields: CreateTestCaseFields,
@@ -1248,8 +1470,31 @@ export interface VicCoreApi {
   generateTestFile(
     projectId: string,
     testId: string,
-  ): Promise<{ status: 'success' | 'rejected-scope' | 'rejected-multi-element' | 'cli-error'; testCase: TestCase; diff: string; rawLog: string; rejectedFiles?: string[] }>
-  testCreationChat(projectId: string, architectureElementId: string | null, message: string): Promise<TestCreationChatResult>
+  ): Promise<{
+    status: 'success' | 'rejected-scope' | 'rejected-multi-element' | 'cli-error'
+    testCase: TestCase
+    diff: string
+    rawLog: string
+    rejectedFiles?: string[]
+    // Per-phase wall-clock breakdown — the agent CLI call (msAgentCli)
+    // normally dominates; a large msToFirstAgentOutput means the provider
+    // was slow to start responding, not that the test was hard to write.
+    timing?: {
+      msTotal: number
+      msScaffold: number
+      msGitInit: number
+      msAgentCli: number
+      msToFirstAgentOutput?: number
+      msScopeGate: number
+      msCommit: number
+    }
+  }>
+  testCreationChat(
+    projectId: string,
+    architectureElementId: string | null,
+    message: string,
+    sessionId?: string,
+  ): Promise<TestCreationChatResult>
   acceptProposedTest(projectId: string, proposal: ProposedTest, architectureElementId: string | null): Promise<TestCase>
 
   // Import legacy test cases (Area E) — scans a server-side folder of
@@ -1263,7 +1508,15 @@ export interface VicCoreApi {
   listTestRuns(projectId: string): Promise<TestRun[]>
   getTestRun(projectId: string, runId: string): Promise<TestRun>
   listTestRegressionRuns(projectId: string): Promise<TestRegressionRun[]>
-  runElementTests(projectId: string, scope: TestCommandScope): Promise<{ testRun: TestRun }>
+  // `only` narrows which test files run: 'requirement' = only Step-4
+  // requirement-traced files (updates the requirement column, leaves the SW
+  // column's last run in place); 'sw' = only Step-5 coding-agent files
+  // (vice versa); omitted = every file in scope, both columns.
+  runElementTests(
+    projectId: string,
+    scope: TestCommandScope,
+    only?: 'requirement' | 'sw',
+  ): Promise<{ testRun: TestRun }>
   runFullRegression(projectId: string): Promise<{ regressionRun: TestRegressionRun }>
   triageTestFailure(
     projectId: string,
@@ -1276,7 +1529,19 @@ export interface VicCoreApi {
     testCaseId: string | null,
     runId: string | null,
     message: string,
+    sessionId?: string,
   ): Promise<TestExecutionChatResult>
+
+  // Persistent chat (ChatSession) CRUD — one session per tab in a screen's
+  // chat dock. listChatSessions omits archived tabs unless includeArchived.
+  listChatSessions(projectId: string, surface: ChatSurface, includeArchived?: boolean): Promise<ChatSession[]>
+  createChatSession(projectId: string, surface: ChatSurface, focus?: ChatSessionFocus, title?: string): Promise<ChatSession>
+  updateChatSession(
+    projectId: string,
+    sessionId: string,
+    updates: { title?: string; focus?: ChatSessionFocus; archivedAt?: string | null },
+  ): Promise<ChatSession>
+  deleteChatSession(projectId: string, sessionId: string): Promise<void>
 
   // Project settings (requirement 63) — phaseTabGating and unitTestMode
   // (Area E, resolved requirements 53-54) are persisted server-side; the
@@ -1347,4 +1612,10 @@ export interface VicCoreApi {
     agentValues?: Record<string, string>,
     agentPluginId?: string,
   ): Promise<void>
+  // Applies VIC's recommended model-level settings to every persona in the
+  // given scope whose current backing plugin has a recommendation. Returns
+  // the list of personas actually changed.
+  autoAdoptRecommendedModels(
+    scope: PersonaScope,
+  ): Promise<{ applied: Array<{ personaId: string; pluginId: string; values: Record<string, string> }> }>
 }

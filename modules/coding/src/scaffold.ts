@@ -129,13 +129,20 @@ async function readExistingMarkerExtras(markerPath: string): Promise<MarkerExtra
   }
 }
 
+// The harness element's folder is always '_harness', keyed off its kind
+// rather than its (fixed, but in principle editable) name — the underscore
+// prefix matches the _shared-interfaces convention and keeps it visually
+// grouped apart from the real element folders (project harness feature).
+export const HARNESS_SUBFOLDER_NAME = '_harness'
+
 // Filesystem-safe slug: lowercase, non-alphanumerics collapse to single
 // hyphens, no leading/trailing hyphen. Not prefixed with the element's
 // ARCH-NNN id — the folder should read as the element's actual name (Area
 // B's "gives the user clear visual/navigational separation" rationale) —
 // the id is kept in the marker file for reverse lookup instead, guarding
 // against this slug algorithm changing later.
-export function elementSubfolderName(element: Pick<ArchitectureElement, 'name'>): string {
+export function elementSubfolderName(element: Pick<ArchitectureElement, 'name' | 'kind'>): string {
+  if (element.kind === 'harness') return HARNESS_SUBFOLDER_NAME
   const slug = element.name
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')

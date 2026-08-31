@@ -19,7 +19,7 @@ test('createProject then loadProject round-trips with schemaVersion', async () =
   await withTempStore(async (store) => {
     const created = await store.createProject('My Project')
     assert.equal(created.name, 'My Project')
-    assert.equal(created.schemaVersion, 1)
+    assert.equal(created.schemaVersion, 3)
     assert.equal(created.projectMode, 'new')
     assert.equal(created.requirements.length, 0)
 
@@ -180,5 +180,102 @@ test('loadProject migrates legacy scalar architectureElement to the architecture
     assert.deepEqual(loaded.requirements[1].architectureElements, [])
     // Legacy field is removed, not left dangling alongside the new one.
     assert.equal('architectureElement' in loaded.requirements[0], false)
+  })
+})
+
+test('loadProject (migrate v3) prunes interface refs to elements that no longer exist — the Worm 2 orphan state', async () => {
+  await withTempStore(async (store, projectsRoot) => {
+    const projectId = 'worm-2-orphans'
+    const dir = path.join(projectsRoot, projectId)
+    // ARCH-005 survives; ARCH-002/007 were deleted but their interface
+    // definitions and ARCH-005's local copies were left behind.
+    const stale = {
+      schemaVersion: 2,
+      id: projectId,
+      name: 'Worm 2',
+      projectMode: 'new',
+      requirements: [],
+      architecture: {
+        layers: ['Core'],
+        elements: [
+          {
+            id: 'ARCH-005',
+            kind: 'functional',
+            name: 'Game Engine',
+            responsibility: 'Runs the loop',
+            row: 0,
+            col: 0,
+            rowSpan: 1,
+            colSpan: 1,
+            interfaces: ['ARCH-002', 'ARCH-003'],
+            elementInterfaces: [
+              { masterDefinitionId: 'IFACE-001', role: 'both', aligned: true, operations: [] },
+              { masterDefinitionId: 'IFACE-004', role: 'both', aligned: true, operations: [] },
+            ],
+          },
+          {
+            id: 'ARCH-003',
+            kind: 'functional',
+            name: 'Game Renderer',
+            responsibility: 'Draws frames',
+            row: 0,
+            col: 1,
+            rowSpan: 1,
+            colSpan: 1,
+            interfaces: ['ARCH-005'],
+            elementInterfaces: [
+              { masterDefinitionId: 'IFACE-004', role: 'both', aligned: true, operations: [] },
+            ],
+          },
+        ],
+        nextElementSeq: 6,
+        nextInterfaceSeq: 7,
+        interfaceDefinitions: [
+          {
+            id: 'IFACE-001',
+            name: 'HTML Portal ↔ Game Engine',
+            participants: [
+              { elementId: 'ARCH-002', role: 'both' },
+              { elementId: 'ARCH-005', role: 'both' },
+            ],
+            status: 'defined',
+            updatedAt: new Date().toISOString(),
+            operations: [],
+          },
+          {
+            id: 'IFACE-004',
+            name: 'Game Engine ↔ Game Renderer',
+            participants: [
+              { elementId: 'ARCH-005', role: 'both' },
+              { elementId: 'ARCH-003', role: 'both' },
+            ],
+            status: 'defined',
+            updatedAt: new Date().toISOString(),
+            operations: [
+              { name: 'renderFrame', description: 'draw', request: 'state', response: 'ack', errors: 'none' },
+            ],
+          },
+        ],
+      },
+    }
+    await mkdir(dir, { recursive: true })
+    await writeFile(path.join(dir, 'project.json'), JSON.stringify(stale), 'utf-8')
+
+    const loaded = await store.loadProject(projectId)
+    assert.equal(loaded.schemaVersion, 3)
+
+    // IFACE-001 named the deleted ARCH-002 -> gone. IFACE-004 is between two
+    // live elements -> kept.
+    const defIds = (loaded.architecture!.interfaceDefinitions ?? []).map((d) => d.id)
+    assert.deepEqual(defIds, ['IFACE-004'])
+
+    // ARCH-005 loses its IFACE-001 copy and its dead ARCH-002 graph edge,
+    // keeps the IFACE-004 copy and the ARCH-003 edge.
+    const engine = loaded.architecture!.elements.find((e) => e.id === 'ARCH-005')!
+    assert.deepEqual(
+      engine.elementInterfaces.map((ei) => ei.masterDefinitionId),
+      ['IFACE-004'],
+    )
+    assert.deepEqual(engine.interfaces, ['ARCH-003'])
   })
 })

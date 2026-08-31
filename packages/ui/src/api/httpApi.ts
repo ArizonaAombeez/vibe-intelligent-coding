@@ -2,6 +2,9 @@ import type {
   AnalyseResult,
   AnalystChatResult,
   ApplySplitRequirementResult,
+  ChatSession,
+  ChatSurface,
+  ChatSessionFocus,
   Architecture,
   ArchitectChatResult,
   ArchitectureConflict,
@@ -9,6 +12,9 @@ import type {
   ArchitectureElementKind,
   ArchitectureTypeId,
   ArchitectureTypeOption,
+  PlatformDescriptor,
+  PlatformId,
+  HarnessSpec,
   AutoConfigureAndAllocateResult,
   AutoAllocateResult,
   CheckConflictsResult,
@@ -54,6 +60,9 @@ import type {
   SplitPieceInput,
   SplitRequirementResult,
   StorageInfo,
+  Status,
+  PhaseId,
+  PhaseBlocker,
   TestCase,
   TestCommandScope,
   TestCreationChatResult,
@@ -83,6 +92,21 @@ const defaultSettings: ProjectSettings = {
   // always-accessible until sign-off exists. Overridden below by whatever
   // the server has actually persisted for this project.
   phaseTabGating: 'always-accessible',
+}
+
+// T2.2: the server computes real phase status + blockers; overlay its
+// statuses onto the labelled/substep skeleton here so a stale or errored
+// route still renders a sane sidebar.
+interface PhaseReadinessResponse {
+  statuses: Record<PhaseId, Status>
+  blockers: Array<{ phaseId: PhaseId; reason: string; fixPhaseId: PhaseId; fixLabel: string }>
+}
+
+function overlayPhaseStatuses(
+  phases: OpenProjectResult['phases'],
+  statuses: PhaseReadinessResponse['statuses'],
+): OpenProjectResult['phases'] {
+  return phases.map((p) => (statuses[p.id] ? { ...p, status: statuses[p.id] } : p))
 }
 
 function defaultPhases(): OpenProjectResult['phases'] {
@@ -220,11 +244,18 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
         codeAlignment: CodeAlignmentRecord | null
         migrationPlan: MigrationPlanRecord | null
       }>(`${baseUrl}/api/projects/${id}/import-status`)
+      // T2.2: overlay real computed phase status. Non-fatal — a failure here
+      // just leaves the labelled skeleton's default statuses.
+      const readiness = await requestJson<PhaseReadinessResponse>(
+        `${baseUrl}/api/projects/${id}/phase-readiness`,
+      ).catch(() => null)
       currentOperation = { text: null }
       return {
         projectId: id,
         projectName: project?.name ?? id,
-        phases: defaultPhases(),
+        phases: readiness
+          ? overlayPhaseStatuses(defaultPhases(), readiness.statuses)
+          : defaultPhases(),
         settings: { ...defaultSettings, ...persistedSettings },
         architectureType,
         projectMode: importStatus.projectMode,
@@ -299,12 +330,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       })
     },
 
-    async analystChat(projectId: string, message: string) {
+    async analystChat(projectId: string, message: string, sessionId?: string) {
       try {
         currentOperation = { text: 'Analyst is thinking...' }
         const result = await requestJson<AnalystChatResult>(
           `${baseUrl}/api/projects/${projectId}/analyst-chat`,
-          { method: 'POST', body: JSON.stringify({ message }) },
+          { method: 'POST', body: JSON.stringify({ message, sessionId }) },
         )
         currentOperation = { text: null }
         return result
@@ -602,6 +633,82 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
+    async listPlatforms() {
+      return requestJson<PlatformDescriptor[]>(`${baseUrl}/api/platforms`)
+    },
+
+    async addCustomPlatform(fields) {
+      const response = await fetch(`${baseUrl}/api/platforms`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(fields),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? 'Adding custom platform failed')
+      }
+      return response.json() as Promise<PlatformDescriptor>
+    },
+
+    async deleteCustomPlatform(platformId: string) {
+      const response = await fetch(`${baseUrl}/api/platforms/${encodeURIComponent(platformId)}`, {
+        method: 'DELETE',
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? 'Deleting custom platform failed')
+      }
+    },
+
+    async getProjectPlatform(projectId: string) {
+      return requestJson<PlatformId | null>(`${baseUrl}/api/projects/${projectId}/platform`)
+    },
+
+    async setProjectPlatform(projectId: string, platformId: string) {
+      const response = await fetch(`${baseUrl}/api/projects/${projectId}/platform`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platformId }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? `Setting platform for ${projectId} failed`)
+      }
+      return (await response.json()) as {
+        platform: string
+        harnessSpecDerived: boolean
+        harnessSpecError?: string
+      }
+    },
+
+    async branchProjectPlatform(projectId: string, platformId: string) {
+      const response = await fetch(`${baseUrl}/api/projects/${projectId}/branch-platform`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ platformId }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? `Branching project ${projectId} failed`)
+      }
+      return response.json() as Promise<{
+        originalProject: { id: string; name: string }
+        newProject: { id: string; name: string }
+      }>
+    },
+
+    async defineHarness(projectId: string) {
+      const response = await fetch(`${baseUrl}/api/projects/${projectId}/architecture/harness/define`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? `Defining harness for ${projectId} failed`)
+      }
+      return (await response.json()).harnessSpec as HarnessSpec
+    },
+
     async getArchitecture(projectId: string) {
       return requestJson<Architecture | null>(`${baseUrl}/api/projects/${projectId}/architecture`)
     },
@@ -696,12 +803,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async architectChat(projectId: string, message: string) {
+    async architectChat(projectId: string, message: string, sessionId?: string) {
       try {
         currentOperation = { text: 'Architect is thinking...' }
         const result = await requestJson<ArchitectChatResult>(
           `${baseUrl}/api/projects/${projectId}/architecture/chat`,
-          { method: 'POST', body: JSON.stringify({ message }) },
+          { method: 'POST', body: JSON.stringify({ message, sessionId }) },
         )
         currentOperation = { text: null }
         return result
@@ -990,6 +1097,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       return `${baseUrl}/api/projects/${projectId}/source-tree/file?path=${encodeURIComponent(relativePath)}`
     },
 
+    // URL of the generated project served as a runnable site (Run Local
+    // preview) — ES modules load over http here, unlike a file:// open.
+    previewUrl(projectId: string) {
+      return `${baseUrl}/preview/${encodeURIComponent(projectId)}/`
+    },
+
     async downloadSourceTree(projectId: string) {
       const response = await fetch(`${baseUrl}/api/projects/${projectId}/source-tree/download`)
       if (!response.ok) {
@@ -1007,6 +1120,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
 
     async getTestScopeReadiness(projectId: string) {
       return requestJson<ScopeReadinessEntry[]>(`${baseUrl}/api/projects/${projectId}/test-suite/readiness`)
+    },
+
+    async getPhaseReadiness(projectId: string) {
+      return requestJson<{ statuses: Record<PhaseId, Status>; blockers: PhaseBlocker[] }>(
+        `${baseUrl}/api/projects/${projectId}/phase-readiness`,
+      )
     },
 
     async createTestCase(projectId: string, fields: CreateTestCaseFields) {
@@ -1096,12 +1215,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async testCreationChat(projectId: string, architectureElementId: string | null, message: string) {
+    async testCreationChat(projectId: string, architectureElementId: string | null, message: string, sessionId?: string) {
       try {
         currentOperation = { text: 'QA is thinking...' }
         const result = await requestJson<TestCreationChatResult>(
           `${baseUrl}/api/projects/${projectId}/test-suite/chat`,
-          { method: 'POST', body: JSON.stringify({ architectureElementId, message }) },
+          { method: 'POST', body: JSON.stringify({ architectureElementId, message, sessionId }) },
         )
         currentOperation = { text: null }
         return result
@@ -1166,12 +1285,12 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       return requestJson<TestRegressionRun[]>(`${baseUrl}/api/projects/${projectId}/test-regression-runs`)
     },
 
-    async runElementTests(projectId: string, scope: TestCommandScope) {
+    async runElementTests(projectId: string, scope: TestCommandScope, only?: 'requirement' | 'sw') {
       try {
         currentOperation = { text: 'Running tests...' }
         const result = await requestJson<{ testRun: TestRun }>(
           `${baseUrl}/api/projects/${projectId}/test-suite/run-element`,
-          { method: 'POST', body: JSON.stringify(scope) },
+          { method: 'POST', body: JSON.stringify(only ? { ...scope, only } : scope) },
         )
         currentOperation = { text: null }
         return result
@@ -1222,12 +1341,18 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
       }
     },
 
-    async testExecutionChat(projectId: string, testCaseId: string | null, runId: string | null, message: string) {
+    async testExecutionChat(
+      projectId: string,
+      testCaseId: string | null,
+      runId: string | null,
+      message: string,
+      sessionId?: string,
+    ) {
       try {
         currentOperation = { text: 'QA is thinking...' }
         const result = await requestJson<TestExecutionChatResult>(
           `${baseUrl}/api/projects/${projectId}/test-runs/chat`,
-          { method: 'POST', body: JSON.stringify({ testCaseId, runId, message }) },
+          { method: 'POST', body: JSON.stringify({ testCaseId, runId, message, sessionId }) },
         )
         currentOperation = { text: null }
         return result
@@ -1235,6 +1360,34 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
         currentOperation = toOperationError(err)
         throw err
       }
+    },
+
+    async listChatSessions(projectId: string, surface: ChatSurface, includeArchived?: boolean) {
+      const qs = new URLSearchParams({ surface })
+      if (includeArchived) qs.set('includeArchived', '1')
+      return requestJson<ChatSession[]>(`${baseUrl}/api/projects/${projectId}/chat-sessions?${qs.toString()}`)
+    },
+
+    async createChatSession(projectId: string, surface: ChatSurface, focus?: ChatSessionFocus, title?: string) {
+      return requestJson<ChatSession>(`${baseUrl}/api/projects/${projectId}/chat-sessions`, {
+        method: 'POST',
+        body: JSON.stringify({ surface, focus, title }),
+      })
+    },
+
+    async updateChatSession(
+      projectId: string,
+      sessionId: string,
+      updates: { title?: string; focus?: ChatSessionFocus; archivedAt?: string | null },
+    ) {
+      return requestJson<ChatSession>(`${baseUrl}/api/projects/${projectId}/chat-sessions/${sessionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(updates),
+      })
+    },
+
+    async deleteChatSession(projectId: string, sessionId: string) {
+      await requestJson<void>(`${baseUrl}/api/projects/${projectId}/chat-sessions/${sessionId}`, { method: 'DELETE' })
     },
 
     async generateMigrationPlan(projectId: string) {
@@ -1360,6 +1513,24 @@ export function createHttpApi(baseUrl: string): VicCoreApi {
         const body = await response.json().catch(() => null)
         throw new Error(body?.error ?? `Saving settings for ${personaId} failed`)
       }
+    },
+
+    async autoAdoptRecommendedModels(scope: PersonaScope) {
+      const response = await fetch(`${baseUrl}/api/settings/personas/auto-adopt`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(currentUserId ? { 'X-VIC-User': currentUserId } : {}),
+        },
+        body: JSON.stringify({ scope }),
+      })
+      if (!response.ok) {
+        const body = await response.json().catch(() => null)
+        throw new Error(body?.error ?? 'Auto-adopting recommended models failed')
+      }
+      return response.json() as Promise<{
+        applied: Array<{ personaId: string; pluginId: string; values: Record<string, string> }>
+      }>
     },
   }
 }

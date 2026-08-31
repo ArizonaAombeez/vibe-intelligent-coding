@@ -8,6 +8,7 @@ import type {
   CurrentOperation,
   ProjectMode,
   Requirement,
+  ChatMessageLink,
   ScanCodeGapsOptions,
   TokenEstimate,
   VicCoreApi,
@@ -18,6 +19,8 @@ import { RequirementDetailPanel } from './RequirementDetailPanel'
 import { RequirementResultsPanel } from './RequirementResultsPanel'
 import { highlightRequirementIds } from './requirementIdHighlight'
 import { EditableProposalCard } from './EditableProposalCard'
+import { ChatDock } from '../components/ChatDock'
+import type { PendingChatNav } from '../navigation/chatLinkNav'
 import { ImportCodebaseDialog } from '../components/ImportCodebaseDialog'
 import { ImportCodeGapScanDialog } from '../components/ImportCodeGapScanDialog'
 import '../components/ModalOverlay.css'
@@ -40,16 +43,13 @@ interface RequirementsScreenProps {
   // Requirement Gaps" action is correctly enabled after a reload, not just
   // within the session the upload happened in.
   importedCodePresent: boolean
+  // Chat link chip clicked anywhere in the app — App switches phase and
+  // sets pendingChatNav; this screen consumes it when kind === 'requirement'.
+  onChatNavigate: (link: ChatMessageLink) => void
+  pendingChatNav: PendingChatNav | null
+  onChatNavConsumed: () => void
 }
 
-interface ChatEntry {
-  role: 'user' | 'analyst'
-  text: string
-}
-
-const DEFAULT_CHAT_HEIGHT = 260
-const MIN_CHAT_HEIGHT = 120
-const MAX_CHAT_HEIGHT = 640
 
 // Side panel (Results / Requirement detail) width as a fraction of the
 // requirements-body container, so it responds to window/container resizes
@@ -69,6 +69,9 @@ export function RequirementsScreen({
   onOpenSettings,
   projectMode,
   importedCodePresent: importedCodePresentProp,
+  onChatNavigate,
+  pendingChatNav,
+  onChatNavConsumed,
 }: RequirementsScreenProps) {
   const [requirements, setRequirements] = useState<Requirement[]>([])
   // Shown once for an 'import' mode project until its codebase zip has been
@@ -85,14 +88,9 @@ export function RequirementsScreen({
   // single requirement's detail — whichever the user looked at most recently.
   const [sidePanelView, setSidePanelView] = useState<'results' | 'detail'>('detail')
 
-  const [chatHistory, setChatHistory] = useState<ChatEntry[]>([])
-  const [chatInput, setChatInput] = useState('')
+  // Analyst-chat proposal cards still live here (surface-specific side
+  // content rendered under the shared ChatDock's transcript).
   const [proposed, setProposed] = useState<string[]>([])
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
-  const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
-  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT)
-  const resizingRef = useRef(false)
 
   const [detailFraction, setDetailFraction] = useState(DEFAULT_DETAIL_FRACTION)
   const detailResizingRef = useRef(false)
@@ -184,29 +182,6 @@ export function RequirementsScreen({
     }
   }, [api, projectId])
 
-  const handleResizeStart = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      resizingRef.current = true
-      const startY = e.clientY
-      const startHeight = chatHeight
-
-      function onMove(moveEvent: MouseEvent) {
-        if (!resizingRef.current) return
-        const delta = startY - moveEvent.clientY
-        const next = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, startHeight + delta))
-        setChatHeight(next)
-      }
-      function onUp() {
-        resizingRef.current = false
-        window.removeEventListener('mousemove', onMove)
-        window.removeEventListener('mouseup', onUp)
-      }
-      window.addEventListener('mousemove', onMove)
-      window.addEventListener('mouseup', onUp)
-    },
-    [chatHeight],
-  )
 
   const handleDetailResizeStart = useCallback(
     (e: React.MouseEvent) => {
@@ -294,6 +269,34 @@ export function RequirementsScreen({
       return a.localeCompare(b)
     })
   }, [filteredRequirements])
+
+  // ChatDock transport for the Analyst surface. Errors propagate to the
+  // dock (which shows them + an "llm-not-configured → Open Settings"
+  // affordance); we still surface them on the status strip too.
+  const sendAnalystChat = useCallback(
+    async (sessionId: string, message: string) => {
+      onOperationChange({ text: 'Analyst is thinking...' })
+      try {
+        const result = await api.analystChat(projectId, message, sessionId)
+        setProposed((prev) => [...prev, ...result.proposedRequirements])
+        onOperationChange({ text: null })
+        return { userMessage: result.userMessage, assistantMessage: result.assistantMessage }
+      } catch (err) {
+        onOperationChange(toOperationError(err))
+        throw err
+      }
+    },
+    [api, projectId, onOperationChange],
+  )
+
+  // Consume a chat link chip that targeted a requirement — open that
+  // requirement's detail panel, then tell App the nav is done.
+  useEffect(() => {
+    if (!pendingChatNav || pendingChatNav.kind !== 'requirement') return
+    setOpenRequirementId(pendingChatNav.id)
+    setSidePanelView('detail')
+    onChatNavConsumed()
+  }, [pendingChatNav, onChatNavConsumed])
 
   if (activeSubstep && activeSubstep !== 'elicitation') {
     return (
@@ -500,30 +503,6 @@ export function RequirementsScreen({
       setOpenRequirementId((prev) => prev ?? created[0]?.id ?? null)
     } catch (err) {
       onOperationChange(toOperationError(err))
-    }
-  }
-
-  async function handleChatSend() {
-    if (!chatInput.trim() || chatBusy) return
-    const message = chatInput.trim()
-    setChatHistory((prev) => [...prev, { role: 'user', text: message }])
-    setChatInput('')
-    setChatBusy(true)
-    setChatError(null)
-    setChatErrorIsLlmNotConfigured(false)
-    onOperationChange({ text: 'Analyst is thinking...' })
-    try {
-      const result = await api.analystChat(projectId, message)
-      setChatHistory((prev) => [...prev, { role: 'analyst', text: result.reply }])
-      setProposed((prev) => [...prev, ...result.proposedRequirements])
-      onOperationChange({ text: null })
-    } catch (err) {
-      const operationError = toOperationError(err)
-      setChatError(operationError.error ?? null)
-      setChatErrorIsLlmNotConfigured(operationError.errorCode === 'llm-not-configured')
-      onOperationChange(operationError)
-    } finally {
-      setChatBusy(false)
     }
   }
 
@@ -1019,44 +998,20 @@ export function RequirementsScreen({
       )}
       </div>
 
-      <div className="analyst-chat-dock" style={{ height: chatHeight }}>
-        <div className="analyst-chat-resize-handle" onMouseDown={handleResizeStart} />
-        <div className="analyst-chat-panel">
-          <div className="analyst-chat-heading-row">
-            <h2>Analyst chat</h2>
-            <span className="analyst-chat-hint">
-              Ask the Analyst to help clarify or fill gaps in your requirements.
-            </span>
-          </div>
-          <div className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}>
-            {chatHistory.length === 0 && !chatBusy && (
-              <p className="analyst-chat-empty">No messages yet — start the conversation below.</p>
-            )}
-            {chatHistory.map((entry, i) => (
-              <div key={i} className={`analyst-chat-entry analyst-chat-entry-${entry.role}`}>
-                <strong>{entry.role === 'user' ? 'You' : 'Analyst'}</strong>
-                <p>{highlightRequirementIds(entry.text)}</p>
-              </div>
-            ))}
-            {chatBusy && <p className="analyst-chat-empty">Analyst is thinking...</p>}
-          </div>
-
-          {chatError && (
-            <div className="analyst-chat-error">
-              <span>{chatError}</span>
-              {chatErrorIsLlmNotConfigured ? (
-                <button type="button" onClick={onOpenSettings}>
-                  Open Settings
-                </button>
-              ) : (
-                <button type="button" onClick={handleChatSend}>
-                  Retry
-                </button>
-              )}
-            </div>
-          )}
-
-          {proposed.length > 0 && (
+      <ChatDock
+        api={api}
+        projectId={projectId}
+        surface="analyst"
+        roleLabel="Analyst"
+        heading="Analyst chat"
+        hint="Ask the Analyst to help clarify or fill gaps in your requirements."
+        placeholder="Message the Analyst... (Shift+Enter for a new line)"
+        onOpenSettings={onOpenSettings}
+        onNavigateLink={onChatNavigate}
+        renderMessageText={highlightRequirementIds}
+        sendMessage={sendAnalystChat}
+        renderExtras={() =>
+          proposed.length > 0 ? (
             <div className="analyst-chat-proposals">
               <h3>Proposed requirements</h3>
               {proposed.map((text) => (
@@ -1068,26 +1023,9 @@ export function RequirementsScreen({
                 />
               ))}
             </div>
-          )}
-
-          <div className="analyst-chat-input-row">
-            <textarea
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault()
-                  handleChatSend()
-                }
-              }}
-              placeholder="Message the Analyst... (Shift+Enter for a new line)"
-            />
-            <button type="button" onClick={handleChatSend} disabled={!chatInput.trim() || chatBusy}>
-              Send
-            </button>
-          </div>
-        </div>
-      </div>
+          ) : null
+        }
+      />
 
       {pendingAnalysisIds && pendingEstimate && (
         <div className="modal-overlay" onClick={closePendingAnalysis}>

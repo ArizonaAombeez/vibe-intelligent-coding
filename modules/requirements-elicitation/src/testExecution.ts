@@ -2,6 +2,7 @@ import {
   buildTestExecutionChatMessages,
   buildTriageMessages,
   buildUserReportedIssueTriageMessages,
+  formatArchitectureForTriage,
   formatLatestRun,
   formatTestCase,
 } from './testExecutionPersona.js'
@@ -28,10 +29,40 @@ function describeVerification(project: Project, testCaseId: string): string {
 
 const CODE_FAILURE_LINE = /^CODE-FAILURE:\s*(.+)$/m
 const TEST_CASE_FAILURE_LINE = /^TEST-CASE-FAILURE:\s*(.+)$/m
+const SUSPECTED_ELEMENTS_LINE = /^SUSPECTED-ELEMENTS:\s*(.+)$/m
+
+// Parses the advisory "SUSPECTED-ELEMENTS: ELM-01, ELM-07" line the triage
+// prompts now ask for, keeping only ids that are real architecture
+// elements (dedup, order preserved). Falls back to the test's static link
+// when the LLM named nothing usable — never returns an empty array so
+// callers always have at least the static attribution to show.
+function parseSuspectedElementIds(
+  replyContent: string,
+  project: Project,
+  fallbackElementIds: string[],
+): string[] {
+  const line = replyContent.match(SUSPECTED_ELEMENTS_LINE)
+  const known = new Set((project.architecture?.elements ?? []).map((e) => e.id))
+  const parsed = line
+    ? [...new Set(line[1].split(/[,\s]+/).map((s) => s.trim()).filter((s) => s.length > 0))].filter((id) => known.has(id))
+    : []
+  return parsed.length > 0 ? parsed : fallbackElementIds.filter((id) => known.has(id))
+}
+
+function staticElementIdsForTest(test: TestCase | undefined): string[] {
+  if (!test) return []
+  if (test.architectureElementId) return [test.architectureElementId]
+  return test.interfaceElementIds ?? []
+}
 
 export interface TriageTestFailureResult {
   triage: TestOutcomeTriage
   triageRationale?: string
+  // Architecture element id(s) the LLM suspects are at fault, most likely
+  // first — always populated (falls back to the test's static link).
+  // Advisory: also written to outcome.suspectedElementIds, never used to
+  // route or gate.
+  suspectedElementIds: string[]
   usage?: LlmUsage
 }
 
@@ -61,7 +92,14 @@ export async function triageTestFailure(
   }
 
   const testCase = project.testSuite?.tests.find((t) => t.id === testCaseId)
-  const messages = buildTriageMessages(testCase?.title ?? testCaseId, describeVerification(project, testCaseId), outcome.output)
+  const staticElementIds = staticElementIdsForTest(testCase)
+  const messages = buildTriageMessages(
+    testCase?.title ?? testCaseId,
+    describeVerification(project, testCaseId),
+    outcome.output,
+    formatArchitectureForTriage(project),
+    staticElementIds[0] ?? null,
+  )
   const result = await llmClient.chat(messages, llmOptions)
 
   const codeFailure = result.content.match(CODE_FAILURE_LINE)
@@ -77,9 +115,12 @@ export async function triageTestFailure(
     triageRationale = codeFailure[1].trim()
   }
 
+  const suspectedElementIds = parseSuspectedElementIds(result.content, project, staticElementIds)
+
   outcome.triage = triage
   outcome.triageRationale = triageRationale
-  return { triage, triageRationale, usage: result.usage }
+  outcome.suspectedElementIds = suspectedElementIds
+  return { triage, triageRationale, suspectedElementIds, usage: result.usage }
 }
 
 // Human confirmation step (Area F, resolved: "a human confirms before the
@@ -141,6 +182,11 @@ export interface UserReportedIssueDispatch {
   verdict: 'code-failure' | 'test-case-failure' | 'requirement-issue'
   rationale: string
   dispatchedTo?: string
+  // Architecture element id(s) the LLM suspects are at fault, most likely
+  // first — always populated (falls back to the test's static link).
+  // Advisory: does NOT change which element(s) pendingRecodeReason is set
+  // on. Surfaced as chat link chips + rationale only.
+  suspectedElementIds: string[]
 }
 
 export interface ClassifyUserReportedIssueResult {
@@ -199,11 +245,14 @@ export async function classifyAndDispatchUserReportedIssue(
   }
   const latestRun: TestRun | null = latestRunId ? (project.testRuns?.find((r) => r.id === latestRunId) ?? null) : null
 
+  const staticElementIds = staticElementIdsForTest(test)
   const messages = buildUserReportedIssueTriageMessages(
     formatTestCase(test),
     describeVerification(project, testCaseId),
     formatLatestRun(latestRun, testCaseId),
     userMessage,
+    formatArchitectureForTriage(project),
+    staticElementIds[0] ?? null,
     codeContext,
   )
   const result = await llmClient.chat(messages, llmOptions)
@@ -216,9 +265,10 @@ export async function classifyAndDispatchUserReportedIssue(
   const codeFailure = result.content.match(USER_ISSUE_CODE_FAILURE_LINE)
   const testCaseFailure = result.content.match(USER_ISSUE_TEST_CASE_FAILURE_LINE)
   const requirementIssue = result.content.match(USER_ISSUE_REQUIREMENT_ISSUE_LINE)
+  const suspectedElementIds = parseSuspectedElementIds(result.content, project, staticElementIds)
 
   if (testCaseFailure) {
-    return { dispatch: { verdict: 'test-case-failure', rationale: testCaseFailure[1].trim() }, usage }
+    return { dispatch: { verdict: 'test-case-failure', rationale: testCaseFailure[1].trim(), suspectedElementIds }, usage }
   }
 
   if (requirementIssue && test.type === 'functional' && test.requirementIds[0]) {
@@ -231,7 +281,7 @@ export async function classifyAndDispatchUserReportedIssue(
       const newText = draftResult.content.trim()
       if (newText) {
         updateRequirementText(project, requirement.id, newText)
-        return { dispatch: { verdict: 'requirement-issue', rationale, dispatchedTo: requirement.id }, usage }
+        return { dispatch: { verdict: 'requirement-issue', rationale, dispatchedTo: requirement.id, suspectedElementIds }, usage }
       }
     }
     // Fall through to code-failure treatment if there's no single
@@ -259,5 +309,8 @@ export async function classifyAndDispatchUserReportedIssue(
     dispatchedIds.push(element.id)
   }
 
-  return { dispatch: { verdict: 'code-failure', rationale, dispatchedTo: dispatchedIds.join(', ') || undefined }, usage }
+  return {
+    dispatch: { verdict: 'code-failure', rationale, dispatchedTo: dispatchedIds.join(', ') || undefined, suspectedElementIds },
+    usage,
+  }
 }

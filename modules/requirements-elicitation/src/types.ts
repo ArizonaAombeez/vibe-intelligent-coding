@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1
+export const SCHEMA_VERSION = 3
 
 export type RequirementType =
   | 'functional'
@@ -128,12 +128,65 @@ export type ArchitectureTypeId =
   | 'game-realtime'
   | 'custom'
 
+// Project platform (project harness feature) — the single deployment /
+// runtime target for the whole project, one per project (not per element).
+// Distinct from ArchitectureTypeId: architectureType only seeds the grid's
+// default layer rows, whereas platform drives HOW the harness realises the
+// entry point, element instantiation, inter-element links and run
+// lifecycle. Orthogonal — a 'web-app' architectureType can target the 'web'
+// built-in or a custom 'custom:electron' platform.
+export type BuiltInPlatformId = 'embedded' | 'web' | 'android' | 'desktop' | 'cli' | 'server'
+
+// A built-in id, or a user-added custom id of the form "custom:<slug>".
+export type PlatformId = BuiltInPlatformId | (string & {})
+
+// One selectable platform. Built-ins are defined in platforms.ts; custom
+// ones are user-added and persisted server-side in
+// PROJECTS_ROOT/platforms.json. The three *Hint fields are fed verbatim
+// into the change-platform warning and the harness Coding prompt.
+export interface PlatformDescriptor {
+  id: PlatformId
+  label: string
+  // How the entry point looks on this platform, e.g.
+  // "index.html + main.tsx (Vite)", "public static void main",
+  // "MainActivity.onCreate".
+  entryPointHint: string
+  // How elements are wired on this platform, e.g. "React context / props",
+  // "Android ViewModel + StateFlow", "constructor injection in main()".
+  wiringHint: string
+  // The run lifecycle on this platform, e.g. "start only (no stop)",
+  // "start + stop via Activity lifecycle", "start + SIGINT stop".
+  lifecycleHint: string
+  // Built-ins cannot be deleted; custom ones can (by anyone).
+  builtIn: boolean
+  // Custom platforms only.
+  createdBy?: string
+  createdAt?: string
+}
+
 // Grid-based architecture structure (Area B, resolved): every block,
 // interface spine, or service occupies one or more cells at a (row, col)
 // coordinate. Rows conventionally represent architectural layers, columns
 // represent functional groupings. Deterministic — same input always renders
 // identically, replacing force-directed layout as the underlying model.
-export type ArchitectureElementKind = 'functional' | 'interface-spine' | 'service' | 'external' | 'runtime'
+//
+// 'harness' (project harness, resolved): exactly one per project, auto-
+// created, non-deletable, excluded from requirement allocation. It is the
+// composition root + platform entry point — it instantiates every other
+// element, establishes the declared inter-element connections, and drives
+// the run lifecycle. It carries no functional logic of its own. Unlike
+// every other kind it is coded with write access to the project root (not
+// just its own src/ subfolder), because its whole job is to produce the
+// entry file the other elements are forbidden from creating. See
+// buildHarnessResponsibility / HarnessSpec below and the harness branch in
+// vic-coding's runCodingForElement.
+export type ArchitectureElementKind =
+  | 'functional'
+  | 'interface-spine'
+  | 'service'
+  | 'external'
+  | 'runtime'
+  | 'harness'
 
 export interface ArchitectureElement {
   id: string
@@ -189,6 +242,62 @@ export interface ArchitectureElement {
   // this verbatim into the next run's prompt. Cleared together with
   // pendingRecodeReason.
   pendingRecodeDetail?: string
+  // Only ever set on the single kind:'harness' element — the derived plan
+  // for how this project's harness realises its entry point, element
+  // instantiation, inter-element links and run lifecycle on the currently
+  // selected project.platform. Undefined until the Define Harness action
+  // has run. Regenerated (not merged) whenever it runs. If
+  // harnessSpec.derivedForPlatform !== project.platform the spec is stale
+  // and the harness Coding gate refuses to run until Define Harness is
+  // re-run. See HarnessSpec below.
+  harnessSpec?: HarnessSpec
+}
+
+// The default harness responsibility checklist (project harness, resolved).
+// Fixed set of concerns a harness must account for; deriveHarnessSpec marks
+// each one 'applies' or 'not-applicable' for the selected platform and
+// records a one-sentence realisation. Kept as stable keys (never free text)
+// so re-derivation on a platform change can match items up.
+export type HarnessChecklistKey =
+  | 'entry-point'
+  | 'element-instantiation'
+  | 'inter-element-links'
+  | 'lifecycle-start'
+  | 'lifecycle-stop'
+  | 'config-load'
+  | 'dependency-order'
+  | 'error-surface'
+
+export type HarnessChecklistStatus = 'applies' | 'not-applicable' | 'unknown'
+
+export interface HarnessChecklistItem {
+  key: HarnessChecklistKey
+  status: HarnessChecklistStatus
+  // One sentence: how this concern is realised on the selected platform
+  // (e.g. "Vite index.html loads src/main.tsx which calls createRoot").
+  // Reviewable/editable by the user after derivation.
+  realisation: string
+}
+
+// One declared inter-element connection plus the concrete platform
+// mechanism realising it — the "score: Android -> StateFlow on
+// GameStateViewModel, observed by HudFragment" artifact. masterDefinitionId
+// points at an Architecture.interfaceDefinitions[] entry.
+export interface HarnessLinkRealisation {
+  masterDefinitionId: string
+  summary: string
+}
+
+export interface HarnessSpec {
+  // The project.platform this spec was derived against. When it no longer
+  // matches project.platform the spec is stale (harness Coding blocked).
+  derivedForPlatform: PlatformId
+  checklist: HarnessChecklistItem[]
+  linkRealisations: HarnessLinkRealisation[]
+  // One paragraph tying the above together — written verbatim into
+  // src/_harness/HARNESS.md by the harness Coding run.
+  narrative: string
+  derivedAt: string
 }
 
 export type ArchitectureConflictKind =
@@ -261,6 +370,34 @@ export interface InterfaceDefinition {
   // interfaceChangedSinceLastCoding compare a coding run's finishedAt
   // against.
   updatedAt: string
+  // Platform-neutral per-participant declarations (Define Interfaces, project
+  // harness feature). For each participant element: what it does, the named
+  // function calls / signals it exposes, the data it owns, and which other
+  // elements may see that data. The format is fixed regardless of
+  // project.platform — only the harness's realisation notes (HarnessSpec)
+  // vary by platform. Undefined on definitions created before this field
+  // existed; re-running Define Interfaces backfills it.
+  declarations?: InterfaceElementDeclaration[]
+}
+
+// One participant element's platform-neutral declaration, emitted by the
+// Define Interfaces Architect call alongside the OPERATION lines (project
+// harness feature). Merged by elementId across every definition the element
+// participates in (union of exposes/owns; last-writer-wins for
+// does/visibleTo). The harness reads these to know what to wire without
+// having to read every element's source. Names here are conceptual (a call
+// or signal name), never a language/framework construct.
+export interface InterfaceElementDeclaration {
+  elementId: string
+  // One line: what this element does. Platform-neutral.
+  does: string
+  // Named function calls / signals this element exposes to others.
+  exposes: string[]
+  // Data this element owns (single owner per datum — nothing is global).
+  owns: string[]
+  // Which elements may see this element's owned data: a list of element
+  // ids, or the sentinel ['all'] or ['none'].
+  visibleTo: string[]
 }
 
 // One element's own local copy of an interface it participates in (Area
@@ -490,6 +627,20 @@ export type CodingRunStatus =
   | 'rejected-multi-element'
   | 'rejected-not-eligible'
   | 'rejected-empty-output'
+  // Coded something, but wrote no runnable "*.test.<ext>" file for the
+  // element (Area F follow-up: SW tests are mandatory). The code the agent
+  // wrote IS kept (merged and committed like a success — throwing away real
+  // work over a missing test would be worse), but the run does NOT count as
+  // success: no requirement status flip, and the UI shows it as needing a
+  // re-run to add the tests.
+  | 'rejected-no-tests'
+  // The coding loop (T3) ran to its iteration/time cap without the element's
+  // own inline tests passing — code and tests WERE produced (a non-empty
+  // diff and >=1 *.test.<ext> file), so this is not 'rejected-*', but it is
+  // NOT 'success' either: requirement status does not advance and the
+  // element badge shows 'blocked'. A distinct member (not 'success' + a
+  // flag) so every `status === 'success'` guard excludes it for free.
+  | 'success-tests-failing'
   | 'cli-error'
 
 export interface CodingRun {
@@ -509,8 +660,18 @@ export interface CodingRun {
   // element" write-scope gate's allowed prefix for this run.
   allowedSubfolder: string
   // Populated only for status 'rejected-scope' — paths the CLI wrote outside
-  // allowedSubfolder that were reverted.
+  // allowedSubfolder that were reverted. Also populated (without failing the
+  // run) for a successful harness run that touched an element's folder: the
+  // harness may write the project root + its own _harness/ folder but never
+  // an element's folder — such writes are reverted and listed here, and the
+  // run still succeeds (see warnings).
   rejectedFiles?: string[]
+  // Human-readable advisory notes attached to an otherwise-successful run.
+  // Currently only used by the harness branch: when the harness attempted
+  // to modify an element's folder, one note per reverted path explaining it
+  // may signal a missing requirement or interface. Undefined/absent when
+  // there is nothing to flag.
+  warnings?: string[]
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number }
   // Which concrete agent client actually ran this (e.g. 'claude-code' vs
   // 'opencode') and which model was requested — recorded so a slow/fast
@@ -531,6 +692,35 @@ export interface CodingRun {
     msToFirstOutput?: number
     msTotal: number
   }
+  // Result of running the element's own freshly-written "*.test.<ext>" files
+  // as part of this Coding run (Area F follow-up — "run the coding-level
+  // tests and confirm they pass, not just that they exist"). Populated on a
+  // run that got far enough to have committed code and at least one test
+  // file; absent otherwise. A run whose tests FAIL is still recorded with
+  // status 'success' for requirement-status purposes (the code and tests
+  // were produced), but swTestsPassed:false is surfaced prominently in the
+  // Coding screen and the agent is prompted to fix them on the next run.
+  swTestResult?: {
+    passed: boolean
+    filesRun: number
+    // Per-file: basename + pass/fail + captured stdout/stderr.
+    files: Array<{ name: string; passed: boolean; output: string }>
+  }
+  // T3: the coding loop iterates until the element's own definition of done
+  // is met (non-empty diff + a test file + inline tests pass + every
+  // allocated requirement referenced by a test's `// covers:` tag) or it
+  // stops making progress. These record how that went. Absent on a
+  // single-shot path (harness runs, gate rejections).
+  iterations?: number
+  iterationHistory?: Array<{
+    status: CodingRunStatus
+    swTestsPassed?: boolean
+    failingTestNames?: string[]
+    // Allocated requirement ids with no `// covers:` tag in any test file
+    // after this iteration.
+    uncoveredRequirementIds?: string[]
+  }>
+  stoppedBecause?: 'done' | 'stalled' | 'cap' | 'budget' | 'cancelled' | 'cli-error' | 'rejected'
 }
 
 // Test Creation & Execution (Areas E/F, resolved). Integration tests are a
@@ -649,6 +839,16 @@ export interface TestCaseOutcome {
   // 'test-case-failure' outcome stop blocking its requirement's status
   // (see requirementStatusFlip.ts).
   testCaseFailureConfirmedAt?: string
+  // Architecture element id(s) triage suspects are actually at fault, most
+  // likely first — the LLM is given the full element list (including the
+  // Harness element) and asked to name the real culprit, which may differ
+  // from or extend the test's static architectureElementId (e.g. the fault
+  // is in a collaborator or the Harness wiring). ADVISORY ONLY: this never
+  // changes which element gets pendingRecodeReason and never feeds the
+  // status-flip gate — it's surfaced on the failing test's row and as chat
+  // link chips. Falls back to the static link when the LLM names nothing
+  // usable. Undefined on outcomes triaged before this field existed.
+  suspectedElementIds?: string[]
 }
 
 // One test result from a scope's test command that could not be matched to
@@ -694,6 +894,14 @@ export interface TestRun {
   // the run predates this field or the output couldn't be parsed per-test
   // (see attributeSwOutcomes in runExecution.ts).
   swOutcomes?: SwTestOutcome[]
+  // Test cases whose recorded filePath pointed at a file that no longer
+  // exists on disk when this run swept the scope (e.g. the source tree was
+  // re-coded and the generated test files were lost). runElementTestSuite
+  // clears the dead filePath and resets those cases to 'not-run' as it
+  // records them here, so the UI can show "file missing — regenerate"
+  // instead of silently producing no outcome for them. Undefined on runs
+  // that predate this field; empty when every recorded filePath resolved.
+  missingFiles?: Array<{ testCaseId: string; filePath: string }>
   // Optional mutation-testing score for this run (Area F top-level bullet:
   // "Mutation testing (mechanical, non-LLM)") — deferred, no real
   // Stryker/mutmut/PIT integration exists yet (confirmed acceptable by
@@ -713,11 +921,90 @@ export interface TestRegressionRun {
   startedAt: string
   finishedAt: string
   runIds: string[]
+  // True only when at least one requirement-traced outcome ran AND all of
+  // them passed. A pass over ZERO outcomes is NOT allPassed — an empty
+  // `[].every()` used to report green while nothing had actually run.
   allPassed: boolean
+  // How many requirement-traced outcomes this pass actually evaluated. 0
+  // means no requirement-level test ran at all (e.g. no automations
+  // generated yet) — the UI shows this instead of a bare red so the reason
+  // is legible.
+  outcomeCount: number
   // What triggered this pass — 'coding-success' is the automatic trigger
   // (Area F, resolved: "triggered automatically after any accepted Coding
   // run"); 'manual' is the Test Execution screen's on-demand action.
   trigger: 'coding-success' | 'manual'
+}
+
+// Persistent chat. Before this, every chat was UI-local useState only and
+// lost on navigate/reload. A ChatSession is one tab in a screen's chat
+// dock; tabs are soft-closed (archivedAt) so a transcript and its dispatch
+// history stay auditable. One surface per chat-capable screen:
+//   analyst       — Requirements screen (Analyst persona)
+//   architect     — Architecture screen (Architect persona)
+//   qa-creation   — Test Creation screen (QA persona)
+//   qa-execution  — Test Execution screen (QA persona; the only surface
+//                   that dispatches, so the only one that populates
+//                   ChatMessage.links / ChatMessage.dispatch)
+// The Coding screen deliberately has NO chat surface — the process drives
+// people through elicitation/architecture/test rather than direct code
+// edits.
+export type ChatSurface = 'analyst' | 'architect' | 'qa-creation' | 'qa-execution'
+
+// A clickable reference embedded in an assistant chat message — rendered
+// as a chip that navigates to the item. label is denormalised at write
+// time so the chip still reads sensibly if the target is later renamed or
+// deleted (the nav helper handles the not-found case).
+export interface ChatMessageLink {
+  kind: 'requirement' | 'element' | 'testCase'
+  id: string
+  label: string
+}
+
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  // Only ever populated on assistant messages, and today only on the
+  // qa-execution surface (the one chat surface that dispatches). Absent
+  // elsewhere.
+  links?: ChatMessageLink[]
+  // Structured triage/dispatch outcome attached to a qa-execution assistant message —
+  // what the DISPATCH_SUMMARY line renders. suspectedElementIds mirrors
+  // TestCaseOutcome.suspectedElementIds and is advisory only.
+  dispatch?: {
+    verdict: 'code-failure' | 'test-case-failure' | 'requirement-issue'
+    rationale: string
+    dispatchedTo?: string
+    suspectedElementIds?: string[]
+  }
+  createdAt: string
+}
+
+export interface ChatSession {
+  id: string
+  surface: ChatSurface
+  // User-editable tab label. Defaults to "Chat N" or a label derived from
+  // the focus context at creation time.
+  title: string
+  // Selection context captured when the tab was opened, passed through to
+  // the chat/triage calls this tab makes. Which fields are meaningful
+  // depends on the surface (qa: testCaseId/runId; analyst: requirementId;
+  // coding: architectureElementId).
+  focus?: {
+    testCaseId?: string
+    runId?: string
+    requirementId?: string
+    architectureElementId?: string
+  }
+  messages: ChatMessage[]
+  createdAt: string
+  updatedAt: string
+  // Set when the user closes the tab. The session stays in
+  // project.chatSessions (transcript + dispatch history retained); it's
+  // just hidden from the tab strip. A hard DELETE route exists but isn't
+  // wired to the tab close affordance.
+  archivedAt?: string
 }
 
 export interface Project {
@@ -748,6 +1035,13 @@ export interface Project {
   // Null until the Architect selects one at the top of the Architecture tab
   // (Area B, "Architecture type selection").
   architectureType?: ArchitectureTypeId | null
+  // The single deployment/runtime platform for this whole project (project
+  // harness feature). Undefined until the user picks one on the
+  // Architecture screen. The harness element cannot be coded until this is
+  // set. Changing it after the fact is a major event — the UI warns and
+  // offers to branch to a new project (see branch-platform route). Never
+  // guessed from architectureType.
+  platform?: PlatformId
   // Undefined until the Architect selects an architecture type, at which
   // point the grid is seeded with that type's default layer rows.
   architecture?: Architecture
@@ -822,4 +1116,10 @@ export interface Project {
   // regression pass.
   testRuns?: TestRun[]
   testRegressionRuns?: TestRegressionRun[]
+  // Persistent chat transcripts for the three chat surfaces (see
+  // ChatSession). Undefined on projects created before this feature —
+  // callers and the store migration normalise it to []. Append-only in
+  // practice: tabs are soft-closed via ChatSession.archivedAt, never
+  // spliced out here.
+  chatSessions?: ChatSession[]
 }

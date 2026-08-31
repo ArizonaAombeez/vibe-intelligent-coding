@@ -61,10 +61,31 @@ function FieldInput({
   )
 }
 
+// Short "provider · model · effort" line shown on a collapsed persona card
+// so the key facts stay visible without expanding. Pulls whichever fields
+// look like model / effort by key, falling back to their raw label.
+function personaSummary(
+  persona: PersonaSettings,
+  currentValue: (persona: PersonaSettings, field: PersonaOverrideField) => string,
+): string {
+  const bits: string[] = []
+  bits.push(persona.pluginLabel ?? (persona.pluginId ? persona.pluginId : 'No provider'))
+  for (const field of persona.fields) {
+    const k = field.key.toLowerCase()
+    if (k.includes('model') || k.includes('effort') || k.includes('reasoning') || k.includes('thinking')) {
+      const v = currentValue(persona, field)
+      if (v) bits.push(`${field.label}: ${v}`)
+    }
+  }
+  return bits.join(' · ')
+}
+
 function PersonaCard({
   scope,
   persona,
   editable,
+  collapsed,
+  onToggleCollapsed,
   savedId,
   errorById,
   currentPersonaValue,
@@ -78,6 +99,8 @@ function PersonaCard({
 }: {
   scope: PersonaScope
   persona: PersonaSettings
+  collapsed: boolean
+  onToggleCollapsed: () => void
   // Non-admins (and admins viewing the read-only branch) get a plain,
   // disabled rendering of whatever's currently saved — no drafts, no
   // dropdowns, no Save button. Matches "users can view the user persona
@@ -99,29 +122,69 @@ function PersonaCard({
   onSaveAgent: (scope: PersonaScope, personaId: string) => void
 }) {
   const draftKey = `${scope}:${persona.id}`
+  const summary = personaSummary(persona, (p, f) => currentPersonaValue(scope, p, f))
+
+  const header = (
+    <button type="button" className="settings-persona-card-header" onClick={onToggleCollapsed} aria-expanded={!collapsed}>
+      <span className="settings-persona-card-toggle" aria-hidden="true">
+        {collapsed ? '▸' : '▾'}
+      </span>
+      <span className="settings-persona-card-title">{persona.label}</span>
+      <span className="settings-persona-card-summary">{summary}</span>
+    </button>
+  )
 
   if (!editable) {
     return (
       <div className="settings-plugin-card">
-        <h3>{persona.label}</h3>
-        <p className="settings-field-description">
-          {persona.pluginLabel ?? 'Not yet wired to an LLM provider — no stage uses this persona yet.'}
-        </p>
-        {persona.pluginId &&
-          persona.fields
-            .filter((field) => field.value)
-            .map((field) => (
-              <p key={field.key} className="settings-field-description">
-                {field.label}: {field.value}
+        {header}
+        {!collapsed && (
+          <>
+            <p className="settings-field-description">
+              {persona.pluginLabel ?? 'Not yet wired to an LLM provider — no stage uses this persona yet.'}
+            </p>
+            {persona.pluginId &&
+              persona.fields
+                .filter((field) => field.value)
+                .map((field) => (
+                  <p key={field.key} className="settings-field-description">
+                    {field.label}: {field.value}
+                  </p>
+                ))}
+            {persona.recommendation && persona.pluginId && (
+              <p className="settings-persona-recommendation">
+                <strong>Recommended:</strong>{' '}
+                {Object.entries(persona.recommendation.values)
+                  .map(([k, v]) => `${k} = ${v}`)
+                  .join(', ')}{' '}
+                — {persona.recommendation.why}
               </p>
-            ))}
+            )}
+          </>
+        )}
       </div>
     )
   }
 
+  if (collapsed) {
+    return <div className="settings-plugin-card">{header}</div>
+  }
+
+  const recommendationHint =
+    persona.recommendation && persona.pluginId ? (
+      <p className="settings-persona-recommendation">
+        <strong>Recommended:</strong>{' '}
+        {Object.entries(persona.recommendation.values)
+          .map(([k, v]) => `${k} = ${v}`)
+          .join(', ')}{' '}
+        — {persona.recommendation.why} Use “Auto-adopt recommended models” above to apply this to every persona.
+      </p>
+    ) : null
+
   return (
     <div className="settings-plugin-card">
-      <h3>{persona.label}</h3>
+      {header}
+      {recommendationHint}
       <label className="settings-field">
         <div className="settings-field-label-row">
           <span>LLM provider</span>
@@ -295,6 +358,67 @@ export function SettingsScreen({
   )
   const [savingAll, setSavingAll] = useState(false)
   const [saveAllError, setSaveAllError] = useState('')
+
+  // Persona cards start collapsed (the list is long); a collapsed card still
+  // shows its provider / model / effort summary. Keyed by `${scope}:${id}`.
+  // `null` for a key that's never been toggled means "use the default"
+  // (collapsed), so we don't need to pre-populate this once persona lists
+  // load.
+  const [expandedPersonas, setExpandedPersonas] = useState<Record<string, boolean>>({})
+  function isPersonaExpanded(scope: PersonaScope, personaId: string): boolean {
+    return expandedPersonas[personaDraftKey(scope, personaId)] ?? false
+  }
+  function togglePersonaExpanded(scope: PersonaScope, personaId: string) {
+    const key = personaDraftKey(scope, personaId)
+    setExpandedPersonas((prev) => ({ ...prev, [key]: !(prev[key] ?? false) }))
+  }
+  function collapseAllPersonas(scope: PersonaScope) {
+    const list = scope === 'admin' ? personaLists.admin ?? [] : personaLists.user
+    setExpandedPersonas((prev) => {
+      const next = { ...prev }
+      for (const p of list) next[personaDraftKey(scope, p.id)] = false
+      return next
+    })
+  }
+  function expandAllPersonas(scope: PersonaScope) {
+    const list = scope === 'admin' ? personaLists.admin ?? [] : personaLists.user
+    setExpandedPersonas((prev) => {
+      const next = { ...prev }
+      for (const p of list) next[personaDraftKey(scope, p.id)] = true
+      return next
+    })
+  }
+
+  const [autoAdoptBusy, setAutoAdoptBusy] = useState(false)
+  const [autoAdoptResult, setAutoAdoptResult] = useState<string | null>(null)
+  async function handleAutoAdopt(scope: PersonaScope) {
+    if (autoAdoptBusy) return
+    setAutoAdoptBusy(true)
+    setAutoAdoptResult(null)
+    try {
+      const { applied } = await api.autoAdoptRecommendedModels(scope)
+      // Re-fetch so the cards + summaries reflect the newly-written values,
+      // and clear any stale drafts for the affected personas.
+      const fresh = await api.listPersonaSettings()
+      setPersonaLists(fresh)
+      setPersonaDrafts((prev) => {
+        const next = { ...prev }
+        for (const a of applied) delete next[personaDraftKey(scope, a.personaId)]
+        return next
+      })
+      setAutoAdoptResult(
+        applied.length === 0
+          ? 'No personas had a recommendation for their current provider — nothing changed.'
+          : `Applied recommended models to ${applied.length} persona${applied.length === 1 ? '' : 's'}: ${applied
+              .map((a) => a.personaId)
+              .join(', ')}.`,
+      )
+    } catch (err) {
+      setAutoAdoptResult(err instanceof Error ? err.message : 'Auto-adopt failed.')
+    } finally {
+      setAutoAdoptBusy(false)
+    }
+  }
 
   const visibleTabs = SETTINGS_TABS.filter(
     (tab) => (!tab.projectOnly || project) && (!tab.adminOnly || currentUser.isAdmin),
@@ -772,12 +896,39 @@ export function SettingsScreen({
                   can edit it.
                 </p>
 
+                {personaLists.user.length > 0 && (
+                  <>
+                    <div className="settings-persona-list-actions">
+                      <button type="button" onClick={() => collapseAllPersonas('user')}>
+                        Collapse all
+                      </button>
+                      <button type="button" onClick={() => expandAllPersonas('user')}>
+                        Expand all
+                      </button>
+                      {currentUser.isAdmin && (
+                        <button
+                          type="button"
+                          className="settings-persona-auto-adopt"
+                          onClick={() => handleAutoAdopt('user')}
+                          disabled={autoAdoptBusy}
+                          title="Set every persona's model / effort to VIC's recommendation for its current provider (e.g. a fast model for QA test-file writing, a strong one for the Analyst). Doesn't change which provider a persona uses."
+                        >
+                          {autoAdoptBusy ? 'Applying…' : 'Auto-adopt recommended models'}
+                        </button>
+                      )}
+                    </div>
+                    {autoAdoptResult && <p className="settings-section-note">{autoAdoptResult}</p>}
+                  </>
+                )}
+
                 {personaLists.user.map((persona) => (
                   <PersonaCard
                     key={persona.id}
                     scope="user"
                     persona={persona}
                     editable={currentUser.isAdmin}
+                    collapsed={!isPersonaExpanded('user', persona.id)}
+                    onToggleCollapsed={() => togglePersonaExpanded('user', persona.id)}
                     savedId={savedId}
                     errorById={errorById}
                     currentPersonaValue={currentPersonaValue}
@@ -802,12 +953,37 @@ export function SettingsScreen({
                   above. Backs the pipeline when you run it.
                 </p>
 
+                {personaLists.admin.length > 0 && (
+                  <>
+                    <div className="settings-persona-list-actions">
+                      <button type="button" onClick={() => collapseAllPersonas('admin')}>
+                        Collapse all
+                      </button>
+                      <button type="button" onClick={() => expandAllPersonas('admin')}>
+                        Expand all
+                      </button>
+                      <button
+                        type="button"
+                        className="settings-persona-auto-adopt"
+                        onClick={() => handleAutoAdopt('admin')}
+                        disabled={autoAdoptBusy}
+                        title="Set every persona's model / effort to VIC's recommendation for its current provider. Doesn't change which provider a persona uses."
+                      >
+                        {autoAdoptBusy ? 'Applying…' : 'Auto-adopt recommended models'}
+                      </button>
+                    </div>
+                    {autoAdoptResult && <p className="settings-section-note">{autoAdoptResult}</p>}
+                  </>
+                )}
+
                 {personaLists.admin.map((persona) => (
                   <PersonaCard
                     key={persona.id}
                     scope="admin"
                     persona={persona}
                     editable
+                    collapsed={!isPersonaExpanded('admin', persona.id)}
+                    onToggleCollapsed={() => togglePersonaExpanded('admin', persona.id)}
                     savedId={savedId}
                     errorById={errorById}
                     currentPersonaValue={currentPersonaValue}

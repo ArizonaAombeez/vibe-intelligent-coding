@@ -1,12 +1,14 @@
 import path from 'node:path'
 import { readdir } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { elementSubfolderName, sourceTreeRoot } from 'vic-coding'
+import { elementSubfolderName, INTERPRETER_BY_EXTENSION, TEST_FILE_SUFFIX_PATTERN, sourceTreeRoot } from 'vic-coding'
 import { connectedPairs } from 'vic-requirements-elicitation'
 import type { Project, TestCase, TestCaseOutcome, TestRegressionRun, TestRun, SwTestOutcome } from 'vic-requirements-elicitation'
 import { resolveExecutionScope } from './executionScopeGate.js'
 import { runTestCommand } from './testRunner.js'
 import { applyPassThreshold } from './requirementStatusFlip.js'
+import { testCaseFilePointerInvalid } from './reconcileTestCaseFiles.js'
 
 function elementSubfolderById(project: Project): Map<string, string> {
   const map = new Map<string, string>()
@@ -26,14 +28,9 @@ function elementSubfolderById(project: Project): Map<string, string> {
 // ones actually observed in real generated projects so far — extend this
 // map if a project introduces a new test language, not by resurrecting a
 // stored RUN: command.
-const INTERPRETER_BY_EXTENSION: Record<string, string> = {
-  '.mjs': 'node',
-  '.cjs': 'node',
-  '.js': 'node',
-  '.py': 'python',
-}
-
-const TEST_FILE_SUFFIX_PATTERN = /\.test\.[^./\\]+$/
+// INTERPRETER_BY_EXTENSION and TEST_FILE_SUFFIX_PATTERN now come from
+// vic-coding (see testFilePattern.ts) so the test-generation prompt, the
+// coding prompt, and this runner cannot drift on which files are runnable.
 
 // Recursively finds every "*.test.<ext>" file under an element's (or
 // interface pair's) own scoped subfolder — an element's generated tests can
@@ -51,6 +48,27 @@ async function findTestFiles(dir: string): Promise<string[]> {
     } else if (entry.isFile() && TEST_FILE_SUFFIX_PATTERN.test(entry.name)) {
       files.push(full)
     }
+  }
+  return files
+}
+
+// The harness element (the composition root) owns the project-level entry
+// point, not a package of its own — its scoped subfolder (_harness/) holds
+// only docs/markers, so a plain findTestFiles there always comes back empty
+// even when the harness run wrote real cross-cutting tests. Those land
+// either at the source-tree root (alongside index.html/main.js) or inside
+// _harness/ itself. Sweep both, but do NOT descend into the sibling element
+// or _shared-interfaces subfolders — each of those has its own
+// element-scoped run and would otherwise be counted twice in a full
+// regression.
+async function findHarnessTestFiles(srcRoot: string, harnessCwd: string): Promise<string[]> {
+  const files: string[] = []
+  for (const entry of await readdir(srcRoot, { withFileTypes: true })) {
+    if (!entry.isFile() || !TEST_FILE_SUFFIX_PATTERN.test(entry.name)) continue
+    files.push(path.join(srcRoot, entry.name))
+  }
+  if (path.resolve(harnessCwd) !== path.resolve(srcRoot) && existsSync(harnessCwd)) {
+    files.push(...(await findTestFiles(harnessCwd)))
   }
   return files
 }
@@ -99,6 +117,34 @@ function activeTestsForScope(
   return tests.filter((t) => t.architectureElementId === architectureElementId)
 }
 
+// Last-line-of-defence heal for the specific set of test cases about to be
+// attributed in THIS scope: any that still point at a since-deleted file
+// have that dead pointer cleared and are reset to 'not-run', and the
+// cleared pointers are returned so the caller can record them on the
+// TestRun (missingFiles) and in rawLog — making the loss visible rather
+// than silently produce no outcome forever.
+//
+// The primary defence is reconcileTestCaseFiles wired into every mutation
+// entry point (coding runs, deletes, re-scaffold); this stays because it is
+// the only place that also feeds run.missingFiles for the UI badge, and
+// because a test run is a legitimate independent re-check. Uses the shared
+// testCaseFilePointerInvalid rule so "this pointer is unusable" has one
+// definition (covers both a missing file and a non-test-file path).
+function reconcileMissingTestFiles(
+  testCases: TestCase[],
+  srcRoot: string,
+): Array<{ testCaseId: string; filePath: string }> {
+  const missing: Array<{ testCaseId: string; filePath: string }> = []
+  for (const testCase of testCases) {
+    if (!testCaseFilePointerInvalid(testCase, srcRoot)) continue
+    missing.push({ testCaseId: testCase.id, filePath: testCase.filePath! })
+    testCase.filePath = undefined
+    testCase.status = 'not-run'
+    testCase.lastRunAt = undefined
+  }
+  return missing
+}
+
 // Path headers ("diff --git a/<path> b/<path>") from a Coding run's stored
 // diff text — the only persisted record of exactly which files a Step 5
 // coding run touched (CodingRun itself keeps the diff, not a separate file
@@ -132,7 +178,11 @@ function stepFiveTestFilesForScope(project: Project, architectureElementId: stri
   const paths = new Set<string>()
   if (!architectureElementId) return paths
   for (const run of project.codingRuns ?? []) {
-    if (run.architectureElementId !== architectureElementId || run.status !== 'success' || !run.diff) continue
+    // 'success-tests-failing' (T3): code + a test file were still produced
+    // and committed, so its diff's test files belong in the SW-test sweep
+    // (they'll just report red).
+    const produced = run.status === 'success' || run.status === 'success-tests-failing'
+    if (run.architectureElementId !== architectureElementId || !produced || !run.diff) continue
     for (const p of pathsTouchedByDiff(run.diff)) {
       if (TEST_FILE_SUFFIX_PATTERN.test(p)) paths.add(`${run.allowedSubfolder}/${p}`)
     }
@@ -186,6 +236,31 @@ function requireTestRuns(project: Project): TestRun[] {
 export interface RunElementTestSuiteScope {
   architectureElementId?: string
   interfaceElementIds?: [string, string]
+  // Which kind of test file to actually run/report:
+  //  - 'requirement': only files that belong to a Step-4 TestCase
+  //    (requirement-traced). Populates `outcomes`; carries `swOutcomes`
+  //    forward unchanged from this scope's previous run.
+  //  - 'sw': only files the Step-5 coding agent wrote (or any file with no
+  //    owning TestCase). Populates `swOutcomes`; carries `outcomes` forward.
+  //  - undefined (default): run everything, populate both — the behaviour
+  //    the full-regression pass and the per-group "Run Group" buttons want.
+  // This is what makes the two "Run All" buttons on the Test Execution
+  // screen do different things instead of both running every file.
+  only?: 'requirement' | 'sw'
+}
+
+// The most recent element-scoped TestRun for exactly this scope, or
+// undefined. Used to carry the untouched column's outcomes forward on a
+// filtered run so the UI's "latest run for scope" still shows both.
+function previousRunForScope(project: Project, scope: RunElementTestSuiteScope): TestRun | undefined {
+  const runs = (project.testRuns ?? []).filter((r) => {
+    if (scope.interfaceElementIds) {
+      const key = [...scope.interfaceElementIds].sort().join('|')
+      return r.interfaceElementIds && [...r.interfaceElementIds].sort().join('|') === key
+    }
+    return r.architectureElementId === (scope.architectureElementId ?? null) && !r.interfaceElementIds
+  })
+  return runs.sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]
 }
 
 // Element-scoped test run (Area F, resolved) — resolves scope (rejects
@@ -230,6 +305,9 @@ export async function runElementTestSuite(
   const resolved = resolveExecutionScope(entity, elementSubfolderById(project), srcRoot)
 
   if ('rejected' in resolved) {
+    // A filtered run against an unscaffolded scope must still not wipe the
+    // other column's last-known results.
+    const prev = scope.only ? previousRunForScope(project, scope) : undefined
     const run: TestRun = {
       id: `TESTRUN-${startedAt}-${randomUUID()}`,
       kind: 'element-scoped',
@@ -242,19 +320,59 @@ export async function runElementTestSuite(
         resolved.rejected === 'scope-not-found'
           ? 'This element/interface pair has not been scaffolded/coded yet — nothing to test.'
           : 'Could not resolve a single element/interface scope for this test run.',
-      outcomes: [],
-      swOutcomes: [],
+      outcomes: scope.only === 'sw' ? prev?.outcomes ?? [] : [],
+      swOutcomes: scope.only === 'requirement' ? prev?.swOutcomes ?? [] : [],
     }
     requireTestRuns(project).push(run)
     return run
   }
 
   const testCases = activeTestsForScope(project.testSuite, scope.architectureElementId, scope.interfaceElementIds)
-  const testFiles = await findTestFiles(resolved.cwd)
-  const { results, skipped } = await runTestFiles(resolved.cwd, testFiles)
+
+  // Heal any test case still pointing at a since-deleted generated file
+  // before attribution runs — otherwise it produces no outcome and its
+  // requirement is stuck forever with nothing to explain why.
+  const missingFiles = reconcileMissingTestFiles(testCases, srcRoot)
+
+  const isHarnessScope =
+    !!scope.architectureElementId &&
+    (project.architecture?.elements ?? []).some(
+      (e) => e.id === scope.architectureElementId && e.kind === 'harness',
+    )
+  const allTestFiles = isHarnessScope
+    ? await findHarnessTestFiles(srcRoot, resolved.cwd)
+    : await findTestFiles(resolved.cwd)
 
   const stepFiveTestFiles = stepFiveTestFilesForScope(project, scope.architectureElementId)
-  const { outcomes, swOutcomes } = attributeResults(testCases, results, srcRoot, stepFiveTestFiles)
+
+  // Apply the requirement/sw filter (if any) to the file list BEFORE
+  // running — no point executing files whose result this run won't report.
+  const testCaseAbsPaths = new Set(
+    testCases.filter((t) => t.filePath).map((t) => path.resolve(srcRoot, t.filePath!)),
+  )
+  function fileIsRequirementTraced(abs: string): boolean {
+    return testCaseAbsPaths.has(path.resolve(abs))
+  }
+  function fileIsSwTest(abs: string): boolean {
+    const rel = path.relative(srcRoot, abs).split(path.sep).join('/')
+    return stepFiveTestFiles.has(rel) || !fileIsRequirementTraced(abs)
+  }
+  const testFiles =
+    scope.only === 'requirement'
+      ? allTestFiles.filter(fileIsRequirementTraced)
+      : scope.only === 'sw'
+        ? allTestFiles.filter(fileIsSwTest)
+        : allTestFiles
+
+  const runCwd = isHarnessScope ? srcRoot : resolved.cwd
+  const { results, skipped } = await runTestFiles(runCwd, testFiles)
+
+  const attributed = attributeResults(testCases, results, srcRoot, stepFiveTestFiles)
+  let outcomes = attributed.outcomes
+  let swOutcomes = attributed.swOutcomes
+
+  // Update each TestCase's own status only from outcomes THIS run actually
+  // produced — do this before the carry-forward below swaps in stale data.
   for (const outcome of outcomes) {
     const testCase = testCases.find((t) => t.id === outcome.testCaseId)
     if (testCase) {
@@ -263,13 +381,46 @@ export async function runElementTestSuite(
     }
   }
 
+  // On a filtered run, keep the OTHER column's last-known results so the
+  // UI's single "latest run for this scope" lookup still shows both.
+  if (scope.only) {
+    const prev = previousRunForScope(project, scope)
+    if (scope.only === 'requirement') swOutcomes = prev?.swOutcomes ?? []
+    if (scope.only === 'sw') outcomes = prev?.outcomes ?? []
+  }
+
   const allPassed = results.length > 0 && results.every((r) => r.passed)
   const rawLogSections = results.map((r) => `--- ${path.relative(srcRoot, r.filePath)} ---\n${r.output}`)
   if (skipped.length > 0) {
     rawLogSections.push(`(no interpreter known for: ${skipped.map((f) => path.relative(srcRoot, f)).join(', ')})`)
   }
   if (results.length === 0 && skipped.length === 0) {
-    rawLogSections.push('No test files found in this scope.')
+    // T1.5(c): distinguish "this scope has no test files at all" from "this
+    // scope has test files but none is linked to a test case" — the latter
+    // is the Worm 2 failure (15 test cases with no generated automation) and
+    // needs a fix hint, not a bare "nothing found".
+    if (scope.only === 'requirement' && allTestFiles.length > 0) {
+      const ungenerated = testCases.filter((t) => !t.filePath).length
+      rawLogSections.push(
+        `${allTestFiles.length} test file(s) exist in this scope but none is linked to a test case` +
+          (ungenerated > 0
+            ? `, and ${ungenerated} of this scope's test case(s) have no generated file yet. Generate test-case automations on the Test Creation tab, then re-run.`
+            : `. The generated files may have been renamed since — regenerate them on the Test Creation tab.`),
+      )
+    } else {
+      rawLogSections.push(
+        isHarnessScope
+          ? 'No harness-level test files found (checked the source-tree root and _harness/). Each element and interface pair is tested by its own scoped run.'
+          : 'No test files found in this scope.',
+      )
+    }
+  }
+  if (missingFiles.length > 0) {
+    rawLogSections.push(
+      `(${missingFiles.length} test case file(s) recorded but missing from disk — reset to "not generated", regenerate via Generate Test File: ${missingFiles
+        .map((m) => `${m.testCaseId} -> ${m.filePath}`)
+        .join(', ')})`,
+    )
   }
 
   const run: TestRun = {
@@ -283,6 +434,7 @@ export async function runElementTestSuite(
     rawLog: rawLogSections.join('\n\n'),
     outcomes,
     swOutcomes,
+    missingFiles,
   }
   requireTestRuns(project).push(run)
 
@@ -355,7 +507,11 @@ export async function runFullRegression(
     startedAt,
     finishedAt: new Date().toISOString(),
     runIds: runs.map((r) => r.id),
-    allPassed: allOutcomes.every((o) => o.passed),
+    // T1.5(a): a regression over zero requirement-traced outcomes is NOT a
+    // pass — `[].every()` is true, which used to paint "Last full
+    // regression passed" green while not one requirement test had run.
+    allPassed: allOutcomes.length > 0 && allOutcomes.every((o) => o.passed),
+    outcomeCount: allOutcomes.length,
     trigger,
   }
   requireRegressionRuns(project).push(regressionRun)

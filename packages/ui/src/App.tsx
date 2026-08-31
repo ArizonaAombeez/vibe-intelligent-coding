@@ -11,6 +11,8 @@ import type {
   VicUser,
 } from './api/types'
 import { createHttpApi, setCurrentUserIdForApi } from './api/httpApi'
+import { pendingNavForLink, type PendingChatNav } from './navigation/chatLinkNav'
+import type { ChatMessageLink } from './api/types'
 import { TopBar } from './components/TopBar'
 import { Sidebar } from './components/Sidebar'
 import { StatusStrip } from './components/StatusStrip'
@@ -85,6 +87,11 @@ function App({ api: injectedApi }: AppProps) {
   const [project, setProject] = useState<OpenProjectResult | null>(null)
   const [activePhase, setActivePhase] = useState<PhaseId>('dashboard')
   const [activeSubstep, setActiveSubstep] = useState<string | null>(null)
+  // Set when a chat link chip is clicked — switches the phase tab and is
+  // handed to the destination screen, which applies it to its own local
+  // selection then calls onChatNavConsumed to clear it. Screens ignore a
+  // pending nav whose kind isn't theirs.
+  const [pendingChatNav, setPendingChatNav] = useState<PendingChatNav | null>(null)
   const [architectureType, setArchitectureType] = useState<ArchitectureTypeId | null>(null)
   const [currentOperation, setCurrentOperation] = useState<CurrentOperation>({ text: null })
   const [sidebarNarrow, setSidebarNarrow] = useState(false)
@@ -234,6 +241,15 @@ function App({ api: injectedApi }: AppProps) {
     setActiveSubstep(null)
   }, [])
 
+  const handleChatNavigate = useCallback((link: ChatMessageLink) => {
+    const nav = pendingNavForLink(link)
+    setActivePhase(nav.phase as PhaseId)
+    setActiveSubstep(null)
+    setPendingChatNav(nav)
+  }, [])
+
+  const handleChatNavConsumed = useCallback(() => setPendingChatNav(null), [])
+
   const handleProjectSettingsChange = useCallback((settings: OpenProjectResult['settings']) => {
     setProject((prev) => (prev ? { ...prev, settings } : prev))
   }, [])
@@ -315,6 +331,9 @@ function App({ api: injectedApi }: AppProps) {
               onOpenSettings={() => setSettingsOpen(true)}
               projectMode={project.projectMode}
               importedCodePresent={project.importedCode !== undefined}
+              onChatNavigate={handleChatNavigate}
+              pendingChatNav={pendingChatNav}
+              onChatNavConsumed={handleChatNavConsumed}
             />
           ) : activePhase === 'architecture' ? (
             <ArchitectureScreen
@@ -326,6 +345,9 @@ function App({ api: injectedApi }: AppProps) {
               onOperationChange={handleOperationChange}
               onOpenSettings={() => setSettingsOpen(true)}
               projectMode={project.projectMode}
+              onChatNavigate={handleChatNavigate}
+              pendingChatNav={pendingChatNav}
+              onChatNavConsumed={handleChatNavConsumed}
             />
           ) : activePhase === 'test-creation' ? (
             <TestCreationScreen
@@ -335,6 +357,7 @@ function App({ api: injectedApi }: AppProps) {
               settings={project.settings}
               onSettingsChange={handleProjectSettingsChange}
               onOpenSettings={() => setSettingsOpen(true)}
+              onChatNavigate={handleChatNavigate}
             />
           ) : activePhase === 'coding' ? (
             <CodingScreen
@@ -349,6 +372,9 @@ function App({ api: injectedApi }: AppProps) {
               projectId={project.projectId}
               onOperationChange={handleOperationChange}
               onOpenSettings={() => setSettingsOpen(true)}
+              onChatNavigate={handleChatNavigate}
+              pendingChatNav={pendingChatNav}
+              onChatNavConsumed={handleChatNavConsumed}
             />
           ) : (
             <PhasePlaceholder phase={activePhaseInfo} activeSubstep={activeSubstep} />

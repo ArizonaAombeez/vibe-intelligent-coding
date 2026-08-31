@@ -1,5 +1,8 @@
 .architecture-screen {
-  padding: 32px;
+  /* No bottom padding: the split layout below must reach all the way down to
+     the status bar. Inner panels (focus view, grid scroll) provide their own
+     breathing room. */
+  padding: 32px 32px 0;
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -40,6 +43,26 @@
   font-weight: 600;
   cursor: pointer;
   padding: 4px 0;
+}
+
+.architecture-overview-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.architecture-overview-header-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  font-size: 13px;
+  color: var(--text-muted, #888);
+  white-space: nowrap;
+}
+
+.architecture-overview-header-meta strong {
+  color: var(--text-h);
 }
 
 .architecture-overview-body {
@@ -147,6 +170,23 @@
 .architecture-type-card-description {
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* Delete affordance on user-added custom platform cards (project harness feature) */
+.architecture-platform-delete {
+  float: right;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.architecture-platform-delete:hover {
+  background: var(--bg-alt);
+  color: var(--text-h);
+}
+.architecture-platform-selector {
+  margin-top: 12px;
 }
 
 .architecture-screen-note {
@@ -272,6 +312,7 @@
   flex: 1;
   display: flex;
   min-height: 0;
+  padding-bottom: 12px;
 }
 
 .architecture-left-col {
@@ -311,10 +352,23 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
+  padding: 8px 12px 12px;
   border: 1px solid var(--border);
   border-radius: 12px;
   background: var(--bg-alt);
+}
+
+.architecture-migration-plan-panel {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--bg-alt);
+  max-height: 40vh;
+  overflow-y: auto;
 }
 
 .architecture-action-box .architecture-action-bar {
@@ -331,8 +385,8 @@
 }
 
 .architecture-req-list-panel {
-  flex: 1;
-  min-height: 120px;
+  flex: 1 1 auto;
+  min-height: 200px;
   display: flex;
   flex-direction: column;
   border: 1px solid var(--border);
@@ -341,14 +395,65 @@
   background: var(--bg);
 }
 
+.architecture-req-list-panel.architecture-section-collapsed {
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
 .architecture-req-list-heading {
   flex-shrink: 0;
   margin: 0;
-  padding: 10px 12px;
+  padding: 4px 8px;
   font-size: 13px;
   color: var(--text-h);
   border-bottom: 1px solid var(--border);
   background: var(--bg-alt);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.architecture-req-list-panel.architecture-section-collapsed .architecture-req-list-heading {
+  border-bottom: none;
+}
+
+/* Collapsible section header — shared by Actions / Requirements / Migration
+   Plan in the left column, so a squeezed Requirements list can be given
+   room by folding the panels around it. */
+.architecture-section-toggle {
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 6px 4px;
+  margin: 0;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-h);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+
+.architecture-section-toggle-caret {
+  color: var(--text-muted);
+  font-size: 11px;
+  width: 12px;
+  display: inline-block;
+}
+
+.architecture-action-box.architecture-section-collapsed,
+.architecture-migration-plan-panel.architecture-section-collapsed {
+  gap: 0;
+  padding-bottom: 0;
+}
+
+/* The panel supplies its own "Migration Plan" section header now — drop the
+   component's built-in h1 to avoid showing the title twice. */
+.architecture-migration-plan-panel .planning-screen h1 {
+  display: none;
 }
 
 .architecture-req-list-unallocated-count {

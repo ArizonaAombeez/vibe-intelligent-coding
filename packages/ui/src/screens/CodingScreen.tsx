@@ -6,13 +6,12 @@ import type {
   CurrentOperation,
   ElementRequirementCoverage,
   Requirement,
-  Status,
   TestRegressionRun,
   VicCoreApi,
 } from '../api/types'
 import { toOperationError } from '../api/errorCode'
-import { REQUIREMENT_STATUS_LABEL, STATUS_COLOR, STATUS_LABEL } from '../statusColor'
-import { formatCodingLog } from './formatCodingLog'
+import { REQUIREMENT_STATUS_LABEL, STATUS_COLOR } from '../statusColor'
+import { formatCodingLog, digestCodingLog } from './formatCodingLog'
 import { HighlightedCode, HighlightedLine, langForFilePath } from './highlightCode'
 import type { CodeLang } from './highlightCode'
 import './RequirementsScreen.css'
@@ -102,6 +101,78 @@ function FormattedLog({ text }: { text: string }) {
   )
 }
 
+// The structured breakdown shown at the top of the live panel and (for a
+// finished run) above the raw log: which files the agent has written so far,
+// what it's currently thinking, and any tool errors. Built from the same
+// run log the raw view uses, so it works for both the Claude Code and
+// OpenCode backends (both now stream normalised JSON event lines).
+function CodingLogDigestView({ text }: { text: string }) {
+  const digest = digestCodingLog(text)
+  const hasAnything =
+    digest.filesChanged.length > 0 || digest.thoughts.length > 0 || digest.toolErrors.length > 0
+  if (!hasAnything) return null
+  return (
+    <div className="coding-log-digest">
+      {digest.filesChanged.length > 0 && (
+        <div className="coding-log-digest-section">
+          <h4>Files changed ({digest.filesChanged.length})</h4>
+          <ul>
+            {digest.filesChanged.map((f) => (
+              <li key={f}>{f}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {digest.toolErrors.length > 0 && (
+        <div className="coding-log-digest-section coding-log-digest-errors">
+          <h4>Tool errors ({digest.toolErrors.length})</h4>
+          <ul>
+            {digest.toolErrors.map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {digest.thoughts.length > 0 && (
+        <div className="coding-log-digest-section">
+          <h4>Latest thinking</h4>
+          <p className="coding-log-digest-thought">{digest.thoughts[digest.thoughts.length - 1]}</p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// Pass/fail summary of the coding-level (SW) tests that ran as part of a
+// finished Coding run — shown whether they passed or failed, so "the tests
+// ran and are green" is as visible as "the tests failed".
+function SwTestResultView({ result }: { result: NonNullable<CodingRun['swTestResult']> }) {
+  return (
+    <div className={`coding-sw-test-result${result.passed ? '' : ' coding-sw-test-result-failed'}`}>
+      <div className="coding-sw-test-result-heading">
+        <span
+          className="coding-status-dot"
+          style={{ background: result.passed ? 'var(--status-green)' : 'var(--status-red)' }}
+        />
+        Coding-level tests: {result.passed ? 'all passed' : 'FAILED'} ({result.filesRun} file
+        {result.filesRun === 1 ? '' : 's'})
+      </div>
+      {result.files.map((f) => (
+        <details key={f.name} className="coding-sw-test-file" open={!f.passed}>
+          <summary>
+            <span
+              className="coding-status-dot"
+              style={{ background: f.passed ? 'var(--status-green)' : 'var(--status-red)' }}
+            />
+            {f.name} — {f.passed ? 'passed' : 'failed'}
+          </summary>
+          <pre>{f.output || '(no output)'}</pre>
+        </details>
+      ))}
+    </div>
+  )
+}
+
 function formatMs(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`
   const seconds = ms / 1000
@@ -173,18 +244,78 @@ function DiffView({ diff }: { diff: string }) {
   )
 }
 
-// An element's rollup status, derived the same way ArchitectureScreen.tsx's
-// deriveElementStatus already does — not-started (nothing allocated),
-// blocked (any allocated requirement is tested-fail), complete (every
-// allocated requirement is 'complete'), else in-progress. No conflict input
-// here (Coding doesn't track architecture conflicts), unlike Architecture's
-// own richer version.
-function deriveElementStatus(elementId: string, requirements: Requirement[]): Status {
+// An element's rollup status for the Coding screen. Distinct from
+// ArchitectureScreen's version: here the reader specifically wants to see
+// "has this element been coded yet" move off amber the moment a Coding run
+// succeeds for it — not stay amber until the whole downstream
+// test+regression pipeline reaches 'complete'. States:
+//   not-started  — nothing allocated / never coded
+//   blocked      — a Coding run for it failed, or an allocated req is tested-fail
+//   coded        — every allocated requirement has reached at least 'coded'
+//                  (a successful Coding run happened since it last changed),
+//                  but the test/regression pipeline hasn't finished
+//   complete     — every allocated requirement is 'complete'
+//   in-progress  — some but not all allocated requirements are coded
+type CodingElementStatus = 'not-started' | 'in-progress' | 'coded' | 'blocked' | 'complete'
+
+const CODING_STATUS_COLOR: Record<CodingElementStatus, string> = {
+  'not-started': 'var(--status-grey)',
+  'in-progress': 'var(--status-amber)',
+  coded: 'var(--status-blue, #3b82f6)',
+  blocked: 'var(--status-red)',
+  complete: 'var(--status-green)',
+}
+
+const CODING_STATUS_LABEL: Record<CodingElementStatus, string> = {
+  'not-started': 'Not coded',
+  'in-progress': 'Coding in progress',
+  coded: 'Coded',
+  blocked: 'Blocked',
+  complete: 'Complete',
+}
+
+const CODED_OR_BEYOND: ReadonlySet<Requirement['status']> = new Set([
+  'coded',
+  'tested',
+  'complete',
+])
+
+function deriveElementStatus(
+  elementId: string,
+  requirements: Requirement[],
+  runs: CodingRun[],
+): CodingElementStatus {
   const allocated = requirements.filter((r) => r.architectureElements.includes(elementId))
-  if (allocated.length === 0) return 'not-started'
+  const elementRuns = runs.filter((r) => r.architectureElementId === elementId)
+  const latestRun = [...elementRuns].sort((a, b) => b.startedAt.localeCompare(a.startedAt))[0]
+
+  // A T3 loop that ran to its cap without the element's own tests passing
+  // (or a requirement left uncovered) — real code landed, but it is not
+  // done. Same 'blocked' treatment as cli-error / rejected-no-tests.
+  const BLOCKING_RUN_STATUSES: ReadonlySet<CodingRun['status']> = new Set([
+    'cli-error',
+    'rejected-no-tests',
+    'success-tests-failing',
+  ])
+
+  if (allocated.length === 0) {
+    // Harness or a not-yet-allocated element — reflect the run history only.
+    if (!latestRun) return 'not-started'
+    if (latestRun.status === 'success') return 'coded'
+    if (BLOCKING_RUN_STATUSES.has(latestRun.status)) return 'blocked'
+    return 'not-started'
+  }
+
   if (allocated.some((r) => r.status === 'tested-fail')) return 'blocked'
+  if (latestRun && BLOCKING_RUN_STATUSES.has(latestRun.status)) {
+    return 'blocked'
+  }
   if (allocated.every((r) => r.status === 'complete')) return 'complete'
-  return 'in-progress'
+  if (allocated.every((r) => CODED_OR_BEYOND.has(r.status))) return 'coded'
+  if (allocated.some((r) => CODED_OR_BEYOND.has(r.status)) || latestRun?.status === 'success') {
+    return 'in-progress'
+  }
+  return 'not-started'
 }
 
 export function CodingScreen({ api, projectId, onOperationChange }: CodingScreenProps) {
@@ -193,6 +324,7 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
   const [runs, setRuns] = useState<CodingRun[]>([])
   const [sourceRoot, setSourceRoot] = useState<string | null>(null)
   const [sourceFiles, setSourceFiles] = useState<Array<{ path: string; size: number }>>([])
+  const [projectPlatform, setProjectPlatform] = useState<string | null>(null)
   const [previewFilePath, setPreviewFilePath] = useState<string | null>(null)
   const [previewText, setPreviewText] = useState<string | null>(null)
   const [previewTextError, setPreviewTextError] = useState<string | null>(null)
@@ -350,12 +482,13 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
 
   async function reload() {
     try {
-      const [a, reqs, r, c, tree] = await Promise.all([
+      const [a, reqs, r, c, tree, platform] = await Promise.all([
         api.getArchitecture(projectId),
         api.listRequirements(projectId),
         api.listCodingRuns(projectId),
         api.getCodingConventions(projectId),
         api.getSourceTree(projectId),
+        api.getProjectPlatform(projectId),
       ])
       setArchitecture(a)
       setRequirements(reqs)
@@ -363,6 +496,7 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
       setConventions(c)
       setSourceRoot(tree.root)
       setSourceFiles(tree.files)
+      setProjectPlatform(platform)
       setLoadError(null)
     } catch (err) {
       setLoadError(toOperationError(err).error ?? 'Failed to load Coding data.')
@@ -467,39 +601,89 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
     }
   }
 
-  // Rebuilds every element in the list from scratch, one at a time (not in
-  // parallel — each run is a real CLI invocation against the same shared
-  // source tree, so concurrent runs would race on the same git repo/files).
-  // Each element's own code folder is wiped before that element's run, same
-  // as a single-element from-scratch rebuild — the agent writes fresh code
-  // instead of reviewing/keeping whatever was there. Stops on the first
-  // failure rather than plowing through the rest, same as a single Update
-  // Code run surfaces its error via onOperationChange.
+  // Rebuilds every element from scratch, one at a time (not in parallel —
+  // each run is a real CLI invocation against the same shared source tree,
+  // so concurrent runs would race on the same git repo/files). Each
+  // element's own code folder is wiped before its run.
+  //
+  // Robustness rules learned from real batches:
+  //  - The Harness wires every other element, so it is coded LAST, and NOT
+  //    from-scratch (fromScratch is a no-op for it — runHarnessCoding gates
+  //    on platform + harness spec, not a folder wipe).
+  //  - A single element failing (CLI error, rejected, or an HTTP error)
+  //    must NOT abort the rest of the batch — it's recorded and the loop
+  //    moves on. Losing every remaining element because element #2 hiccuped
+  //    is the exact "NOT ACCEPTABLE" outcome this replaces.
+  //  - A corrupt architecture with >1 kind:'harness' element is refused
+  //    up front rather than coding both.
   async function handleCodeAll() {
     if (busy || elements.length === 0) return
+
+    const harnessElements = elements.filter((e) => e.kind === 'harness')
+    if (harnessElements.length > 1) {
+      onOperationChange({
+        text: null,
+        error: `This architecture has ${harnessElements.length} Harness elements — that should never happen. Delete the duplicate on the Architecture screen before running Code All.`,
+      })
+      return
+    }
+    const nonHarness = elements.filter((e) => e.kind !== 'harness')
+    const ordered = [...nonHarness, ...harnessElements] // harness last
+
     if (
       !window.confirm(
-        'Code every element from scratch? This deletes everything currently in each element\'s code folder before writing fresh code — the agent won\'t see (or be able to keep) any existing implementation.',
+        `Code all ${ordered.length} element(s) from scratch? Each non-Harness element's code folder is wiped before it is rebuilt — the agent won't see (or keep) any existing implementation. The Harness is coded last. The batch continues even if an individual element fails.`,
       )
     ) {
       return
     }
     setBusy(true)
+    const failures: string[] = []
+    let succeeded = 0
     try {
-      for (const element of elements) {
-        onOperationChange({ text: `Coding ${element.id}...` })
+      for (let i = 0; i < ordered.length; i++) {
+        const element = ordered[i]
+        const isHarness = element.kind === 'harness'
+        onOperationChange({ text: `Coding ${element.name} (${i + 1}/${ordered.length})...` })
         const runToken = crypto.randomUUID()
         const stopPolling = pollRunLog(element.id, runToken)
         try {
-          await api.runCoding(projectId, element.id, runToken, true, true)
+          // Harness: recode=true so its requirements-regression path is a
+          // no-op but the run is allowed; fromScratch=false (ignored anyway).
+          const { codingRun } = await api.runCoding(
+            projectId,
+            element.id,
+            runToken,
+            true,
+            !isHarness,
+          )
+          if (codingRun.status === 'success') {
+            succeeded += 1
+          } else if (codingRun.status === 'success-tests-failing') {
+            failures.push(
+              `${element.name}: code written but tests didn't pass after ${codingRun.iterations ?? '?'} attempt(s) — open it to see the failing tests`,
+            )
+          } else {
+            failures.push(`${element.name}: ${codingRun.status}`)
+          }
+        } catch (err) {
+          // HTTP-level failure for THIS element — record and keep going.
+          failures.push(`${element.name}: ${toOperationError(err).error ?? 'request failed'}`)
         } finally {
           stopPolling()
         }
       }
       await reload()
-      onOperationChange({ text: null })
-    } catch (err) {
-      onOperationChange(toOperationError(err))
+      onOperationChange({
+        text:
+          failures.length === 0
+            ? `Coded all ${succeeded} element(s).`
+            : null,
+        error:
+          failures.length > 0
+            ? `Coded ${succeeded}/${ordered.length}. ${failures.length} did not succeed — ${failures.join('; ')}. Open each on the left to see its run and retry.`
+            : undefined,
+      })
     } finally {
       setLiveLogElementId(null)
       setBusy(false)
@@ -570,7 +754,7 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
             Scaffold source tree
           </button>
           <button type="button" onClick={handleCodeAll} disabled={busy || elements.length === 0 || !!projectLock}>
-            Code All
+            Code All Elements
           </button>
           <button
             type="button"
@@ -580,6 +764,20 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
           >
             {testFullAppBusy ? 'Testing full app...' : 'Test Full App'}
           </button>
+          {projectPlatform === 'web' && (
+            <button
+              type="button"
+              onClick={() => window.open(api.previewUrl(projectId), '_blank', 'noopener')}
+              disabled={!sourceFiles.some((f) => f.path === 'index.html')}
+              title={
+                sourceFiles.some((f) => f.path === 'index.html')
+                  ? 'Opens the generated site served over http in a new tab. ES modules load correctly this way — opening index.html as a file:// path does not.'
+                  : 'Run the Harness first — it writes the index.html entry point this serves.'
+              }
+            >
+              Run Local
+            </button>
+          )}
           {fullAppTestResult && (
             <span
               className="coding-full-app-result"
@@ -591,6 +789,14 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
             </span>
           )}
         </div>
+        {fullAppTestResult && !fullAppTestResult.allPassed && (
+          <div className="coding-run-banner coding-run-banner-cli-error">
+            Some tests failed.{' '}
+            <strong>Next:</strong> open the <strong>Test Execution</strong> screen to see which element / interface
+            pairs failed and triage them, or fix the code here and run <strong>Update Code</strong> on the affected
+            element, then re-test.
+          </div>
+        )}
         <label className="coding-conventions-label">
           Coding conventions
           <textarea
@@ -687,7 +893,7 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
       <div className="coding-layout">
         <ul className="coding-story-list">
           {elements.map((element) => {
-            const status = deriveElementStatus(element.id, requirements)
+            const status = deriveElementStatus(element.id, requirements, runs)
             const allocatedCount = requirements.filter(
               (r) => !r.deletedAt && r.architectureElements.includes(element.id),
             ).length
@@ -699,12 +905,18 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
                 }
                 onClick={() => setSelectedElementId(element.id)}
               >
-                <span className="coding-status-dot" style={{ background: STATUS_COLOR[status] }} />
+                <span className="coding-status-dot" style={{ background: CODING_STATUS_COLOR[status] }} />
                 <span className="coding-story-title">{element.name}</span>
-                <span className="coding-status-badge" style={{ background: STATUS_COLOR[status] }}>
-                  {STATUS_LABEL[status]}
+                <span className="coding-status-badge" style={{ background: CODING_STATUS_COLOR[status] }}>
+                  {CODING_STATUS_LABEL[status]}
                 </span>
-                {allocatedCount === 0 && <span className="coding-warning-badge">No requirements</span>}
+                {element.kind === 'harness' ? (
+                  <span className="coding-harness-badge" title="The composition root (entry point + element wiring). It has no requirements of its own by design — code it once a Platform is chosen and Define Harness has been run on the Architecture screen.">
+                    Harness
+                  </span>
+                ) : (
+                  allocatedCount === 0 && <span className="coding-warning-badge">No requirements</span>
+                )}
               </li>
             )
           })}
@@ -737,10 +949,23 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
               </div>
               <p className="coding-hint">{selectedElement.responsibility}</p>
 
+              {selectedElement.kind === 'harness' && (
+                <div className="coding-run-banner coding-run-banner-info">
+                  This is the <strong>Harness</strong> — the project's single entry point and the wiring between every
+                  other element. It has no requirements of its own. To code it, first choose a <strong>Platform</strong>{' '}
+                  and run <strong>Define Harness</strong> on the Architecture screen; then use <strong>Update Code</strong>{' '}
+                  here.
+                </div>
+              )}
+
               <div className="coding-element-requirements">
                 <h3 className="coding-code-check-heading">Allocated requirements</h3>
                 {selectedElementRequirements.length === 0 ? (
-                  <p className="coding-hint">No requirements currently allocated to this element.</p>
+                  <p className="coding-hint">
+                    {selectedElement.kind === 'harness'
+                      ? 'The Harness has no allocated requirements by design (see above).'
+                      : 'No requirements currently allocated to this element.'}
+                  </p>
                 ) : (
                   <ul className="coding-element-requirement-list">
                     {selectedElementRequirements.map((r) => (
@@ -780,7 +1005,7 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
                 <div className="coding-live-log">
                   <div className="coding-live-log-heading">
                     <span className="coding-live-log-dot" />
-                    Coding in progress…
+                    Coding {selectedElement.name}…
                     {liveLogMsSinceActivity >= STALE_ACTIVITY_MS ? (
                       <span className="coding-live-log-stale">
                         {' '}
@@ -798,14 +1023,38 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
                       {cancelBusy ? 'Cancelling…' : 'Cancel run'}
                     </button>
                   </div>
-                  <pre ref={liveLogRef}>{liveLog ? <FormattedLog text={liveLog} /> : 'Waiting for output...'}</pre>
+                  <div className="coding-live-log-body">
+                    <CodingLogDigestView text={liveLog} />
+                    <div className="coding-live-log-activity">
+                      <h4>Activity</h4>
+                      <pre ref={liveLogRef}>{liveLog ? <FormattedLog text={liveLog} /> : 'Waiting for output…'}</pre>
+                    </div>
+                  </div>
                 </div>
               ) : latestRunForSelected ? (
                 <>
                   {latestRunForSelected.status !== 'success' && (
                     <div className={`coding-run-banner coding-run-banner-${latestRunForSelected.status}`}>
-                      {latestRunForSelected.status === 'rejected-not-eligible' &&
-                        "None of this element's allocated requirements are pending — nothing for Coding to do."}
+                      {latestRunForSelected.status === 'rejected-not-eligible' && (
+                        // The server puts the real, element-specific reason in
+                        // rawLog (e.g. the Harness gate: "run Define Harness
+                        // first", "no platform selected"). Show it instead of a
+                        // one-size-fits-all message that's wrong for the
+                        // Harness (which never has requirements by design).
+                        <>
+                          {latestRunForSelected.rawLog?.trim()
+                            ? latestRunForSelected.rawLog.trim()
+                            : "None of this element's allocated requirements are pending — nothing for Coding to do."}
+                        </>
+                      )}
+                      {latestRunForSelected.status === 'rejected-no-tests' && (
+                        <>
+                          The code was written and committed, but the agent didn't produce a runnable{' '}
+                          <code>*.test.*</code> file for this element — SW tests are mandatory. This run does{' '}
+                          <strong>not</strong> count as complete: click <strong>Update Code</strong> again to have it
+                          add the tests.
+                        </>
+                      )}
                       {latestRunForSelected.status === 'rejected-scope' && (
                         <>
                           The CLI wrote outside its allowed scope — those changes were reverted.
@@ -820,10 +1069,26 @@ export function CodingScreen({ api, projectId, onOperationChange }: CodingScreen
                       )}
                       {latestRunForSelected.status === 'rejected-empty-output' &&
                         "The coding agent finished without writing any code, so nothing was committed. If this followed a Recode from scratch, the previous implementation was restored rather than left deleted."}
+                      {latestRunForSelected.status === 'success-tests-failing' && (
+                        <>
+                          The code was written and committed over{' '}
+                          <strong>{latestRunForSelected.iterations ?? '?'}</strong> attempt(s), but the coding loop
+                          stopped ({latestRunForSelected.stoppedBecause ?? 'unknown'}) before the element's own
+                          tests passed{latestRunForSelected.iterationHistory?.at(-1)?.uncoveredRequirementIds?.length
+                            ? ' and every requirement was covered'
+                            : ''}
+                          . This does <strong>not</strong> count as complete — requirement status has not advanced.
+                          See the failing tests below, then click <strong>Update Code</strong> to resume.
+                        </>
+                      )}
                       {latestRunForSelected.status === 'cli-error' && 'The coding agent CLI run failed. See the raw log below.'}
                     </div>
                   )}
                   <RunTimingSummary run={latestRunForSelected} />
+                  {latestRunForSelected.swTestResult && (
+                    <SwTestResultView result={latestRunForSelected.swTestResult} />
+                  )}
+                  <CodingLogDigestView text={latestRunForSelected.rawLog} />
                   <DiffView diff={latestRunForSelected.diff} />
                   <details className="coding-raw-log">
                     <summary>Raw output</summary>

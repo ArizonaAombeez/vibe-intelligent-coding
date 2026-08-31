@@ -190,6 +190,81 @@ export const personas: PersonaInfo[] = [
   { id: 'qa', label: 'QA (Test Creation/Execution)', defaultPluginId: null, supportsAgentLevel: false },
 ]
 
+// --- Per-persona model recommendations -------------------------------
+//
+// Which model (and reasoning knobs) suits each persona's workload best,
+// per provider family. Surfaced in Settings > Personas as a "Recommended:
+// …" hint next to each field, and applied in one click by the "Auto-adopt
+// recommended models" button (PUT /api/settings/personas/auto-adopt).
+//
+// Rationale by persona:
+//  - analyst / architect / code-gap-scan / pm: single-shot document
+//    reasoning over natural-language text. Benefits from a strong model,
+//    not a fast one — a weak model here produces vague requirements /
+//    shallow architecture that costs far more downstream than the latency
+//    saved. Recommend the provider's flagship, thinking ON.
+//  - qa: writing ONE small self-contained test file per call. Narrow,
+//    well-specified, short output, and the result is executed so a subtly
+//    wrong test is caught rather than shipped. This is the ideal case for
+//    a fast/cheap model — the bottleneck is the agent streaming the file
+//    token-by-token, and a frontier model there just burns latency.
+//    Recommend the fastest capable model, thinking OFF / low effort.
+//  - dev: multi-file agentic coding — needs real capability. Recommend a
+//    strong coding model, moderate effort. (Agent-level delegation is left
+//    to the user.)
+//
+// Keyed by personaId -> pluginId -> { values, why }. Only providers with a
+// meaningful choice are listed; a persona/plugin pair not present here
+// simply has no recommendation shown.
+export interface PersonaModelRecommendation {
+  // Field values to write (keys must match the plugin's
+  // personaOverridableFields — anything unknown is ignored on apply).
+  values: Record<string, string>
+  // One-line human rationale shown in the UI.
+  why: string
+}
+
+export const PERSONA_MODEL_RECOMMENDATIONS: Record<string, Record<string, PersonaModelRecommendation>> = {
+  analyst: {
+    'vic-llm-glm': { values: { model: 'glm-4.7', thinking: 'enabled' }, why: 'Requirements reasoning wants a strong model with thinking on; GLM-4.7 is the reliable default.' },
+    'vic-llm-claude-code': { values: { model: 'sonnet', effort: 'high' }, why: 'Sonnet 5 at high effort for careful requirements analysis.' },
+  },
+  architect: {
+    'vic-llm-glm': { values: { model: 'glm-4.7', thinking: 'enabled' }, why: 'Architecture decisions benefit from deeper reasoning; GLM-4.7 with thinking on.' },
+    'vic-llm-claude-code': { values: { model: 'sonnet', effort: 'high' }, why: 'Sonnet 5 at high effort for architecture trade-offs.' },
+  },
+  'code-gap-scan': {
+    'vic-llm-glm': { values: { model: 'glm-4.7', thinking: 'enabled' }, why: 'Scanning source for missing requirements needs comprehension, not speed.' },
+    'vic-llm-claude-code': { values: { model: 'sonnet', effort: 'medium' }, why: 'Sonnet 5, medium effort — thorough but not exhaustive.' },
+  },
+  pm: {
+    'vic-llm-glm': { values: { model: 'glm-4.7', thinking: 'enabled' }, why: 'Planning reasoning over the whole project; strong model, thinking on.' },
+    'vic-llm-claude-code': { values: { model: 'sonnet', effort: 'medium' }, why: 'Sonnet 5, medium effort for planning.' },
+  },
+  qa: {
+    'vic-llm-claude-code': {
+      values: { model: 'haiku', effort: 'low' },
+      why: 'Test files are short, well-specified, and executed after generation — Haiku 4.5 at low effort is fastest and quality risk is low.',
+    },
+    'vic-llm-glm': {
+      values: { model: 'glm-4.7', thinking: 'disabled' },
+      why: 'File-writing is the bottleneck — GLM-4.7 (fastest reliable GLM) with thinking OFF, since the test is executed afterwards to catch mistakes.',
+    },
+  },
+  dev: {
+    'vic-llm-claude-code': { values: { model: 'sonnet', effort: 'high' }, why: 'Multi-file agentic coding needs real capability; Sonnet 5 at high effort.' },
+    'vic-llm-glm': { values: { model: 'glm-4.7', thinking: 'enabled' }, why: 'GLM-4.7 is the fastest reliable GLM coder; keep thinking on for multi-file work.' },
+  },
+}
+
+export function personaModelRecommendation(
+  personaId: string,
+  pluginId: string | null | undefined,
+): PersonaModelRecommendation | undefined {
+  if (!pluginId) return undefined
+  return PERSONA_MODEL_RECOMMENDATIONS[personaId]?.[pluginId]
+}
+
 export function findPluginManifest(pluginId: string): PluginSettingsManifest | undefined {
   return installedPluginManifests.find((m) => m.id === pluginId)
 }

@@ -172,14 +172,15 @@ test('generateTestFileForTestCase: a CLI-level failure returns status cli-error'
   }
 })
 
-test('generateTestFileForTestCase: the first-ever generation call establishes project.testCommand from the agent\'s declared RUN: line', async () => {
-  process.env.FAKE_CLAUDE_MODE = 'write-in-scope-declare-run-command'
-  process.env.FAKE_CLAUDE_WRITE_PATH = 'login-ui/login.test.ts'
-  process.env.FAKE_CLAUDE_RUN_LINE = 'RUN: node test.mjs ./index.html'
+test('generateTestFileForTestCase: filePath is the test file, not git\'s alphabetically-first changed path (T1.2)', async () => {
+  process.env.FAKE_CLAUDE_MODE = 'write-in-scope-multi'
+  // index.html sorts before nav.test.mjs — the old changedInScope[0] would
+  // have recorded the .html here (this is the exact Worm 2 TEST-003 bug).
+  process.env.FAKE_CLAUDE_SUPPORT_PATH = 'login-ui/index.html'
+  process.env.FAKE_CLAUDE_WRITE_PATH = 'login-ui/nav.test.mjs'
   const dir = await tempProjectDir()
   try {
     const project = baseProject()
-    assert.equal(project.testCommand, undefined)
     const testCase = functionalTestCase()
     const client = new ClaudeCodeAgentClient()
 
@@ -189,64 +190,11 @@ test('generateTestFileForTestCase: the first-ever generation call establishes pr
     })
 
     assert.equal(result.status, 'success')
-    assert.deepEqual(project.testCommand, { command: 'node', args: ['test.mjs', './index.html'] })
+    assert.equal(result.testCase.filePath, 'login-ui/nav.test.mjs')
   } finally {
     await rm(dir, { recursive: true, force: true })
+    delete process.env.FAKE_CLAUDE_SUPPORT_PATH
     delete process.env.FAKE_CLAUDE_WRITE_PATH
-    delete process.env.FAKE_CLAUDE_RUN_LINE
-  }
-})
-
-test('generateTestFileForTestCase: a declared RUN: line matching the existing project default does not create a per-element override', async () => {
-  process.env.FAKE_CLAUDE_MODE = 'write-in-scope-declare-run-command'
-  process.env.FAKE_CLAUDE_WRITE_PATH = 'login-ui/login.test.ts'
-  process.env.FAKE_CLAUDE_RUN_LINE = 'RUN: npx vitest run'
-  const dir = await tempProjectDir()
-  try {
-    const project = baseProject()
-    project.testCommand = { command: 'npx', args: ['vitest', 'run'] }
-    const testCase = functionalTestCase()
-    const client = new ClaudeCodeAgentClient()
-
-    await generateTestFileForTestCase(project, dir, testCase, client, { binary: 'node', binaryArgs: [fixture] })
-
-    // Still the project default, untouched — and no marker-file override
-    // was written for this element (readElementTestCommand would otherwise
-    // pick it up ahead of the project default).
-    assert.deepEqual(project.testCommand, { command: 'npx', args: ['vitest', 'run'] })
-    const { readElementTestCommand } = await import('../src/index.js')
-    const resolved = await readElementTestCommand(sourceTreeRoot(dir), 'login-ui', project.testCommand)
-    assert.deepEqual(resolved, { command: 'npx', args: ['vitest', 'run'] })
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_CLAUDE_WRITE_PATH
-    delete process.env.FAKE_CLAUDE_RUN_LINE
-  }
-})
-
-test('generateTestFileForTestCase: a declared RUN: line that deviates from the project default is stored as a per-element override', async () => {
-  process.env.FAKE_CLAUDE_MODE = 'write-in-scope-declare-run-command'
-  process.env.FAKE_CLAUDE_WRITE_PATH = 'login-ui/login.test.ts'
-  process.env.FAKE_CLAUDE_RUN_LINE = 'RUN: python -m pytest'
-  const dir = await tempProjectDir()
-  try {
-    const project = baseProject()
-    project.testCommand = { command: 'npx', args: ['vitest', 'run'] }
-    const testCase = functionalTestCase()
-    const client = new ClaudeCodeAgentClient()
-
-    await generateTestFileForTestCase(project, dir, testCase, client, { binary: 'node', binaryArgs: [fixture] })
-
-    // Project-wide default is untouched by this element's deviation...
-    assert.deepEqual(project.testCommand, { command: 'npx', args: ['vitest', 'run'] })
-    // ...but this element now resolves to its own override ahead of it.
-    const { readElementTestCommand } = await import('../src/index.js')
-    const resolved = await readElementTestCommand(sourceTreeRoot(dir), 'login-ui', project.testCommand)
-    assert.deepEqual(resolved, { command: 'python', args: ['-m', 'pytest'] })
-  } finally {
-    await rm(dir, { recursive: true, force: true })
-    delete process.env.FAKE_CLAUDE_WRITE_PATH
-    delete process.env.FAKE_CLAUDE_RUN_LINE
   }
 })
 

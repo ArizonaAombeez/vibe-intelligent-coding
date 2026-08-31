@@ -35,6 +35,7 @@ import {
   findRequirementReferences,
   applySplitRequirement,
   setArchitectureType,
+  ensureHarnessElement,
   createArchitectureElement,
   updateArchitectureElement,
   deleteArchitectureElement,
@@ -50,12 +51,14 @@ import {
   checkInterfaceConflict,
   defineInterfaceDefinition,
   defineAllInterfaceDefinitions,
+  deriveHarnessSpec,
   setInterfaceDefinition,
   reconcileElementInterface,
   checkInterfaces,
   nextFreeColumn,
   EXTERNAL_CONTEXT_ROW,
   ARCHITECTURE_TYPES,
+  BUILT_IN_PLATFORMS,
   getProjectSettings,
   updateProjectSettings,
   estimateAnalysisTokens,
@@ -75,10 +78,12 @@ import {
   chatWithQATestExecution,
   classifyAndDispatchUserReportedIssue,
   formatCodeContextForTriage,
+  formatArchitectureForTriage,
   importLegacyTestCases,
   deleteImportedTestCase,
   type ArchitectureTypeId,
   type ArchitectureElementKind,
+  type PlatformDescriptor,
   type PhaseTabGating,
   type Project,
   type LlmCallOptions,
@@ -94,6 +99,13 @@ import {
   type CodeStripOptions,
   type UnitTestMode,
   type InterfaceContractOperation,
+  type ChatSession,
+  type ChatSurface,
+  type ChatMessage,
+  type ChatMessageLink,
+  type TestCase,
+  type UserReportedIssueDispatch,
+  computePhaseReadiness,
 } from 'vic-requirements-elicitation'
 import { generateMigrationPlan } from 'vic-planning'
 import type { GlmAccessMethod } from 'vic-llm-glm'
@@ -117,6 +129,7 @@ import {
   runFullRegression,
   evaluateRequirementStatus,
   scopeReadinessEntries,
+  reconcileTestCaseFiles,
 } from 'vic-testing'
 import JSZip from 'jszip'
 import path from 'node:path'
@@ -126,6 +139,7 @@ import { randomUUID } from 'node:crypto'
 import { SecretsStore } from './secretsStore.js'
 import { PersonaSettingsStore, type PersonaScope } from './personaSettingsStore.js'
 import { GlobalSeqStore } from './globalSeqStore.js'
+import { PlatformStore } from './platformStore.js'
 import { ServerSettingsStore } from './serverSettingsStore.js'
 import { UsersStore } from './usersStore.js'
 import {
@@ -143,6 +157,7 @@ import {
   personas,
   findPluginManifest,
   findInstalledPlugin,
+  personaModelRecommendation,
   CLI_BACKED_PLUGIN_IDS,
   codingAgentClient,
   openCodeAgentClient,
@@ -197,6 +212,7 @@ const PROJECTS_ROOT_SOURCE: 'env' | 'override' | 'default' = process.env.VIC_PRO
 
 const store = new ProjectStore({ projectsRoot: PROJECTS_ROOT })
 const usersStore = new UsersStore(PROJECTS_ROOT)
+const platformStore = new PlatformStore(PROJECTS_ROOT)
 // codingAgentClient/openCodeAgentClient are options-free singletons built by
 // settingsRegistry.ts at startup — per-call model/effort/apiKey/baseUrl
 // travel through runAgentTask's options (resolved from the Dev/QA persona
@@ -468,6 +484,116 @@ async function loadProjectOr404(id: string): Promise<Project | null> {
   }
 }
 
+// Reconcile test-case files against disk + architecture after any mutation
+// that can invalidate them (coding runs, re-scaffold, element deletion,
+// test-file generation). Cheap and idempotent — see reconcileTestCaseFiles.
+// Logs what it cleared so a large sweep (e.g. after a from-scratch recode)
+// isn't silent. Callers still own store.saveProject.
+function reconcileTestCaseFilesForProject(project: Project): void {
+  const result = reconcileTestCaseFiles(project, store.projectDir(project.id))
+  if (result.cleared.length > 0) {
+    console.warn(
+      `[reconcile] project ${project.id}: cleared ${result.cleared.length} test-case filePath(s) whose file is gone: ${result.cleared
+        .map((c) => `${c.testCaseId}(${c.filePath})`)
+        .join(', ')}`,
+    )
+  }
+  if (result.orphaned.length > 0) {
+    console.warn(
+      `[reconcile] project ${project.id}: soft-deleted ${result.orphaned.length} test case(s) whose architecture element no longer exists: ${result.orphaned
+        .map((c) => c.testCaseId)
+        .join(', ')}`,
+    )
+  }
+}
+
+// ---- Persistent chat (ChatSession) helpers -------------------------------
+// The store migration guarantees project.chatSessions is always an array,
+// but every accessor here still coalesces so a hand-edited project.json
+// can't crash a route.
+
+const CHAT_SURFACES: ChatSurface[] = ['analyst', 'architect', 'qa-creation', 'qa-execution']
+
+function chatSessionsOf(project: Project): ChatSession[] {
+  if (!Array.isArray(project.chatSessions)) project.chatSessions = []
+  return project.chatSessions
+}
+
+function newChatMessage(role: ChatMessage['role'], text: string, extra?: Partial<ChatMessage>): ChatMessage {
+  return {
+    id: randomUUID(),
+    role,
+    text,
+    createdAt: new Date().toISOString(),
+    ...extra,
+  }
+}
+
+// Resolves the session a chat route should append to. Returns null (not an
+// error) when sessionId is absent — the route then behaves statelessly,
+// exactly as before persistence existed. Throws only when a sessionId is
+// given but doesn't match a live (non-archived) session on the right
+// surface, so a stale client can't silently write into the wrong tab.
+function resolveChatSession(project: Project, surface: ChatSurface, sessionId: unknown): ChatSession | null {
+  if (typeof sessionId !== 'string' || !sessionId) return null
+  const session = chatSessionsOf(project).find((s) => s.id === sessionId && s.surface === surface && !s.archivedAt)
+  if (!session) throw new Error(`chat session ${sessionId} not found for surface ${surface}`)
+  return session
+}
+
+// Appends the user turn and the assistant turn to a session and bumps its
+// updatedAt. Returns the two persisted messages so the route can hand them
+// straight back to the client without a re-fetch.
+function appendChatTurn(
+  session: ChatSession,
+  userText: string,
+  assistantText: string,
+  assistantExtra?: Partial<ChatMessage>,
+): { userMessage: ChatMessage; assistantMessage: ChatMessage } {
+  const userMessage = newChatMessage('user', userText)
+  const assistantMessage = newChatMessage('assistant', assistantText, assistantExtra)
+  session.messages.push(userMessage, assistantMessage)
+  session.updatedAt = assistantMessage.createdAt
+  return { userMessage, assistantMessage }
+}
+
+// Builds the clickable link chips carried on a QA assistant message from a
+// dispatch verdict. Labels are denormalised here (from the project's
+// current state) so a chip still reads sensibly after the target is
+// renamed/deleted; the UI nav helper handles a since-deleted target.
+function buildDispatchLinks(
+  project: Project,
+  dispatch: UserReportedIssueDispatch,
+  test: TestCase | undefined,
+): ChatMessageLink[] {
+  const links: ChatMessageLink[] = []
+  const elements = project.architecture?.elements ?? []
+  const elementLabel = (id: string) => elements.find((e) => e.id === id)?.name ?? id
+
+  if (dispatch.verdict === 'requirement-issue' && dispatch.dispatchedTo) {
+    const req = project.requirements.find((r) => r.id === dispatch.dispatchedTo)
+    links.push({ kind: 'requirement', id: dispatch.dispatchedTo, label: req ? req.text.slice(0, 80) : dispatch.dispatchedTo })
+  }
+
+  if (dispatch.verdict === 'test-case-failure' && test) {
+    links.push({ kind: 'testCase', id: test.id, label: test.title })
+  }
+
+  // For a code failure: the element(s) actually flagged for re-code, plus
+  // any advisory suspects the LLM named that weren't among them.
+  const dispatchedIds = dispatch.verdict === 'code-failure' && dispatch.dispatchedTo
+    ? dispatch.dispatchedTo.split(',').map((s) => s.trim()).filter(Boolean)
+    : []
+  const seen = new Set<string>()
+  for (const id of [...dispatchedIds, ...dispatch.suspectedElementIds]) {
+    if (seen.has(id)) continue
+    seen.add(id)
+    links.push({ kind: 'element', id, label: elementLabel(id) })
+  }
+
+  return links
+}
+
 // Where this server instance is actually storing data right now, what's
 // driving that (env var / a persisted Settings-screen override / the
 // shared-drive default), and — separately — what override is currently
@@ -655,13 +781,30 @@ app.post('/api/projects/:id/analyst-chat', async (req, res) => {
     res.status(400).json({ error: 'message is required' })
     return
   }
+  let session: ChatSession | null
+  try {
+    session = resolveChatSession(project, 'analyst', req.body?.sessionId)
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message })
+    return
+  }
   try {
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'analyst')
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'analyst')
     const result = await chatWithAnalyst(project, llmClient, message, llmOptions)
     recordTokenUsage(result.usage)
-    res.json({ reply: result.reply, proposedRequirements: result.proposedRequirements })
+    let persisted: { userMessage: ChatMessage; assistantMessage: ChatMessage } | undefined
+    if (session) {
+      persisted = appendChatTurn(session, message, result.reply)
+      await store.saveProject(project)
+    }
+    res.json({
+      reply: result.reply,
+      proposedRequirements: result.proposedRequirements,
+      userMessage: persisted?.userMessage,
+      assistantMessage: persisted?.assistantMessage,
+    })
   } catch (err) {
     sendLlmError(res, err)
   }
@@ -1055,6 +1198,177 @@ app.get('/api/architecture-types', async (_req, res) => {
   res.json(ARCHITECTURE_TYPES)
 })
 
+// ---- Project platforms (project harness feature) ----
+
+app.get('/api/platforms', async (_req, res) => {
+  res.json([...BUILT_IN_PLATFORMS, ...(await platformStore.listCustom())])
+})
+
+app.post('/api/platforms', async (req, res) => {
+  const { label, entryPointHint, wiringHint, lifecycleHint } = req.body ?? {}
+  if ([label, entryPointHint, wiringHint, lifecycleHint].some((v) => typeof v !== 'string' || !v.trim())) {
+    res.status(400).json({ error: 'label, entryPointHint, wiringHint and lifecycleHint are all required' })
+    return
+  }
+  try {
+    const descriptor = await platformStore.addCustom({
+      label,
+      entryPointHint,
+      wiringHint,
+      lifecycleHint,
+      createdBy: (await resolveUserDisplayName(req)) ?? 'unknown',
+    })
+    res.status(201).json(descriptor)
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message })
+  }
+})
+
+app.delete('/api/platforms/:id', async (req, res) => {
+  try {
+    await platformStore.deleteCustom(req.params.id)
+    res.status(204).end()
+  } catch (err) {
+    res.status(400).json({ error: (err as Error).message })
+  }
+})
+
+app.get('/api/projects/:id/platform', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  res.json(project.platform ?? null)
+})
+
+// Shared by the "Define Harness" route and the platform-set route (T2.1).
+// Derives the harness spec if — and only if — the architecture has real
+// elements to compose and the spec is currently missing or was derived for
+// a different platform. Returns what happened so a caller can surface a
+// non-fatal derivation error without failing its own primary action.
+// NEVER throws: an Architect LLM failure here must not roll back the user's
+// platform choice or their explicit Define-Harness click.
+async function ensureHarnessSpec(
+  project: Project,
+  req: express.Request,
+  { force = false }: { force?: boolean } = {},
+): Promise<{ derived: boolean; skippedReason?: string; error?: string }> {
+  if (!project.architecture) return { derived: false, skippedReason: 'no-architecture' }
+  const platform = await platformStore.resolve(project.platform)
+  if (!platform) return { derived: false, skippedReason: 'no-platform' }
+  const others = project.architecture.elements.filter((e) => e.kind !== 'harness')
+  if (others.length === 0) return { derived: false, skippedReason: 'no-elements' }
+
+  const harness = project.architecture.elements.find((e) => e.kind === 'harness')
+  const spec = harness?.harnessSpec
+  const upToDate = !!spec && spec.derivedForPlatform === project.platform
+  if (upToDate && !force) return { derived: false, skippedReason: 'already-current' }
+
+  try {
+    const personaScope = await resolvePersonaScope(req)
+    const llmClient = await getClientForPersona(personaScope, 'architect')
+    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
+    const result = await deriveHarnessSpec(project, llmClient, platform, llmOptions)
+    recordTokenUsage(result.usage)
+    return { derived: true }
+  } catch (err) {
+    return { derived: false, error: (err as Error).message }
+  }
+}
+
+app.put('/api/projects/:id/platform', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const platformId = req.body?.platformId
+  if (typeof platformId !== 'string') {
+    res.status(400).json({ error: 'platformId must be a string' })
+    return
+  }
+  const resolved = await platformStore.resolve(platformId)
+  if (!resolved) {
+    res.status(400).json({ error: 'platformId is not a known built-in or custom platform' })
+    return
+  }
+  const platformChanged = project.platform !== platformId
+  project.platform = platformId
+  // T2.1: setting the platform now auto-derives the harness spec for it, so
+  // the Architecture phase is actually complete after this one action and
+  // Coding the Harness isn't silently refused later. force only when the
+  // platform actually changed (a re-PUT of the same platform shouldn't spend
+  // another Architect call). Best-effort — a derivation failure is reported
+  // to the UI (which falls back to the manual Define Harness button) but
+  // never rolls back the platform choice.
+  const harnessResult = await ensureHarnessSpec(project, req, { force: platformChanged })
+  await store.saveProject(project)
+  res.json({
+    platform: platformId,
+    harnessSpecDerived: harnessResult.derived,
+    ...(harnessResult.error ? { harnessSpecError: harnessResult.error } : {}),
+  })
+})
+
+// "Branch to a new project on platform change" (project harness feature).
+// Deep-copies the project (incl. src/) into a new project whose name is
+// suffixed with the new platform, clears the copy's now-invalid derived
+// state, and renames the ORIGINAL project's display name (not its on-disk
+// folder) with its old platform suffix.
+app.post('/api/projects/:id/branch-platform', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const newPlatformId = req.body?.platformId
+  if (typeof newPlatformId !== 'string') {
+    res.status(400).json({ error: 'platformId must be a string' })
+    return
+  }
+  const newPlatform = await platformStore.resolve(newPlatformId)
+  if (!newPlatform) {
+    res.status(400).json({ error: 'platformId is not a known platform' })
+    return
+  }
+  const oldPlatform = await platformStore.resolve(project.platform)
+  const slug = (p: PlatformDescriptor | undefined, fallback: string) =>
+    (p?.label ?? fallback).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || fallback
+
+  const runToken = randomUUID()
+  try {
+    acquireProjectRunLock(project.id, runToken, { userId: await resolveUserDisplayName(req), cancel: () => {} })
+  } catch (err) {
+    if (err instanceof ProjectRunLockedError) {
+      res.status(409).json({ error: 'This project is busy — try again once the current run finishes.', code: 'project-run-locked' })
+      return
+    }
+    throw err
+  }
+  try {
+    const originalName = project.name
+    const newName = `${originalName}-${slug(newPlatform, 'new')}`
+    const newProject = await store.copyProject(project.id, newName, (clone) => {
+      clone.platform = newPlatformId
+      const harness = clone.architecture?.elements.find((e) => e.kind === 'harness')
+      if (harness) harness.harnessSpec = undefined
+      clone.codingRuns = []
+      clone.elementCodeChecks = []
+      clone.testRuns = []
+      clone.testRegressionRuns = []
+    })
+    // Rename the original's display name only — the on-disk folder is the
+    // project id, referenced everywhere.
+    const renamedOriginal = await store.renameProject(project.id, `${originalName}-${slug(oldPlatform, 'previous')}`)
+    res.json({ originalProject: renamedOriginal, newProject })
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message })
+  } finally {
+    releaseProjectRunLock(project.id, runToken)
+  }
+})
+
 app.get('/api/projects/:id/architecture-type', async (req, res) => {
   const project = await loadProjectOr404(req.params.id)
   if (!project) {
@@ -1093,6 +1407,16 @@ app.get('/api/projects/:id/architecture', async (req, res) => {
   if (!project) {
     res.status(404).json({ error: 'project not found' })
     return
+  }
+  // Self-heal a project that ended up with a duplicate harness (a pre-fix
+  // architecture import). ensureHarnessElement dedupes; persist only if it
+  // actually changed something.
+  if (project.architecture) {
+    const before = project.architecture.elements.length
+    ensureHarnessElement(project)
+    if (project.architecture.elements.length !== before) {
+      await store.saveProject(project)
+    }
   }
   res.json(project.architecture ?? null)
 })
@@ -1157,6 +1481,10 @@ app.delete('/api/projects/:id/architecture/elements/:elementId', async (req, res
   }
   try {
     deleteArchitectureElement(project, req.params.elementId)
+    // The deleted element's own test cases now trace to nothing and their
+    // generated files may be gone — soft-delete / clear them so they stop
+    // showing in Test Creation and Test Execution.
+    reconcileTestCaseFilesForProject(project)
     await store.saveProject(project)
     res.status(204).end()
   } catch (err) {
@@ -1286,16 +1614,30 @@ app.post('/api/projects/:id/architecture/chat', async (req, res) => {
     res.status(400).json({ error: 'message is required' })
     return
   }
+  let session: ChatSession | null
+  try {
+    session = resolveChatSession(project, 'architect', req.body?.sessionId)
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message })
+    return
+  }
   try {
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'architect')
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
     const result = await chatWithArchitect(project, llmClient, message, llmOptions)
     recordTokenUsage(result.usage)
+    let persisted: { userMessage: ChatMessage; assistantMessage: ChatMessage } | undefined
+    if (session) {
+      persisted = appendChatTurn(session, message, result.reply)
+      await store.saveProject(project)
+    }
     res.json({
       reply: result.reply,
       proposedElements: result.proposedElements,
       proposedInterfaces: result.proposedInterfaces,
+      userMessage: persisted?.userMessage,
+      assistantMessage: persisted?.assistantMessage,
     })
   } catch (err) {
     sendLlmError(res, err)
@@ -1520,8 +1862,49 @@ app.post('/api/projects/:id/architecture/interfaces/define-all', async (req, res
     const force = req.body?.force === true
     const result = await defineAllInterfaceDefinitions(project, llmClient, llmOptions, force)
     recordTokenUsage(result.usage)
+    // T2.1(iii): interface definitions feed the harness spec's
+    // linkRealisations, so an already-derived spec is now stale. Re-derive
+    // it here (force) if a platform is set — keeps the Architecture phase
+    // "done" after the natural define-interfaces step. Best-effort.
+    let harnessSpecReDerived = false
+    if (project.platform && project.architecture?.elements.some((e) => e.kind === 'harness' && e.harnessSpec)) {
+      const hr = await ensureHarnessSpec(project, req, { force: true })
+      harnessSpecReDerived = hr.derived
+    }
     await store.saveProject(project)
-    res.json({ definitions: result.definitions })
+    res.json({ definitions: result.definitions, harnessSpecReDerived })
+  } catch (err) {
+    sendLlmError(res, err)
+  }
+})
+
+// "Define Harness" (project harness feature) — one Architect LLM call that
+// derives how this project's harness realises its entry point, element
+// instantiation, inter-element links and run lifecycle on the selected
+// platform, storing the result on the harness element's harnessSpec.
+app.post('/api/projects/:id/architecture/harness/define', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  if (!project.architecture) {
+    res.status(400).json({ error: 'Project has no architecture — select an Architecture type first' })
+    return
+  }
+  const platform = await platformStore.resolve(project.platform)
+  if (!platform) {
+    res.status(400).json({ error: 'Select a platform for this project before defining the Harness' })
+    return
+  }
+  try {
+    const personaScope = await resolvePersonaScope(req)
+    const llmClient = await getClientForPersona(personaScope, 'architect')
+    const llmOptions = await resolvePersonaLlmOptions(personaScope, 'architect')
+    const result = await deriveHarnessSpec(project, llmClient, platform, llmOptions)
+    recordTokenUsage(result.usage)
+    await store.saveProject(project)
+    res.json({ harnessSpec: result.harnessSpec })
   } catch (err) {
     sendLlmError(res, err)
   }
@@ -1577,6 +1960,11 @@ app.post('/api/projects/:id/coding/scaffold', async (req, res) => {
   }
   try {
     const result = await scaffoldProjectSourceTree(project, store.projectDir(project.id))
+    // A (re-)scaffold can change the folder layout under a test case's
+    // recorded path — reconcile so no test case is left pointing at a file
+    // that moved or is gone.
+    reconcileTestCaseFilesForProject(project)
+    await store.saveProject(project)
     res.json(result)
   } catch (err) {
     res.status(400).json({ error: (err as Error).message })
@@ -1673,10 +2061,23 @@ app.post('/api/projects/:id/architecture/elements/:elementId/run-coding', async 
       effort: llmOptions.effort,
       ...extraOptions,
       fromScratch: req.body?.fromScratch === true,
+      // Resolved here (incl. custom platforms) because runCoding can't reach
+      // the platform store itself. The harness element needs it for its
+      // entry-point/wiring hints; a non-harness element needs it for
+      // platform-specific packaging rules (e.g. 'web' => expose an
+      // index.js ES-module entry, relative .js imports only).
+      platform: await platformStore.resolve(project.platform),
       onChunk: appendLog,
       signal: abortController.signal,
     })
     project.codingRuns = [...(project.codingRuns ?? []), codingRun]
+    // Reconcile test-case files against disk after EVERY coding run, not
+    // only successful ones: a recode-from-scratch (or any run that wiped the
+    // element's subfolder) that then fails still deletes the old generated
+    // test files, and a success can replace them with differently-named
+    // ones. runFullRegression below (success only) would also catch this,
+    // but doing it unconditionally here is what closes the failure path.
+    reconcileTestCaseFilesForProject(project)
     if (codingRun.status === 'success') {
       // A successful Coding run advances every requirement allocated to
       // THIS element toward 'coded' — but per the confirmed multi-element
@@ -1935,6 +2336,18 @@ app.get('/api/projects/:id/test-suite/readiness', async (req, res) => {
   res.json(scopeReadinessEntries(project))
 })
 
+// T2.2: real, computed phase status + blockers — replaces the UI's
+// hardcoded defaultPhases() literal. Pure function over the loaded project,
+// same cheap read-only shape as test-suite/readiness above.
+app.get('/api/projects/:id/phase-readiness', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  res.json(computePhaseReadiness(project))
+})
+
 app.post('/api/projects/:id/test-suite/tests', async (req, res) => {
   const project = await loadProjectOr404(req.params.id)
   if (!project) {
@@ -2071,13 +2484,30 @@ app.post('/api/projects/:id/test-suite/chat', async (req, res) => {
     return
   }
   const architectureElementId = typeof req.body?.architectureElementId === 'string' ? req.body.architectureElementId : null
+  let session: ChatSession | null
+  try {
+    session = resolveChatSession(project, 'qa-creation', req.body?.sessionId)
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message })
+    return
+  }
   try {
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'qa')
     const llmOptions = await resolvePersonaLlmOptions(personaScope, 'qa')
     const result = await chatWithQATestCreation(project, llmClient, architectureElementId, message, llmOptions)
     recordTokenUsage(result.usage)
-    res.json({ reply: result.reply, proposedTests: result.proposedTests })
+    let persisted: { userMessage: ChatMessage; assistantMessage: ChatMessage } | undefined
+    if (session) {
+      persisted = appendChatTurn(session, message, result.reply)
+      await store.saveProject(project)
+    }
+    res.json({
+      reply: result.reply,
+      proposedTests: result.proposedTests,
+      userMessage: persisted?.userMessage,
+      assistantMessage: persisted?.assistantMessage,
+    })
   } catch (err) {
     sendLlmError(res, err)
   }
@@ -2159,9 +2589,24 @@ app.post('/api/projects/:id/test-suite/tests/:testId/generate-file', async (req,
       onChunk: appendLog,
       signal: abortController.signal,
     })
+    if (result.timing) {
+      const t = result.timing
+      console.log(
+        `[generate-test-file] ${testCase.id} status=${result.status} ` +
+          `total=${(t.msTotal / 1000).toFixed(1)}s ` +
+          `(scaffold=${t.msScaffold}ms gitInit=${t.msGitInit}ms ` +
+          `agentCli=${(t.msAgentCli / 1000).toFixed(1)}s` +
+          `${t.msToFirstAgentOutput !== undefined ? ` [firstOutput=${(t.msToFirstAgentOutput / 1000).toFixed(1)}s]` : ''} ` +
+          `scopeGate=${t.msScopeGate}ms commit=${t.msCommit}ms)`,
+      )
+    }
     if (result.status === 'success' && result.testCase.filePath) {
       testCase.filePath = result.testCase.filePath
     }
+    // A generation run works inside one element's subfolder and can
+    // legitimately replace or remove a sibling test case's file — reconcile
+    // so none is left dangling.
+    reconcileTestCaseFilesForProject(project)
     await store.saveProject(project)
     res.json(result)
   } catch (err) {
@@ -2318,11 +2763,16 @@ app.post('/api/projects/:id/test-suite/run-element', async (req, res) => {
     res.status(404).json({ error: 'project not found' })
     return
   }
-  const { architectureElementId, interfaceElementIds } = req.body ?? {}
+  const { architectureElementId, interfaceElementIds, only } = req.body ?? {}
+  if (only !== undefined && only !== 'requirement' && only !== 'sw') {
+    res.status(400).json({ error: "only must be 'requirement', 'sw', or omitted" })
+    return
+  }
   try {
     const testRun = await runElementTestSuite(project, store.projectDir(project.id), {
       architectureElementId,
       interfaceElementIds,
+      only,
     })
     await store.saveProject(project)
     res.json({ testRun })
@@ -2405,6 +2855,13 @@ app.post('/api/projects/:id/test-runs/chat', async (req, res) => {
   }
   const testCaseId = typeof req.body?.testCaseId === 'string' ? req.body.testCaseId : null
   const runId = typeof req.body?.runId === 'string' ? req.body.runId : null
+  let session: ChatSession | null
+  try {
+    session = resolveChatSession(project, 'qa-execution', req.body?.sessionId)
+  } catch (err) {
+    res.status(404).json({ error: (err as Error).message })
+    return
+  }
   try {
     const personaScope = await resolvePersonaScope(req)
     const llmClient = await getClientForPersona(personaScope, 'qa')
@@ -2419,12 +2876,13 @@ app.post('/api/projects/:id/test-runs/chat', async (req, res) => {
     // (e.g. malformed LLM reply) still lets the conversational reply
     // through rather than failing the whole request.
     let dispatch: Awaited<ReturnType<typeof classifyAndDispatchUserReportedIssue>>['dispatch']
+    let dispatchLinks: ChatMessageLink[] = []
+    const dispatchTest = testCaseId ? project.testSuite?.tests.find((t) => t.id === testCaseId) : undefined
     if (testCaseId) {
       try {
-        const test = project.testSuite?.tests.find((t) => t.id === testCaseId)
         let codeContext: string | undefined
-        if (test?.architectureElementId) {
-          const element = project.architecture?.elements.find((e) => e.id === test.architectureElementId)
+        if (dispatchTest?.architectureElementId) {
+          const element = project.architecture?.elements.find((e) => e.id === dispatchTest.architectureElementId)
           if (element) {
             const files = await readCodeContextFiles(sourceTreeRoot(store.projectDir(project.id)), elementSubfolderName(element))
             codeContext = formatCodeContextForTriage(files)
@@ -2441,6 +2899,7 @@ app.post('/api/projects/:id/test-runs/chat', async (req, res) => {
         )
         for (const usage of dispatchResult.usage) recordTokenUsage(usage)
         dispatch = dispatchResult.dispatch
+        if (dispatch) dispatchLinks = buildDispatchLinks(project, dispatch, dispatchTest)
         if (dispatch) await store.saveProject(project)
       } catch {
         // Swallow — the conversational reply above already succeeded and
@@ -2448,10 +2907,129 @@ app.post('/api/projects/:id/test-runs/chat', async (req, res) => {
       }
     }
 
-    res.json({ reply: result.reply, dispatch })
+    // Persist the turn when the client bound this send to a chat session.
+    // The assistant message carries the dispatch metadata + link chips so
+    // reload/navigate reproduces exactly what the user saw.
+    let persisted: { userMessage: ChatMessage; assistantMessage: ChatMessage } | undefined
+    if (session) {
+      persisted = appendChatTurn(session, message, result.reply, {
+        links: dispatchLinks.length > 0 ? dispatchLinks : undefined,
+        dispatch: dispatch
+          ? {
+              verdict: dispatch.verdict,
+              rationale: dispatch.rationale,
+              dispatchedTo: dispatch.dispatchedTo,
+              suspectedElementIds: dispatch.suspectedElementIds,
+            }
+          : undefined,
+      })
+      await store.saveProject(project)
+    }
+
+    res.json({
+      reply: result.reply,
+      dispatch,
+      userMessage: persisted?.userMessage,
+      assistantMessage: persisted?.assistantMessage,
+    })
   } catch (err) {
     sendLlmError(res, err)
   }
+})
+
+// ---- Persistent chat CRUD ---------------------------------------------------
+// One ChatSession per tab in a screen's chat dock. Tabs are soft-closed
+// (PATCH archivedAt) so a transcript + its dispatch history stay auditable;
+// DELETE is a hard purge kept for completeness, not wired to the tab-close
+// affordance.
+
+app.get('/api/projects/:id/chat-sessions', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const surface = req.query.surface
+  const includeArchived = req.query.includeArchived === '1' || req.query.includeArchived === 'true'
+  let sessions = chatSessionsOf(project)
+  if (typeof surface === 'string') {
+    if (!CHAT_SURFACES.includes(surface as ChatSurface)) {
+      res.status(400).json({ error: `unknown surface ${surface}` })
+      return
+    }
+    sessions = sessions.filter((s) => s.surface === surface)
+  }
+  if (!includeArchived) sessions = sessions.filter((s) => !s.archivedAt)
+  res.json(sessions)
+})
+
+app.post('/api/projects/:id/chat-sessions', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const surface = req.body?.surface
+  if (typeof surface !== 'string' || !CHAT_SURFACES.includes(surface as ChatSurface)) {
+    res.status(400).json({ error: 'surface must be one of analyst | qa | coding' })
+    return
+  }
+  const sessions = chatSessionsOf(project)
+  const now = new Date().toISOString()
+  const existingOnSurface = sessions.filter((s) => s.surface === surface).length
+  const focus = req.body?.focus && typeof req.body.focus === 'object' ? req.body.focus : undefined
+  const session: ChatSession = {
+    id: randomUUID(),
+    surface: surface as ChatSurface,
+    title: typeof req.body?.title === 'string' && req.body.title.trim() ? req.body.title.trim() : `Chat ${existingOnSurface + 1}`,
+    focus,
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  }
+  sessions.push(session)
+  await store.saveProject(project)
+  res.status(201).json(session)
+})
+
+app.patch('/api/projects/:id/chat-sessions/:sessionId', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const session = chatSessionsOf(project).find((s) => s.id === req.params.sessionId)
+  if (!session) {
+    res.status(404).json({ error: 'chat session not found' })
+    return
+  }
+  if (typeof req.body?.title === 'string' && req.body.title.trim()) session.title = req.body.title.trim()
+  if (req.body?.focus && typeof req.body.focus === 'object') session.focus = req.body.focus
+  if ('archivedAt' in (req.body ?? {})) {
+    // Accept a client-sent timestamp or `true` (server stamps now); null/false clears it (reopen).
+    const v = req.body.archivedAt
+    session.archivedAt = v === null || v === false ? undefined : typeof v === 'string' ? v : new Date().toISOString()
+  }
+  session.updatedAt = new Date().toISOString()
+  await store.saveProject(project)
+  res.json(session)
+})
+
+app.delete('/api/projects/:id/chat-sessions/:sessionId', async (req, res) => {
+  const project = await loadProjectOr404(req.params.id)
+  if (!project) {
+    res.status(404).json({ error: 'project not found' })
+    return
+  }
+  const sessions = chatSessionsOf(project)
+  const idx = sessions.findIndex((s) => s.id === req.params.sessionId)
+  if (idx === -1) {
+    res.status(404).json({ error: 'chat session not found' })
+    return
+  }
+  sessions.splice(idx, 1)
+  await store.saveProject(project)
+  res.status(204).end()
 })
 
 // Recursively lists every file under a project's generated src/ tree
@@ -2536,6 +3114,76 @@ app.get('/api/projects/:id/source-tree/file', async (req, res) => {
   })
 })
 
+// --- Run Local preview (web platform) -------------------------------------
+// Serves a project's generated src/ tree over http so a generated Web App
+// (plain ES modules, no bundler) actually runs — opening index.html from a
+// file:// path fails because browsers give every file:// a unique opaque
+// origin and then block the module import as cross-origin. Over http the
+// whole tree shares one origin and native `import './x/index.js'` just
+// works. This is read-only static serving of the same files
+// /api/projects/:id/source-tree/file already exposes, only mounted at a
+// path a browser can treat as a site root. No build step, no framework.
+const PREVIEW_MIME_BY_EXT: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.map': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.wasm': 'application/wasm',
+  '.txt': 'text/plain; charset=utf-8',
+}
+
+async function servePreviewFile(id: string, relativePath: string, res: express.Response): Promise<void> {
+  const project = await loadProjectOr404(id)
+  if (!project) {
+    res.status(404).send('project not found')
+    return
+  }
+  const root = sourceTreeRoot(store.projectDir(project.id))
+  const fullPath = resolveWithinSourceTree(root, relativePath)
+  if (!fullPath) {
+    res.status(400).send('path escapes the project source tree')
+    return
+  }
+  const info = await stat(fullPath).catch(() => null)
+  if (!info || !info.isFile()) {
+    res.status(404).send(`not found: ${relativePath}`)
+    return
+  }
+  const mime = PREVIEW_MIME_BY_EXT[path.extname(fullPath).toLowerCase()] ?? 'application/octet-stream'
+  res.setHeader('Content-Type', mime)
+  // Never cache — the tree changes on every Coding run and the point of the
+  // preview is to see the latest.
+  res.setHeader('Cache-Control', 'no-store')
+  res.sendFile(fullPath, (err) => {
+    if (err && !res.headersSent) res.status(404).send('file not found')
+  })
+}
+
+// Express 5 ignores a trailing slash by default, so this one handler covers
+// both /preview/:id and /preview/:id/ — serve the entry point for either.
+// The client always links with the trailing slash so relative imports in
+// index.html resolve correctly regardless.
+app.get('/preview/:id', (req, res) => {
+  void servePreviewFile(req.params.id, 'index.html', res)
+})
+
+app.get('/preview/:id/*splat', (req, res) => {
+  // Express 5 hands the wildcard back as string[] (one per segment) or a
+  // string; join it into a relative path.
+  const splat = (req.params as unknown as Record<string, unknown>)['splat']
+  const joined = Array.isArray(splat) ? splat.join('/') : typeof splat === 'string' ? splat : ''
+  void servePreviewFile(req.params.id, joined.length > 0 ? joined : 'index.html', res)
+})
+
 app.get('/api/projects/:id/source-tree/download', async (req, res) => {
   const project = await loadProjectOr404(req.params.id)
   if (!project) {
@@ -2552,12 +3200,90 @@ app.get('/api/projects/:id/source-tree/download', async (req, res) => {
   for (const file of files) {
     zip.file(file.path, await readFile(path.join(root, file.path)))
   }
+
+  // Web projects are plain ES modules with no build step — a recipient must
+  // serve the folder over http (opening index.html as a file:// blocks the
+  // module imports). Bundle a zero-dependency static server + a README so
+  // "unzip and run" works with nothing but Node installed. Never overwrites
+  // a file the generated project already has at that name.
+  if (project.platform === 'web') {
+    const hasIndexHtml = files.some((f) => f.path === 'index.html')
+    if (hasIndexHtml && !files.some((f) => f.path === 'serve.mjs')) {
+      zip.file('serve.mjs', WEB_EXPORT_SERVE_SCRIPT)
+    }
+    if (!files.some((f) => f.path.toLowerCase() === 'readme.md')) {
+      zip.file('README.md', WEB_EXPORT_README)
+    }
+  }
+
   const buffer = await zip.generateAsync({ type: 'nodebuffer' })
   const filename = `${slugForFilename(project.name)}_source_${timestampForFilename()}.zip`
   res.setHeader('Content-Type', 'application/zip')
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
   res.send(buffer)
 })
+
+// Dropped into a `web` project's export zip. No dependencies — Node's own
+// http + fs. Serves the folder it lives in, with the same MIME map the
+// live preview route uses, so ES modules load correctly.
+const WEB_EXPORT_SERVE_SCRIPT = `// Zero-dependency static server for this generated web project.
+// Run:  node serve.mjs        (then open the printed URL)
+import { createServer } from 'node:http'
+import { readFile, stat } from 'node:fs/promises'
+import { extname, join, normalize } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const root = fileURLToPath(new URL('.', import.meta.url))
+const port = Number(process.env.PORT ?? 8080)
+const MIME = {
+  '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif', '.webp': 'image/webp', '.ico': 'image/x-icon',
+  '.wasm': 'application/wasm', '.txt': 'text/plain; charset=utf-8',
+}
+
+createServer(async (req, res) => {
+  try {
+    let rel = decodeURIComponent((req.url ?? '/').split('?')[0])
+    if (rel === '/' || rel === '') rel = '/index.html'
+    const full = normalize(join(root, rel))
+    if (!full.startsWith(root)) { res.statusCode = 400; return res.end('bad path') }
+    const info = await stat(full).catch(() => null)
+    if (!info || !info.isFile()) { res.statusCode = 404; return res.end('not found') }
+    res.setHeader('Content-Type', MIME[extname(full).toLowerCase()] ?? 'application/octet-stream')
+    res.setHeader('Cache-Control', 'no-store')
+    res.end(await readFile(full))
+  } catch (err) {
+    res.statusCode = 500; res.end(String(err))
+  }
+}).listen(port, () => console.log(\`Serving this project at http://localhost:\${port}/\`))
+`
+
+const WEB_EXPORT_README = `# Running this project
+
+This is a plain ES-modules web app with **no build step**. It must be served
+over http — opening \`index.html\` directly from your file system will fail,
+because browsers block module imports across \`file://\` origins.
+
+## Easiest way (Node installed)
+
+    node serve.mjs
+
+Then open the URL it prints (http://localhost:8080/ by default).
+
+## Any other static server also works, e.g.
+
+    npx serve .
+    python -m http.server 8080
+
+## Structure
+
+- \`index.html\` — entry point, loads \`main.js\` as a module
+- \`main.js\` — wires the modules together and starts the app
+- one folder per module, each exposing \`index.js\`
+`
 
 const EXPORTABLE_PART_IDS = new Set(PROJECT_PARTS.filter((p) => p.available).map((p) => p.id))
 
@@ -3349,11 +4075,26 @@ async function buildPersonaSettingsList(scope: PersonaScope) {
         ? await personaSettingsStore.getAgentValues(scope, persona.id)
         : {}
 
+      const recommendation = personaModelRecommendation(persona.id, pluginId)
+      const agentRecommendation = persona.supportsAgentLevel
+        ? personaModelRecommendation(persona.id, agentPluginId)
+        : undefined
+
       return {
         id: persona.id,
         label: persona.label,
         pluginId: pluginId ?? null,
         pluginLabel: manifest?.label,
+        // What VIC recommends for this persona given its current backing
+        // plugin — surfaced as a hint in Settings and applied by the
+        // "Auto-adopt recommended models" button. Undefined when there's no
+        // recommendation for this persona/plugin pair.
+        recommendation: recommendation
+          ? { values: recommendation.values, why: recommendation.why }
+          : undefined,
+        agentRecommendation: agentRecommendation
+          ? { values: agentRecommendation.values, why: agentRecommendation.why }
+          : undefined,
         // Every installed plugin is a valid choice for any persona — the
         // dropdown in Settings > Personas is populated from this generic
         // list, never a per-persona hardcoded set.
@@ -3491,6 +4232,48 @@ app.put('/api/settings/personas/:id', async (req, res) => {
   }
 
   res.status(204).end()
+})
+
+// "Auto-adopt recommended models" (Settings > Personas). For every persona
+// whose currently-selected backing plugin has an entry in
+// PERSONA_MODEL_RECOMMENDATIONS, writes the recommended field values
+// (model / thinking / effort / …) into that persona's overrides. Does NOT
+// change which plugin a persona uses — only the model-level knobs for the
+// plugin it already has. Applies to whichever scope the request names
+// (admin or user), admin-only, same as editing a persona directly.
+app.post('/api/settings/personas/auto-adopt', async (req, res) => {
+  const callerScope = await resolvePersonaScope(req)
+  if (callerScope !== 'admin') {
+    res.status(403).json({ error: 'only admins can edit persona settings' })
+    return
+  }
+  const requestedScope = req.body?.scope
+  if (requestedScope !== 'admin' && requestedScope !== 'user') {
+    res.status(400).json({ error: "scope must be 'admin' or 'user'" })
+    return
+  }
+  const personaScope: PersonaScope = requestedScope
+
+  const applied: Array<{ personaId: string; pluginId: string; values: Record<string, string> }> = []
+  for (const persona of personas) {
+    const pluginId = await resolvePersonaPluginId(personaScope, persona.id)
+    const recommendation = personaModelRecommendation(persona.id, pluginId)
+    if (!pluginId || !recommendation) continue
+    const manifest = findPluginManifest(pluginId)
+    const knownKeys = new Set((manifest?.personaOverridableFields ?? []).map((f) => f.key))
+    // Merge onto whatever is already set — a recommendation only names the
+    // fields it has an opinion about, and only known-and-valid keys are
+    // written.
+    const current = await personaSettingsStore.getPersonaValues(personaScope, persona.id)
+    const next = { ...current }
+    for (const [key, value] of Object.entries(recommendation.values)) {
+      if (knownKeys.has(key)) next[key] = value
+    }
+    await personaSettingsStore.setPersonaValues(personaScope, persona.id, next)
+    applied.push({ personaId: persona.id, pluginId, values: recommendation.values })
+  }
+
+  res.json({ applied })
 })
 
 // Catches anything that reaches Express without going through a route's own

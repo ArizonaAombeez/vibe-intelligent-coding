@@ -10,6 +10,8 @@ import type {
   CreateArchitectureElementFields,
   CurrentOperation,
   InterfaceContractOperation,
+  PlatformDescriptor,
+  PlatformId,
   PhaseInfo,
   ProjectMode,
   ProposedArchitectureElement,
@@ -17,10 +19,13 @@ import type {
   Requirement,
   Status,
   VicCoreApi,
+  ChatMessageLink,
 } from '../api/types'
 import { STATUS_COLOR, STATUS_LABEL } from '../statusColor'
 import { toOperationError } from '../api/errorCode'
 import { highlightRequirementIds } from './requirementIdHighlight'
+import { ChatDock } from '../components/ChatDock'
+import type { PendingChatNav } from '../navigation/chatLinkNav'
 import { ArchitectureGrid } from './ArchitectureGrid'
 import { ArchitectureElementFocusView } from './ArchitectureElementFocusView'
 import { ArchitectureRequirementList } from './ArchitectureRequirementList'
@@ -43,18 +48,12 @@ interface ArchitectureScreenProps {
   onOperationChange: (op: CurrentOperation) => void
   onOpenSettings: () => void
   projectMode: ProjectMode
-}
-
-interface ChatEntry {
-  role: 'user' | 'architect'
-  text: string
+  onChatNavigate: (link: ChatMessageLink) => void
+  pendingChatNav: PendingChatNav | null
+  onChatNavConsumed: () => void
 }
 
 const STATUS_FILTERS: Status[] = ['not-started', 'in-progress', 'blocked', 'complete']
-
-const DEFAULT_CHAT_HEIGHT = 260
-const MIN_CHAT_HEIGHT = 120
-const MAX_CHAT_HEIGHT = 640
 
 const DEFAULT_SPLIT_FRACTION = 0.5
 const MIN_SPLIT_FRACTION = 0.25
@@ -89,9 +88,23 @@ export function ArchitectureScreen({
   onOperationChange,
   onOpenSettings,
   projectMode,
+  onChatNavigate,
+  pendingChatNav,
+  onChatNavConsumed,
 }: ArchitectureScreenProps) {
   const [types, setTypes] = useState<ArchitectureTypeOption[]>([])
   const [selectedType, setSelectedType] = useState<ArchitectureTypeId | null>(null)
+  // Project platform (project harness feature)
+  const [platforms, setPlatforms] = useState<PlatformDescriptor[]>([])
+  const [selectedPlatform, setSelectedPlatform] = useState<PlatformId | null>(null)
+  const [addPlatformOpen, setAddPlatformOpen] = useState(false)
+  // Whether the platform card grid is showing. Once a platform is picked the
+  // grid collapses to a single "Platform: X · Change" line (same pattern as
+  // Architecture type); "Change" re-opens it.
+  const [platformPickerOpen, setPlatformPickerOpen] = useState(false)
+  const [newPlatform, setNewPlatform] = useState({ label: '', entryPointHint: '', wiringHint: '', lifecycleHint: '' })
+  const [pendingPlatformChange, setPendingPlatformChange] = useState<string | null>(null)
+  const [definingHarness, setDefiningHarness] = useState(false)
   const [architecture, setArchitecture] = useState<Architecture | null>(null)
   const [requirements, setRequirements] = useState<Requirement[]>([])
   const [loading, setLoading] = useState(true)
@@ -102,7 +115,13 @@ export function ArchitectureScreen({
   // stage prompt as extra context and available to Test Full App.
   const [overviewDescription, setOverviewDescription] = useState('')
   const [overviewRunInstructions, setOverviewRunInstructions] = useState('')
+  // Collapsed by default once it has content (the user has already filled it
+  // in — no reason to keep two big textareas open on every visit); starts
+  // open only while still empty so a first-time user sees the prompt. Set
+  // once, when the overview first loads — a later edit that empties both
+  // fields shouldn't yank the panel open under the user's cursor.
   const [overviewOpen, setOverviewOpen] = useState(true)
+  const [overviewLoaded, setOverviewLoaded] = useState(false)
   const [autoPopulatingOverview, setAutoPopulatingOverview] = useState(false)
 
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null)
@@ -140,16 +159,41 @@ export function ArchitectureScreen({
     null,
   )
 
-  const [chatHistory, setChatHistory] = useState<ChatEntry[]>([])
-  const [chatInput, setChatInput] = useState('')
+  // Architect-chat proposal cards still live here (surface-specific side
+  // content under the shared ChatDock's transcript).
   const [proposedElements, setProposedElements] = useState<ProposedArchitectureElement[]>([])
   const [proposedInterfaces, setProposedInterfaces] = useState<ProposedInterface[]>([])
-  const [chatBusy, setChatBusy] = useState(false)
-  const [chatError, setChatError] = useState<string | null>(null)
-  const [chatErrorIsLlmNotConfigured, setChatErrorIsLlmNotConfigured] = useState(false)
-  const [chatHeight, setChatHeight] = useState(DEFAULT_CHAT_HEIGHT)
-  const chatResizingRef = useRef(false)
-  const chatInputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Whether this project actually has imported legacy source on disk — the
+  // Migration Plan panel is only meaningful then, not for every import-mode
+  // project (an import project whose sources were never uploaded, or a
+  // greenfield one, has nothing to migrate). Checked via the source tree.
+  const [hasLegacyCode, setHasLegacyCode] = useState(false)
+  // Per-section collapse state for the left column, so a squeezed
+  // Requirements list can be given room by folding the panels around it.
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>({})
+  const toggleSection = (key: string) =>
+    setCollapsedSections((prev) => ({ ...prev, [key]: !prev[key] }))
+  const isCollapsed = (key: string, defaultCollapsed = false) =>
+    collapsedSections[key] ?? defaultCollapsed
+
+  useEffect(() => {
+    let cancelled = false
+    api
+      .getSourceTree(projectId)
+      .then((tree) => {
+        if (!cancelled) setHasLegacyCode((tree.files?.length ?? 0) > 0)
+      })
+      .catch(() => {
+        if (!cancelled) setHasLegacyCode(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [api, projectId])
+  // Bumped to push prefilled composer text into the ChatDock (see
+  // handleAskArchitectAboutInterface).
+  const [chatPrefill, setChatPrefill] = useState<{ text: string; nonce: number }>({ text: '', nonce: 0 })
 
   const [splitFraction, setSplitFraction] = useState(DEFAULT_SPLIT_FRACTION)
   const splitResizingRef = useRef(false)
@@ -193,15 +237,20 @@ export function ArchitectureScreen({
 
   useEffect(() => {
     let cancelled = false
-    Promise.all([api.listArchitectureTypes(), api.getArchitectureType(projectId)]).then(
-      async ([typeOptions, current]) => {
-        if (cancelled) return
-        setTypes(typeOptions)
-        setSelectedType(current)
-        if (current) await loadArchitecture()
-        setLoading(false)
-      },
-    )
+    Promise.all([
+      api.listArchitectureTypes(),
+      api.getArchitectureType(projectId),
+      api.listPlatforms(),
+      api.getProjectPlatform(projectId),
+    ]).then(async ([typeOptions, current, platformOptions, currentPlatform]) => {
+      if (cancelled) return
+      setTypes(typeOptions)
+      setSelectedType(current)
+      setPlatforms(platformOptions)
+      setSelectedPlatform(currentPlatform)
+      if (current) await loadArchitecture()
+      setLoading(false)
+    })
     return () => {
       cancelled = true
     }
@@ -213,6 +262,8 @@ export function ArchitectureScreen({
       if (cancelled) return
       setOverviewDescription(description)
       setOverviewRunInstructions(runInstructions)
+      setOverviewOpen(!(description.trim() || runInstructions.trim()))
+      setOverviewLoaded(true)
     })
     return () => {
       cancelled = true
@@ -248,6 +299,95 @@ export function ArchitectureScreen({
   async function handleAddElement(fields: CreateArchitectureElementFields) {
     await api.createArchitectureElement(projectId, fields)
     await loadArchitecture()
+  }
+
+  // Project platform (project harness feature) ------------------------------
+
+  async function handleSelectPlatform(platformId: string) {
+    if (selectedPlatform && selectedPlatform !== platformId) {
+      // Changing an already-set platform re-derives the harness and
+      // invalidates generated code — confirm and offer to branch first.
+      setPendingPlatformChange(platformId)
+      return
+    }
+    setSelectedPlatform(platformId)
+    setPlatformPickerOpen(false)
+    try {
+      const result = await api.setProjectPlatform(projectId, platformId)
+      // T2.1: the server auto-derives the harness spec on platform-set. Tell
+      // the user if that failed so they know to use the manual button.
+      if (result.harnessSpecError) {
+        onOperationChange({
+          text: null,
+          error: `Platform saved, but deriving the Harness failed: ${result.harnessSpecError}. Use "Define Harness" to retry.`,
+        })
+      }
+      await loadArchitecture()
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  async function handleConfirmChangeInPlace() {
+    const platformId = pendingPlatformChange
+    if (!platformId) return
+    setPendingPlatformChange(null)
+    setSelectedPlatform(platformId)
+    setPlatformPickerOpen(false)
+    try {
+      await api.setProjectPlatform(projectId, platformId)
+      await api.defineHarness(projectId)
+      await loadArchitecture()
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  async function handleBranchPlatform() {
+    const platformId = pendingPlatformChange
+    if (!platformId) return
+    setPendingPlatformChange(null)
+    try {
+      const { newProject } = await api.branchProjectPlatform(projectId, platformId)
+      onOperationChange({
+        text: `Branched to "${newProject.name}". The original project has been renamed with its previous platform.`,
+      })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  async function handleAddCustomPlatform() {
+    try {
+      const created = await api.addCustomPlatform(newPlatform)
+      setPlatforms((prev) => [...prev, created])
+      setAddPlatformOpen(false)
+      setNewPlatform({ label: '', entryPointHint: '', wiringHint: '', lifecycleHint: '' })
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  async function handleDeleteCustomPlatform(platformId: string) {
+    try {
+      await api.deleteCustomPlatform(platformId)
+      setPlatforms((prev) => prev.filter((p) => p.id !== platformId))
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    }
+  }
+
+  async function handleDefineHarness() {
+    if (definingHarness) return
+    setDefiningHarness(true)
+    try {
+      await api.defineHarness(projectId)
+      await loadArchitecture()
+    } catch (err) {
+      onOperationChange(toOperationError(err))
+    } finally {
+      setDefiningHarness(false)
+    }
   }
 
   async function handleSaveElement(
@@ -402,6 +542,19 @@ export function ArchitectureScreen({
 
   async function handleAutoConfigureAndAllocate() {
     if (autoConfiguring) return
+    // Auto Configure never deletes or overwrites an existing element — it
+    // adds modules for still-unallocated requirements and allocates onto
+    // the combined set. When real modules already exist, warn so the user
+    // knows they'll get a mixed (LLM-proposed + existing) architecture
+    // rather than a clean-slate one.
+    if (
+      hasNonHarnessElements &&
+      !window.confirm(
+        'This architecture already has modules. Auto Configure will keep them, add new modules for any still-unallocated requirements, connect interfaces, and allocate — it will not delete or overwrite what is already there. Continue?',
+      )
+    ) {
+      return
+    }
     setAutoConfiguring(true)
     onOperationChange({ text: 'Auto-configuring and allocating...' })
     try {
@@ -456,30 +609,22 @@ export function ArchitectureScreen({
     }
   }
 
-  async function handleChatSend() {
-    if (!chatInput.trim() || chatBusy) return
-    const message = chatInput.trim()
-    setChatHistory((prev) => [...prev, { role: 'user', text: message }])
-    setChatInput('')
-    setChatBusy(true)
-    setChatError(null)
-    setChatErrorIsLlmNotConfigured(false)
-    onOperationChange({ text: 'Architect is thinking...' })
-    try {
-      const result = await api.architectChat(projectId, message)
-      setChatHistory((prev) => [...prev, { role: 'architect', text: result.reply }])
-      setProposedElements((prev) => [...prev, ...result.proposedElements])
-      setProposedInterfaces((prev) => [...prev, ...result.proposedInterfaces])
-      onOperationChange({ text: null })
-    } catch (err) {
-      const operationError = toOperationError(err)
-      setChatError(operationError.error ?? null)
-      setChatErrorIsLlmNotConfigured(operationError.errorCode === 'llm-not-configured')
-      onOperationChange(operationError)
-    } finally {
-      setChatBusy(false)
-    }
-  }
+  const sendArchitectChat = useCallback(
+    async (sessionId: string, message: string) => {
+      onOperationChange({ text: 'Architect is thinking...' })
+      try {
+        const result = await api.architectChat(projectId, message, sessionId)
+        setProposedElements((prev) => [...prev, ...result.proposedElements])
+        setProposedInterfaces((prev) => [...prev, ...result.proposedInterfaces])
+        onOperationChange({ text: null })
+        return { userMessage: result.userMessage, assistantMessage: result.assistantMessage }
+      } catch (err) {
+        onOperationChange(toOperationError(err))
+        throw err
+      }
+    },
+    [api, projectId, onOperationChange],
+  )
 
   async function handleAcceptProposedElement(
     proposal: ProposedArchitectureElement,
@@ -507,29 +652,6 @@ export function ArchitectureScreen({
     setProposedInterfaces((prev) => prev.filter((p) => p !== proposal))
   }
 
-  const handleChatResizeStart = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault()
-      chatResizingRef.current = true
-      const startY = e.clientY
-      const startHeight = chatHeight
-
-      function onMove(moveEvent: MouseEvent) {
-        if (!chatResizingRef.current) return
-        const delta = startY - moveEvent.clientY
-        const next = Math.min(MAX_CHAT_HEIGHT, Math.max(MIN_CHAT_HEIGHT, startHeight + delta))
-        setChatHeight(next)
-      }
-      function onUp() {
-        chatResizingRef.current = false
-        window.removeEventListener('mousemove', onMove)
-        window.removeEventListener('mouseup', onUp)
-      }
-      window.addEventListener('mousemove', onMove)
-      window.addEventListener('mouseup', onUp)
-    },
-    [chatHeight],
-  )
 
   async function handleRemoveInterface(fromId: string, toId: string) {
     const from = architecture?.elements.find((e) => e.id === fromId)
@@ -588,10 +710,18 @@ export function ArchitectureScreen({
   function handleAskArchitectAboutInterface(fromId: string, toId: string) {
     const from = architecture?.elements.find((e) => e.id === fromId)
     const to = architecture?.elements.find((e) => e.id === toId)
-    setChatInput(`Review the interface between ${from?.name ?? fromId} and ${to?.name ?? toId}.`)
-    chatInputRef.current?.focus()
-    chatInputRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    setChatPrefill((prev) => ({
+      text: `Review the interface between ${from?.name ?? fromId} and ${to?.name ?? toId}.`,
+      nonce: prev.nonce + 1,
+    }))
   }
+
+  // Consume a chat link chip that targeted an architecture element.
+  useEffect(() => {
+    if (!pendingChatNav || pendingChatNav.kind !== 'element') return
+    setSelectedElementId(pendingChatNav.id)
+    onChatNavConsumed()
+  }, [pendingChatNav, onChatNavConsumed])
 
   const conflicts: ArchitectureConflict[] = useMemo(
     () => architecture?.conflicts ?? [],
@@ -622,6 +752,13 @@ export function ArchitectureScreen({
   }, [requirements])
 
   const hasElements = (architecture?.elements.length ?? 0) > 0
+  // The Harness is a composition root with no requirements of its own —
+  // Auto Configure/Allocate already ignore it server-side
+  // (allocatableElements filters kind:'harness'), so it must not gate the
+  // buttons either. This is the count that actually matters for "does the
+  // architecture already have real modules".
+  const hasNonHarnessElements =
+    (architecture?.elements.filter((e) => e.kind !== 'harness').length ?? 0) > 0
 
   const alignmentCounts = useMemo(() => {
     if (!codeAlignment) return null
@@ -651,6 +788,18 @@ export function ArchitectureScreen({
   const selectedOption = types.find((t) => t.id === selectedType) ?? null
   const unknownSelectedType = selectedType !== null && selectedOption === null
   const focusElement = architecture?.elements.find((e) => e.id === selectedElementId) ?? null
+  // Harness spec state (project harness feature). Three cases, and the UI
+  // must warn about ALL of them — the never-derived case used to show
+  // nothing because harnessOutOfDate required a spec to exist.
+  const harnessSpec = architecture?.elements.find((e) => e.kind === 'harness')?.harnessSpec
+  const nonHarnessElementCount = (architecture?.elements ?? []).filter((e) => e.kind !== 'harness').length
+  const harnessMissing = !!selectedPlatform && nonHarnessElementCount > 0 && !harnessSpec
+  const harnessOutOfDate =
+    !!selectedPlatform && !!harnessSpec && harnessSpec.derivedForPlatform !== selectedPlatform
+  const harnessNeedsAttention = harnessMissing || harnessOutOfDate
+  const harnessAttentionLabel = harnessMissing
+    ? 'Harness not defined — Coding the Harness will be refused until you run Define Harness'
+    : 'Harness out of date — it was derived for a different platform; run Define Harness again'
   const focusElementRequirements = selectedElementId
     ? requirements.filter((r) => r.architectureElements.includes(selectedElementId))
     : []
@@ -718,13 +867,30 @@ export function ArchitectureScreen({
       {substepLabel && <p className="architecture-screen-substep">{substepLabel}</p>}
 
       <section className="architecture-overview-panel">
-        <button
-          type="button"
-          className="architecture-overview-toggle"
-          onClick={() => setOverviewOpen((open) => !open)}
-        >
-          {overviewOpen ? '▾' : '▸'} Project Overview
-        </button>
+        <div className="architecture-overview-header-row">
+          <button
+            type="button"
+            className="architecture-overview-toggle"
+            onClick={() => setOverviewOpen((open) => !open)}
+          >
+            {overviewOpen ? '▾' : '▸'} Project Overview
+          </button>
+          {!overviewOpen && overviewLoaded && (selectedOption || selectedPlatform) && (
+            <div className="architecture-overview-header-meta">
+              {selectedOption && (
+                <span>
+                  Architecture type: <strong>{selectedOption.label}</strong>
+                </span>
+              )}
+              {selectedPlatform && (
+                <span>
+                  Platform:{' '}
+                  <strong>{platforms.find((p) => p.id === selectedPlatform)?.label ?? selectedPlatform}</strong>
+                </span>
+              )}
+            </div>
+          )}
+        </div>
         {overviewOpen && (
           <div className="architecture-overview-body">
             <button
@@ -788,9 +954,10 @@ export function ArchitectureScreen({
           <>
             <h2>Architecture type</h2>
             <p className="architecture-type-hint">
-              Select the architecture type that best matches this project's needs. This sets the
-              default grid layout (layer rows) and dynamic-design behaviour — both can still be
-              adjusted afterward.
+              The app's internal <em>structure</em> — how its parts are organised (layered,
+              hexagonal, event-driven…). Not the same as Platform below, which is where the built
+              app runs. This sets the default grid layout (layer rows) and dynamic-design
+              behaviour — both can still be adjusted afterward.
             </p>
           </>
         )}
@@ -813,6 +980,157 @@ export function ArchitectureScreen({
         ) : null}
       </section>
 
+      {selectedOption && (
+        <section className="architecture-type-selector architecture-platform-selector">
+          {selectedPlatform && !platformPickerOpen ? (
+            <p className="architecture-type-line">
+              Platform: <strong>{platforms.find((p) => p.id === selectedPlatform)?.label ?? selectedPlatform}</strong>
+              {' · '}
+              <button
+                type="button"
+                className="architecture-type-change-link"
+                onClick={() => setPlatformPickerOpen(true)}
+              >
+                Change
+              </button>
+              {' · '}
+              <button
+                type="button"
+                className="architecture-type-change-link"
+                onClick={handleDefineHarness}
+                disabled={definingHarness}
+              >
+                {definingHarness ? 'Defining Harness…' : 'Define Harness'}
+              </button>
+              {harnessNeedsAttention && (
+                <span className="architecture-type-line-warning"> · {harnessAttentionLabel}</span>
+              )}
+            </p>
+          ) : (
+            <>
+          <h2>Platform</h2>
+          <p className="architecture-type-hint">
+            The single deployment/runtime <em>target</em> — where the built app actually runs (browser, CLI,
+            Electron, microcontroller…). Distinct from Architecture type above, which is the app's internal
+            structure. Platform determines how the Harness realises the entry point, element wiring and run
+            lifecycle; changing it later re-derives the Harness and invalidates generated code.
+          </p>
+          {harnessNeedsAttention && (
+            <p className="architecture-type-line-warning">
+              {harnessAttentionLabel}.{' '}
+              <button
+                type="button"
+                className="architecture-type-change-link"
+                onClick={handleDefineHarness}
+                disabled={definingHarness}
+              >
+                {definingHarness ? 'Defining Harness…' : 'Define Harness now'}
+              </button>
+            </p>
+          )}
+          <div className="architecture-type-grid">
+            {platforms.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                className={`architecture-type-card ${selectedPlatform === p.id ? 'selected' : ''}`}
+                onClick={() => handleSelectPlatform(p.id)}
+              >
+                <span className="architecture-type-card-label">
+                  {p.label}
+                  {!p.builtIn && (
+                    <span
+                      className="architecture-platform-delete"
+                      role="button"
+                      tabIndex={0}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void handleDeleteCustomPlatform(p.id)
+                      }}
+                    >
+                      ×
+                    </span>
+                  )}
+                </span>
+                <span className="architecture-type-card-description">{p.entryPointHint}</span>
+              </button>
+            ))}
+            <button
+              type="button"
+              className="architecture-type-card"
+              onClick={() => setAddPlatformOpen(true)}
+            >
+              <span className="architecture-type-card-label">+ Add custom platform</span>
+              <span className="architecture-type-card-description">
+                Persists for future projects; you can delete it later.
+              </span>
+            </button>
+          </div>
+            </>
+          )}
+        </section>
+      )}
+
+      {addPlatformOpen && (
+        <div className="modal-overlay" onClick={() => setAddPlatformOpen(false)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <h3>Add custom platform</h3>
+            {(['label', 'entryPointHint', 'wiringHint', 'lifecycleHint'] as const).map((field) => (
+              <label key={field} className="architecture-field-label">
+                {field === 'label'
+                  ? 'Name'
+                  : field === 'entryPointHint'
+                    ? 'Entry point (how "run this" looks)'
+                    : field === 'wiringHint'
+                      ? 'Wiring (how elements are connected)'
+                      : 'Run lifecycle (start / stop)'}
+                <input
+                  type="text"
+                  value={newPlatform[field]}
+                  onChange={(e) => setNewPlatform((prev) => ({ ...prev, [field]: e.target.value }))}
+                />
+              </label>
+            ))}
+            <div className="modal-actions">
+              <button type="button" onClick={() => setAddPlatformOpen(false)}>
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleAddCustomPlatform}
+                disabled={Object.values(newPlatform).some((v) => !v.trim())}
+              >
+                Add
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingPlatformChange && (
+        <div className="modal-overlay" onClick={() => setPendingPlatformChange(null)}>
+          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
+            <h3>Change platform?</h3>
+            <p>
+              Changing the platform re-derives the Harness from scratch. Every "how each link is
+              realised" note changes, and all generated code, coding-run history and test results for
+              this project become invalid and must be regenerated.
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setPendingPlatformChange(null)}>
+                Cancel
+              </button>
+              <button type="button" onClick={handleConfirmChangeInPlace}>
+                Change in place
+              </button>
+              <button type="button" onClick={handleBranchPlatform}>
+                Branch to a new project
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {!loading && !selectedOption && !unknownSelectedType && (
         <p className="architecture-screen-note">Select an architecture type above to continue.</p>
       )}
@@ -820,7 +1138,18 @@ export function ArchitectureScreen({
       {showArchitectureWorkspace && (
         <div className="architecture-layout" ref={layoutRef}>
           <div className="architecture-left-col" style={{ flexBasis: `${splitFraction * 100}%` }}>
-            <div className="architecture-action-box">
+            <div className={`architecture-action-box${isCollapsed('actions') ? ' architecture-section-collapsed' : ''}`}>
+              <button
+                type="button"
+                className="architecture-section-toggle"
+                onClick={() => toggleSection('actions')}
+                aria-expanded={!isCollapsed('actions')}
+              >
+                <span className="architecture-section-toggle-caret">{isCollapsed('actions') ? '▸' : '▾'}</span>
+                Actions
+              </button>
+              {!isCollapsed('actions') && (
+              <>
               <div className="architecture-action-bar">
                 <div className="architecture-action-group">
                   <span className="architecture-action-group-label">Build</span>
@@ -832,10 +1161,10 @@ export function ArchitectureScreen({
                       type="button"
                       className="architecture-action-secondary"
                       onClick={handleAutoConfigureAndAllocate}
-                      disabled={autoConfiguring || hasElements}
+                      disabled={autoConfiguring}
                       title={
-                        hasElements
-                          ? 'Architecture elements already exist — use Auto Allocate to allocate onto them, or delete existing elements first.'
+                        hasNonHarnessElements
+                          ? 'Modules already exist. Auto Configure keeps them, adds modules for any still-unallocated requirements, connects interfaces, and allocates — it never deletes or overwrites existing modules. You will be asked to confirm.'
                           : 'Groups unallocated requirements into modules, creates the architecture elements, connects their interfaces, and allocates the requirements.'
                       }
                     >
@@ -845,11 +1174,11 @@ export function ArchitectureScreen({
                       type="button"
                       className="architecture-action-secondary"
                       onClick={() => handleAutoAllocate('llm')}
-                      disabled={autoAllocating || !hasElements}
+                      disabled={autoAllocating || !hasNonHarnessElements}
                       title={
-                        hasElements
+                        hasNonHarnessElements
                           ? 'Allocates unallocated requirements onto existing elements using the Architect (LLM).'
-                          : 'Add at least one architecture element first.'
+                          : 'Add at least one non-Harness architecture element first (the Harness has no requirements of its own).'
                       }
                     >
                       {autoAllocating ? 'Allocating...' : 'Auto Allocate (LLM)'}
@@ -955,11 +1284,27 @@ export function ArchitectureScreen({
                   </button>
                 </div>
               )}
+              </>
+              )}
             </div>
 
-            <div className="architecture-req-list-panel">
+            <div
+              className={`architecture-req-list-panel${
+                isCollapsed('requirements') ? ' architecture-section-collapsed' : ''
+              }`}
+            >
               <h2 className="architecture-req-list-heading">
-                Requirements{requirements.length > 0 ? ` (${requirements.length})` : ''}
+                <button
+                  type="button"
+                  className="architecture-section-toggle"
+                  onClick={() => toggleSection('requirements')}
+                  aria-expanded={!isCollapsed('requirements')}
+                >
+                  <span className="architecture-section-toggle-caret">
+                    {isCollapsed('requirements') ? '▸' : '▾'}
+                  </span>
+                  Requirements{requirements.length > 0 ? ` (${requirements.length})` : ''}
+                </button>
                 {unallocatedRequirementCount > 0 && (
                   <span className="architecture-req-list-unallocated-count">
                     {' '}
@@ -967,6 +1312,7 @@ export function ArchitectureScreen({
                   </span>
                 )}
               </h2>
+              {!isCollapsed('requirements') && (
               <div className="architecture-req-list-scroll">
                 <ArchitectureRequirementList
                   requirements={requirements}
@@ -984,118 +1330,97 @@ export function ArchitectureScreen({
                   activeElementId={selectedElementId}
                 />
               </div>
+              )}
             </div>
 
-            {projectMode === 'import' && (
-              <div className="architecture-migration-plan-panel">
-                <MigrationPlanPanel api={api} projectId={projectId} onOperationChange={onOperationChange} />
+            {/* Migration Plan is only meaningful when there is imported
+                legacy source to migrate — not for every import-mode project
+                (one whose sources were never uploaded has nothing to plan). */}
+            {projectMode === 'import' && hasLegacyCode && (
+              <div
+                className={`architecture-migration-plan-panel${
+                  isCollapsed('migration', true) ? ' architecture-section-collapsed' : ''
+                }`}
+              >
+                <button
+                  type="button"
+                  className="architecture-section-toggle"
+                  onClick={() => toggleSection('migration')}
+                  aria-expanded={!isCollapsed('migration', true)}
+                >
+                  <span className="architecture-section-toggle-caret">
+                    {isCollapsed('migration', true) ? '▸' : '▾'}
+                  </span>
+                  Migration Plan
+                </button>
+                {!isCollapsed('migration', true) && (
+                  <MigrationPlanPanel api={api} projectId={projectId} onOperationChange={onOperationChange} />
+                )}
               </div>
             )}
 
-            <div className="analyst-chat-dock" style={{ height: chatHeight }}>
-              <div className="analyst-chat-resize-handle" onMouseDown={handleChatResizeStart} />
-              <div className="analyst-chat-panel">
-                <div className="analyst-chat-heading-row">
-                  <h2>Architect chat</h2>
-                  <span className="analyst-chat-hint">
-                    Ask the Architect to help design, extend, or refine the architecture.
-                  </span>
-                </div>
-                <div
-                  className={`analyst-chat-history ${chatHistory.length === 0 ? 'analyst-chat-history-empty' : ''}`}
-                >
-                  {chatHistory.length === 0 && !chatBusy && (
-                    <p className="analyst-chat-empty">No messages yet — start the conversation below.</p>
-                  )}
-                  {chatHistory.map((entry, i) => (
-                    <div key={i} className={`analyst-chat-entry analyst-chat-entry-${entry.role}`}>
-                      <strong>{entry.role === 'user' ? 'You' : 'Architect'}</strong>
-                      <p>{highlightRequirementIds(entry.text)}</p>
+            <ChatDock
+              api={api}
+              projectId={projectId}
+              surface="architect"
+              roleLabel="Architect"
+              heading="Architect chat"
+              hint="Ask the Architect to help design, extend, or refine the architecture."
+              placeholder="Message the Architect... (Shift+Enter for a new line)"
+              onOpenSettings={onOpenSettings}
+              onNavigateLink={onChatNavigate}
+              renderMessageText={highlightRequirementIds}
+              sendMessage={sendArchitectChat}
+              prefill={chatPrefill.nonce > 0 ? chatPrefill : undefined}
+              renderExtras={() => (
+                <>
+                  {proposedElements.length > 0 && (
+                    <div className="analyst-chat-proposals">
+                      <h3>Proposed elements</h3>
+                      {proposedElements.map((proposal, i) => (
+                        <EditableElementProposalCard
+                          key={`${proposal.name}-${i}`}
+                          proposal={proposal}
+                          layers={architecture?.layers ?? []}
+                          onAccept={(edited) => handleAcceptProposedElement(edited, proposal)}
+                          onDiscard={handleDiscardProposedElement}
+                        />
+                      ))}
                     </div>
-                  ))}
-                  {chatBusy && <p className="analyst-chat-empty">Architect is thinking...</p>}
-                </div>
-
-                {chatError && (
-                  <div className="analyst-chat-error">
-                    <span>{chatError}</span>
-                    {chatErrorIsLlmNotConfigured ? (
-                      <button type="button" onClick={onOpenSettings}>
-                        Open Settings
-                      </button>
-                    ) : (
-                      <button type="button" onClick={handleChatSend}>
-                        Retry
-                      </button>
-                    )}
-                  </div>
-                )}
-
-                {proposedElements.length > 0 && (
-                  <div className="analyst-chat-proposals">
-                    <h3>Proposed elements</h3>
-                    {proposedElements.map((proposal, i) => (
-                      <EditableElementProposalCard
-                        key={`${proposal.name}-${i}`}
-                        proposal={proposal}
-                        layers={architecture?.layers ?? []}
-                        onAccept={(edited) => handleAcceptProposedElement(edited, proposal)}
-                        onDiscard={handleDiscardProposedElement}
-                      />
-                    ))}
-                  </div>
-                )}
-
-                {proposedInterfaces.length > 0 && (
-                  <div className="analyst-chat-proposals">
-                    <h3>Proposed interfaces</h3>
-                    {proposedInterfaces.map((proposal, i) => {
-                      const bothExist =
-                        architecture?.elements.some((e) => e.name === proposal.from) &&
-                        architecture?.elements.some((e) => e.name === proposal.to)
-                      return (
-                        <div key={`${proposal.from}-${proposal.to}-${i}`} className="analyst-chat-proposal">
-                          <p>
-                            <strong>{proposal.from}</strong> → <strong>{proposal.to}</strong>
-                          </p>
-                          <div className="analyst-chat-proposal-actions">
-                            <button
-                              type="button"
-                              onClick={() => handleAcceptProposedInterface(proposal)}
-                              disabled={!bothExist}
-                              title={bothExist ? undefined : 'Accept its elements above first'}
-                            >
-                              Accept
-                            </button>
-                            <button type="button" onClick={() => handleDiscardProposedInterface(proposal)}>
-                              Discard
-                            </button>
+                  )}
+                  {proposedInterfaces.length > 0 && (
+                    <div className="analyst-chat-proposals">
+                      <h3>Proposed interfaces</h3>
+                      {proposedInterfaces.map((proposal, i) => {
+                        const bothExist =
+                          architecture?.elements.some((e) => e.name === proposal.from) &&
+                          architecture?.elements.some((e) => e.name === proposal.to)
+                        return (
+                          <div key={`${proposal.from}-${proposal.to}-${i}`} className="analyst-chat-proposal">
+                            <p>
+                              <strong>{proposal.from}</strong> → <strong>{proposal.to}</strong>
+                            </p>
+                            <div className="analyst-chat-proposal-actions">
+                              <button
+                                type="button"
+                                onClick={() => handleAcceptProposedInterface(proposal)}
+                                disabled={!bothExist}
+                                title={bothExist ? undefined : 'Accept its elements above first'}
+                              >
+                                Accept
+                              </button>
+                              <button type="button" onClick={() => handleDiscardProposedInterface(proposal)}>
+                                Discard
+                              </button>
+                            </div>
                           </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-
-                <div className="analyst-chat-input-row">
-                  <textarea
-                    ref={chatInputRef}
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' && !e.shiftKey) {
-                        e.preventDefault()
-                        handleChatSend()
-                      }
-                    }}
-                    placeholder="Message the Architect... (Shift+Enter for a new line)"
-                  />
-                  <button type="button" onClick={handleChatSend} disabled={!chatInput.trim() || chatBusy}>
-                    Send
-                  </button>
-                </div>
-              </div>
-            </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                </>
+              )}
+            />
           </div>
 
           <div className="architecture-split-resize-handle" onMouseDown={handleSplitResizeStart} />

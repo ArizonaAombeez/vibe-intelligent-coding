@@ -7,48 +7,14 @@ import {
   gitDiffText,
   gitInitIfNeeded,
   gitStatusPorcelain,
+  isTestFilePath,
   resolveAllowedScope,
   scaffoldProjectSourceTree,
   sourceTreeRoot,
 } from 'vic-coding'
 import type { Project, TestCase } from 'vic-requirements-elicitation'
-import { buildTestGenerationPrompt, RUN_COMMAND_MARKER } from './testGenerationPersona.js'
-import { writeElementTestCommand, type TestCommand } from './testCommandResolution.js'
-
-// Pulls the agent's declared "RUN: <command> <args...>" line (see
-// buildTestGenerationPrompt) out of its raw output — the LAST such match, in
-// case the model echoes the instruction text itself earlier in its response
-// (a real, observed LLM habit: repeating part of the prompt back before
-// answering it). Returns undefined if the agent never declared one (e.g. a
-// CLI-error run, or a model that ignored the instruction) — callers treat
-// that as "no change," not an error, since a test run can still fall back
-// to whatever readElementTestCommand resolves at execution time.
-//
-// Matches on a real line break OR a literal backslash-n, not just '\n' —
-// rawLog's shape differs by backend: OpenCode's is genuinely
-// newline-delimited JSON events, but ClaudeCodeAgentClient's is `stdout` of
-// ONE JSON document (see ClaudeCodeAgentClient.ts's `JSON.parse(stdout)`),
-// so a "line break" inside the model's own text response survives only as
-// the two characters \ and n inside that JSON string, never an actual
-// newline byte in rawLog. Stops the captured command+args at whichever
-// comes first: end of string, a real newline, a literal \n, or an
-// unescaped closing quote (the end of the JSON string it's embedded in).
-function parseDeclaredRunCommand(rawLog: string): TestCommand | undefined {
-  const pattern = new RegExp(`${RUN_COMMAND_MARKER}\\s*(.+?)(?:\\\\n|\\n|"|$)`, 'g')
-  let match: RegExpExecArray | null
-  let last: string | undefined
-  while ((match = pattern.exec(rawLog))) {
-    last = match[1]
-  }
-  if (!last) return undefined
-  const tokens = last.trim().split(/\s+/).filter(Boolean)
-  if (tokens.length === 0) return undefined
-  return { command: tokens[0], args: tokens.slice(1) }
-}
-
-function sameCommand(a: TestCommand, b: TestCommand): boolean {
-  return a.command === b.command && a.args.length === b.args.length && a.args.every((v, i) => v === b.args[i])
-}
+import { buildTestGenerationPrompt } from './testGenerationPersona.js'
+import { gatherTestSourceContext } from './testSourceContext.js'
 
 function elementSubfolderById(project: Project): Map<string, string> {
   const map = new Map<string, string>()
@@ -60,6 +26,23 @@ function elementSubfolderById(project: Project): Map<string, string> {
 
 export type GenerateTestFileStatus = 'success' | 'rejected-scope' | 'rejected-multi-element' | 'cli-error'
 
+// Per-phase wall-clock breakdown of one generate-test-file call — added to
+// diagnose why "QA is writing the test file for TEST-xxx..." takes so long.
+// The agent CLI invocation (msAgentCli) is expected to dominate; the rest
+// (scaffold / git / scope-gate / commit) being non-trivial would be the
+// surprise worth acting on. msToFirstAgentOutput mirrors AgentRunTiming's
+// msToFirstOutput — a large value there means the provider was slow to
+// start, not that the test itself was hard to write.
+export interface GenerateTestFileTiming {
+  msTotal: number
+  msScaffold: number
+  msGitInit: number
+  msAgentCli: number
+  msToFirstAgentOutput?: number
+  msScopeGate: number
+  msCommit: number
+}
+
 export interface GenerateTestFileResult {
   status: GenerateTestFileStatus
   testCase: TestCase
@@ -67,6 +50,7 @@ export interface GenerateTestFileResult {
   rawLog: string
   exitCode: number | null
   rejectedFiles?: string[]
+  timing?: GenerateTestFileTiming
 }
 
 // The agentic test-file-writing step (Area E) — invoked only AFTER
@@ -108,12 +92,23 @@ export async function generateTestFileForTestCase(
     }
   }
 
+  const t0 = Date.now()
   await scaffoldProjectSourceTree(project, projectDir)
+  const tScaffold = Date.now()
   const srcRoot = sourceTreeRoot(projectDir)
   await gitInitIfNeeded(srcRoot)
   const beforeStatus = await gitStatusPorcelain(srcRoot)
+  const tGitInit = Date.now()
 
-  const prompt = buildTestGenerationPrompt(project, testCase, scope.allowedRelativePrefix)
+  // Pre-flight: gather the code under test + an example test from disk NOW,
+  // with no LLM round-trip, so the agent can skip the 4-6 slow discovery
+  // tool calls it would otherwise make before writing anything. Best-effort
+  // — if nothing resolves (element not coded yet), the prompt falls back to
+  // its previous "read the target file(s) yourself" wording.
+  const sourceContext = await gatherTestSourceContext(project, testCase, srcRoot, scope.allowedRelativePrefix).catch(
+    () => undefined,
+  )
+  const prompt = buildTestGenerationPrompt(project, testCase, scope.allowedRelativePrefix, sourceContext)
 
   let runResult
   try {
@@ -134,10 +129,28 @@ export async function generateTestFileForTestCase(
   } catch (err) {
     const rawLog = (err as { rawLog?: string }).rawLog ?? (err as Error).message
     const exitCode = (err as { exitCode?: number | null }).exitCode ?? null
-    return { status: 'cli-error', testCase, diff: '', rawLog, exitCode }
+    const tErr = Date.now()
+    return {
+      status: 'cli-error',
+      testCase,
+      diff: '',
+      rawLog,
+      exitCode,
+      timing: {
+        msTotal: tErr - t0,
+        msScaffold: tScaffold - t0,
+        msGitInit: tGitInit - tScaffold,
+        msAgentCli: tErr - tGitInit,
+        msToFirstAgentOutput: (err as { timing?: { msToFirstOutput?: number } }).timing?.msToFirstOutput,
+        msScopeGate: 0,
+        msCommit: 0,
+      },
+    }
   }
+  const tAgent = Date.now()
 
   const gateResult = await enforceWriteScope(srcRoot, scope.allowedRelativePrefix, beforeStatus)
+  const tScopeGate = Date.now()
   if (!gateResult.ok) {
     const remainingDiff = await gitDiffText(srcRoot)
     return {
@@ -147,6 +160,15 @@ export async function generateTestFileForTestCase(
       rawLog: runResult.rawLog,
       exitCode: runResult.exitCode,
       rejectedFiles: gateResult.rejectedFiles,
+      timing: {
+        msTotal: tScopeGate - t0,
+        msScaffold: tScaffold - t0,
+        msGitInit: tGitInit - tScaffold,
+        msAgentCli: tAgent - tGitInit,
+        msToFirstAgentOutput: runResult.timing?.msToFirstOutput,
+        msScopeGate: tScopeGate - tAgent,
+        msCommit: 0,
+      },
     }
   }
 
@@ -161,35 +183,31 @@ export async function generateTestFileForTestCase(
   const changedInScope = afterStatus.filter(
     (p) => !beforeSet.has(p) && p.split('/').join(path.sep).startsWith(scope.allowedRelativePrefix),
   )
+  // T1.2: pick the TEST file the agent wrote, not git's alphabetically-first
+  // changed path. Without this filter, an agent that also writes a support
+  // file (e.g. `_harness/index.html`, which sorts before `nav.test.mjs`)
+  // leaves that non-test path in testCase.filePath, where it can never be
+  // discovered, run, or healed. If the agent wrote no test file at all,
+  // filePath stays undefined (honest) rather than becoming a bogus pointer.
+  const testFilesWritten = changedInScope.filter(isTestFilePath)
 
   await gitCommitAll(srcRoot, `Test: ${testCase.id} ${testCase.title}`)
-
-  // Establish/reconcile the run-command manifest (Area F, resolved) — see
-  // buildTestGenerationPrompt's RUN: instruction and project.testCommand's
-  // own doc comment for the full rationale. Silently no-ops if the agent
-  // never declared one; a later execution attempt still has
-  // readElementTestCommand's npm-test last-resort fallback.
-  const declared = parseDeclaredRunCommand(runResult.rawLog)
-  if (declared) {
-    if (!project.testCommand) {
-      // First test ever generated for this project — this call's
-      // declaration becomes the shared project-wide default that every
-      // later generation call is told to reuse instead of redeciding.
-      project.testCommand = declared
-    } else if (!sameCommand(declared, project.testCommand)) {
-      // Agent explicitly deviated from the established convention (per the
-      // prompt, only expected for a genuine cross-language/runtime need) —
-      // record it as this element's own override, not a change to the
-      // shared default other elements still follow.
-      await writeElementTestCommand(srcRoot, scope.allowedRelativePrefix, declared)
-    }
-  }
+  const tCommit = Date.now()
 
   return {
     status: 'success',
-    testCase: { ...testCase, filePath: changedInScope[0] ?? testCase.filePath },
+    testCase: { ...testCase, filePath: testFilesWritten[0] ?? testCase.filePath },
     diff,
     rawLog: runResult.rawLog,
     exitCode: runResult.exitCode,
+    timing: {
+      msTotal: Date.now() - t0,
+      msScaffold: tScaffold - t0,
+      msGitInit: tGitInit - tScaffold,
+      msAgentCli: tAgent - tGitInit,
+      msToFirstAgentOutput: runResult.timing?.msToFirstOutput,
+      msScopeGate: tScopeGate - tAgent,
+      msCommit: tCommit - tScopeGate,
+    },
   }
 }

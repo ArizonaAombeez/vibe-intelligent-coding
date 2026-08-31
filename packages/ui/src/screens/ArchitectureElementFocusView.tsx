@@ -28,6 +28,7 @@ const KIND_LABEL: Record<ArchitectureElementKind, string> = {
   service: 'Service',
   external: 'External / environment',
   runtime: 'Runtime / execution',
+  harness: 'Harness (composition root)',
 }
 
 // Which edge of the focused card a connected interface renders on: elements

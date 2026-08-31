@@ -44,24 +44,70 @@ export interface PluginSettingsManifest {
   personaOverridableFields: PluginSettingField[]
 }
 
-// Relative Coding-run speed notes below come from one real, timed,
-// button-press-to-idle comparison on a single element (ARCH-001, Worm Game
-// project, 2026-08-23) — glm-4.7 was the fastest/only-reliable model
-// observed and is used as the 100% baseline; the others are expressed
-// relative to it. This is n=1 per model, not a statistically robust
-// benchmark — GLM's own run-to-run variance was substantial in the same
-// session (an earlier glm-5.2 run succeeded in ~400s, a later one failed
-// outright in ~205s) — so treat these as a directional signal to revisit
-// periodically, not a permanent ranking. Update this comment (and the
-// labels below) if a more thorough comparison changes the picture.
+// Two independent signals are baked into the labels below. All timing is
+// n=1 per model, directional only — GLM's run-to-run variance is high (a 5.2
+// run once went 400s then 205s on the same task). Re-measure periodically.
+//
+// (1) Relative Coding-run SPEED — measured on two task sizes, which give
+//     OPPOSITE rankings. Both are real; the LARGE-task numbers are the ones
+//     that matter for actual VIC use (a real element build is a large task).
+//
+//     [A] LARGE task = one real architecture element built from scratch
+//         through VIC's production path (OpenCodeAgentClient -> opencode
+//         --auto -> z.ai Coding Plan). Two consistent rounds:
+//         - ARCH-001 button-press-to-idle, 2026-08-23: glm-4.7 fastest;
+//           glm-5.2 ~6x slower on the same element; glm-4.7-flash unreliable.
+//         - ARCH-002 (Game Engine — 6 requirements, 2 interface contracts),
+//           2026-08-29, wall time vs a fresh glm-4.7 run (108.8s = 1.00x):
+//             glm-4.7        108.8s  1.00x  OK
+//             glm-4.5        142.9s  1.31x  OK
+//             glm-4.5-air    142.2s  1.31x  OK
+//             glm-5.3        437.3s  4.02x  OK
+//             glm-5.2        582.2s  5.35x  OK
+//             glm-5.3-flash  729.1s  6.70x  OK  (slowest — "flash" is NOT
+//                                   fast here; it's a smaller 5.3 that still
+//                                   does a full thinking pass every turn)
+//             glm-4.7-flash    —     FAIL   exit 1 after ~88s cold start
+//         Takeaway: for real element builds use glm-4.7 (or the 4.5 pair).
+//         The 5.x models' per-turn extended-thinking compounds across a
+//         multi-turn agentic build and costs 4-7x wall time.
+//
+//     glm-4.5-x was in this list until 2026-08-29 but is NOT included in the
+//     GLM Coding Plan subscription — every request 429'd with "insufficient
+//     balance / no resource package" (it needs a pay-as-you-go credit
+//     balance). Removed rather than shipped as an option that always fails
+//     for Coding-Plan users. Re-add it if pay-as-you-go access lands.
+//
+//     UNRELIABLE models are prefixed "⚠ UNRELIABLE — " in their label (the
+//     settings UI renders options as bare native <option> elements, which
+//     cannot be coloured, so the warning has to live in the text). Currently
+//     only glm-4.7-flash: it failed the real element build outright (clean
+//     exit 1, no output) and needed a ~90s cold start before that.
+//
+//     [B] TRIVIAL task = implement one ~30-line Python module + asserts,
+//         2026-08-29, vs glm-4.7 = 25.8s: glm-5.3 0.49x, glm-5.2 0.49x,
+//         glm-5.3-flash 0.76x, glm-4.5-air 0.96x, glm-4.5 1.48x,
+//         glm-4.7-flash 4.22x (60s cold start). On a task too small for
+//         thinking overhead to compound, the 5.x models finish FASTER than
+//         4.7 — the reverse of [A]. Do not use this ranking to pick a model
+//         for real work; it only holds for throwaway one-file tasks.
+//
+// (2) Coding CAPABILITY — the "coding" category score (out of 100) from
+//     benchlm.ai, a third-party aggregator that composites several verified
+//     coding benchmarks (Terminal-Bench, DeepSWE, etc.) into one number.
+//     This is an external derived figure, NOT z.ai's own — z.ai does not
+//     publish one consistent coding metric across the whole family. Fetched
+//     2026-08-29; benchlm had no ranked coding score for GLM-4.7-Flash or
+//     the GLM-4.5 family at that time ("not ranked" below).
+//     Re-check https://benchlm.ai/models/<slug> when updating.
 export const KNOWN_GLM_MODELS: PluginSettingOption[] = [
-  { value: 'glm-5.3', label: 'GLM-5.3 (~2.3x slower than GLM-4.7, thinking always on — see reasoning effort)' },
-  { value: 'glm-5.2', label: 'GLM-5.2 (~2.6x slower than GLM-4.7; also failed with empty output in the same test)' },
-  { value: 'glm-4.7', label: 'GLM-4.7 (fastest/most reliable observed for Coding runs — recommended default)' },
-  { value: 'glm-4.7-flash', label: 'GLM-4.7-Flash (free, not yet timed against the others)' },
-  { value: 'glm-4.5', label: 'GLM-4.5 (not yet timed against the others)' },
-  { value: 'glm-4.5-air', label: 'GLM-4.5-Air (cheaper, smaller, not yet timed against the others)' },
-  { value: 'glm-4.5-x', label: 'GLM-4.5-X (premium, not yet timed against the others)' },
+  { value: 'glm-5.3', label: 'GLM-5.3 (real element build ~4x slower than GLM-4.7; coding 66.5/100 benchlm; thinking always on — see reasoning effort)' },
+  { value: 'glm-5.3-flash', label: 'GLM-5.3-Flash (real element build ~6.7x slower than GLM-4.7 — slowest of the family, "flash" ≠ fast here; coding 67.1/100 benchlm — highest; built-in vision; thinking always on)' },
+  { value: 'glm-5.2', label: 'GLM-5.2 (real element build ~5.3x slower than GLM-4.7; coding 65.0/100 benchlm)' },
+  { value: 'glm-4.7', label: 'GLM-4.7 (speed baseline = 1.00x; fastest on real element builds and completed every test run without erroring; coding 51.5/100 benchlm; recommended default)' },
+  { value: 'glm-4.7-flash', label: '⚠ UNRELIABLE — GLM-4.7-Flash (free, but failed the real element build: clean exit 1 with no output, after a ~90s cold start; coding not ranked by benchlm)' },
+  { value: 'glm-4.5', label: 'GLM-4.5 (real element build ~1.3x slower than GLM-4.7 — the closest alternative; coding not ranked by benchlm)' },
+  { value: 'glm-4.5-air', label: 'GLM-4.5-Air (cheaper, smaller; real element build ~1.3x slower than GLM-4.7; coding not ranked by benchlm)' },
 ]
 
 // z.ai's "thinking" parameter is a simple on/off switch (no graduated
@@ -112,12 +158,15 @@ export interface GlmModelCapabilities {
 // special case.
 export const GLM_MODEL_CAPABILITIES: Record<string, GlmModelCapabilities> = {
   'glm-5.3': { canDisableThinking: false, reasoningEffortValues: ['low', 'high', 'max'] },
+  // Assumed to share the GLM-5.3 line's mandatory-thinking behaviour (z.ai's
+  // 5.3 docs say thinking cannot be disabled). If z.ai documents that the
+  // Flash variant *can* disable thinking, flip canDisableThinking to true.
+  'glm-5.3-flash': { canDisableThinking: false, reasoningEffortValues: ['low', 'high', 'max'] },
   'glm-5.2': { canDisableThinking: true, reasoningEffortValues: ['high', 'max'] },
   'glm-4.7': { canDisableThinking: true },
   'glm-4.7-flash': { canDisableThinking: true },
   'glm-4.5': { canDisableThinking: true },
   'glm-4.5-air': { canDisableThinking: true },
-  'glm-4.5-x': { canDisableThinking: true },
 }
 
 export function glmModelCapabilities(model: string | undefined): GlmModelCapabilities {
